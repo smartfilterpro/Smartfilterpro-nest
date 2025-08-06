@@ -41,50 +41,6 @@ const eventTime = toTimestamp(timestamp);
 // Determine if HVAC is active (heating or cooling)
 const isActive = hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’;
 const wasActive = deviceStates[key]?.isActive || false;
-const previousStatus = deviceStates[key]?.status || ‘OFF’;
-
-if (isActive && !wasActive) {
-// Just turned on - start new session
-sessions[key] = {
-startTime: eventTime,
-startStatus: hvacStatus,
-startTemp: currentTemp
-};
-console.log(`🟢 Starting ${hvacStatus} session for ${key}`);
-
-} else if (!isActive && wasActive) {
-// Just turned off - calculate runtime
-const session = sessions[key];
-if (session) {
-const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
-
-```
-  // Basic validation (same as your Enode logic)
-  if (runtimeSeconds > 0 && runtimeSeconds < 86400) { // 0 to 24 hours
-    delete sessions[key];
-```
-
-// Track current state for next event
-deviceStates[key] = {
-isActive,
-status: hvacStatus,
-temp: currentTemp,
-lastUpdate: eventTime
-};
-} else {
-console.warn(`⚠️ Invalid runtime ${runtimeSeconds}s for ${key}, skipping`);
-delete sessions[key];
-}
-}
-} else if (isActive && !sessions[key]) {
-// System is active but no session start (after restart)
-sessions[key] = {
-startTime: eventTime,
-startStatus: hvacStatus,
-startTemp: currentTemp
-};
-console.log(`🔄 Restarting ${hvacStatus} session for ${key}`);
-}
 
 // Standard payload structure - SAME for all events sent to Bubble
 function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
@@ -207,6 +163,14 @@ if (err.code === 'ECONNABORTED' || err.code === 'ENOTFOUND') {
 ```
 
 }
+
+// Track current state for next event
+deviceStates[key] = {
+isActive,
+status: hvacStatus,
+temp: currentTemp,
+lastUpdate: eventTime
+};
 }
 
 // Cleanup logic (same as your Enode version)
