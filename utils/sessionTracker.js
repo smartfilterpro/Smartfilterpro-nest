@@ -62,61 +62,107 @@ const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
   // Basic validation (same as your Enode logic)
   if (runtimeSeconds > 0 && runtimeSeconds < 86400) { // 0 to 24 hours
     delete sessions[key];
+```
 
-    // Payload for Bubble (similar structure to your Enode payload)
-    const payload = {
-      userId,
-      thermostatId: deviceId,
-      deviceName: deviceName,
-      runtimeSeconds,
-      runtimeMinutes: Math.round(runtimeSeconds / 60),
-      timestamp,
-      
-      // HVAC specific data
-      hvacMode: session.startStatus, // "HEATING" or "COOLING"
-      thermostatMode: mode, // "HEAT", "COOL", "HEAT_COOL", "OFF"
-      
-      // Temperature data (converted to Fahrenheit)
-      startTempF: session.startTemp ? celsiusToFahrenheit(session.startTemp) : null,
-      endTempF: currentTemp ? celsiusToFahrenheit(currentTemp) : null,
-      coolSetpointF: coolSetpoint ? celsiusToFahrenheit(coolSetpoint) : null,
-      heatSetpointF: heatSetpoint ? celsiusToFahrenheit(heatSetpoint) : null,
-      
-      // Raw celsius values (if needed)
-      startTempC: session.startTemp,
-      endTempC: currentTemp,
-      coolSetpointC: coolSetpoint,
-      heatSetpointC: heatSetpoint,
-      
-      // Event metadata
-      eventId: eventData.eventId,
-      eventTimestamp: eventTime
-    };
+// Track current state for next event
+deviceStates[key] = {
+isActive,
+status: hvacStatus,
+temp: currentTemp,
+lastUpdate: eventTime
+};
+} else {
+console.warn(`⚠️ Invalid runtime ${runtimeSeconds}s for ${key}, skipping`);
+delete sessions[key];
+}
+}
+} else if (isActive && !sessions[key]) {
+// System is active but no session start (after restart)
+sessions[key] = {
+startTime: eventTime,
+startStatus: hvacStatus,
+startTemp: currentTemp
+};
+console.log(`🔄 Restarting ${hvacStatus} session for ${key}`);
+}
 
-    try {
-      // Send to Bubble (same pattern as your Enode code)
-      await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload);
-      console.log('✅ Sent Nest runtime to Bubble:', payload);
-    } catch (err) {
-      console.error('❌ Failed to send to Bubble:', err.response?.data || err.message);
-      
-      // Retry logic (same as your Enode code)
-      if (err.code === 'ECONNABORTED' || err.code === 'ENOTFOUND') {
-        console.log('🔄 Retrying in 5 seconds...');
-        setTimeout(async () => {
-          try {
-            await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload);
-            console.log('✅ Retry successful:', payload);
-          } catch (retryErr) {
-            console.error('❌ Retry failed:', retryErr.message);
-          }
-        }, 5000);
-      }
-    }
+// Standard payload structure - SAME for all events sent to Bubble
+function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
+return {
+// User and device info
+userId,
+thermostatId: deviceId,
+deviceName: deviceName,
+
+```
+  // Runtime data (0 for temperature updates, actual for runtime events)
+  runtimeSeconds,
+  runtimeMinutes: Math.round(runtimeSeconds / 60),
+  isRuntimeEvent,
+  
+  // Current status
+  hvacMode: hvacStatus, // "HEATING", "COOLING", "OFF"
+  thermostatMode: mode, // "HEAT", "COOL", "HEAT_COOL", "OFF"
+  
+  // Temperature data (converted to Fahrenheit) - always present
+  currentTempF: currentTemp ? celsiusToFahrenheit(currentTemp) : null,
+  coolSetpointF: coolSetpoint ? celsiusToFahrenheit(coolSetpoint) : null,
+  heatSetpointF: heatSetpoint ? celsiusToFahrenheit(heatSetpoint) : null,
+  
+  // Session start temperatures (only for runtime events)
+  startTempF: sessionData?.startTemp ? celsiusToFahrenheit(sessionData.startTemp) : null,
+  endTempF: currentTemp ? celsiusToFahrenheit(currentTemp) : null,
+  
+  // Raw celsius values - always present
+  currentTempC: currentTemp,
+  coolSetpointC: coolSetpoint,
+  heatSetpointC: heatSetpoint,
+  startTempC: sessionData?.startTemp || null,
+  endTempC: currentTemp,
+  
+  // Timestamps - always present
+  timestamp,
+  eventId: eventData.eventId,
+  eventTimestamp: eventTime
+};
+```
+
+}
+
+// ALWAYS send to Bubble (with appropriate runtime values)
+let payload;
+
+if (isActive && !wasActive) {
+// Just turned on - start new session, send temp update
+sessions[key] = {
+startTime: eventTime,
+startStatus: hvacStatus,
+startTemp: currentTemp
+};
+console.log(`🟢 Starting ${hvacStatus} session for ${key}`);
+
+```
+payload = createBubblePayload(0, false); // 0 runtime, not a runtime event
+```
+
+} else if (!isActive && wasActive) {
+// Just turned off - calculate runtime
+const session = sessions[key];
+if (session) {
+const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
+
+```
+  // Basic validation (same as your Enode logic)
+  if (runtimeSeconds > 0 && runtimeSeconds < 86400) { // 0 to 24 hours
+    delete sessions[key];
+    payload = createBubblePayload(runtimeSeconds, true, session); // Actual runtime event
   } else {
     console.warn(`⚠️ Invalid runtime ${runtimeSeconds}s for ${key}, skipping`);
     delete sessions[key];
+    payload = createBubblePayload(0, false); // Send temp update with 0 runtime
   }
+} else {
+  payload = createBubblePayload(0, false); // No session found, send temp update
 }
 ```
 
@@ -128,15 +174,39 @@ startStatus: hvacStatus,
 startTemp: currentTemp
 };
 console.log(`🔄 Restarting ${hvacStatus} session for ${key}`);
+
+```
+payload = createBubblePayload(0, false); // Send temp update
+```
+
+} else {
+// No state change, just temperature/setpoint update
+payload = createBubblePayload(0, false); // Send temp update
 }
 
-// Track current state for next event (enhanced from your Enode version)
-deviceStates[key] = {
-isActive,
-status: hvacStatus,
-temp: currentTemp,
-lastUpdate: eventTime
-};
+// Send to Bubble (every event gets sent)
+try {
+await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload);
+console.log(‘✅ Sent to Bubble:’, payload);
+} catch (err) {
+console.error(‘❌ Failed to send to Bubble:’, err.response?.data || err.message);
+
+```
+// Retry logic
+if (err.code === 'ECONNABORTED' || err.code === 'ENOTFOUND') {
+  console.log('🔄 Retrying in 5 seconds...');
+  setTimeout(async () => {
+    try {
+      await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload);
+      console.log('✅ Retry successful:', payload);
+    } catch (retryErr) {
+      console.error('❌ Retry failed:', retryErr.message);
+    }
+  }, 5000);
+}
+```
+
+}
 }
 
 // Cleanup logic (same as your Enode version)
