@@ -156,5 +156,5 @@ setInterval(() => {
 }, 6 * 60 * 60 * 1000); // Every 6 hours
 
 module.exports = {
-  handleNestEvent: handleEvent
+  handleEvent: handleNestEvent
 };
