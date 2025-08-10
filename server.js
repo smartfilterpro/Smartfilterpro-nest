@@ -104,6 +104,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: Math.round(runtimeSeconds / 60),
       isRuntimeEvent,
       hvacMode: hvacStatus,
+      isHvacActive: isActive, // ← Added boolean true/false field
       thermostatMode: mode,
       currentTempF: currentTemp ? celsiusToFahrenheit(currentTemp) : null,
       coolSetpointF: coolSetpoint ? celsiusToFahrenheit(coolSetpoint) : null,
@@ -186,6 +187,7 @@ async function handleNestEvent(eventData) {
         runtimeSeconds: payload.runtimeSeconds,
         isRuntimeEvent: payload.isRuntimeEvent,
         hvacMode: payload.hvacMode,
+        isHvacActive: payload.isHvacActive,
         currentTempF: payload.currentTempF
       });
       console.log('✅ Sent to Bubble:', logData);
@@ -216,6 +218,7 @@ async function handleNestEvent(eventData) {
         runtimeSeconds: payload.runtimeSeconds,
         isRuntimeEvent: payload.isRuntimeEvent,
         hvacMode: payload.hvacMode,
+        isHvacActive: payload.isHvacActive,
         currentTempF: payload.currentTempF
       });
       console.log('📝 Would send to Bubble (no URL configured):', logData);
