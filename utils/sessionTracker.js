@@ -9,7 +9,7 @@ const MAX_RUNTIME_HOURS = 24;               // maximum reasonable runtime
 const MIN_RUNTIME_SECONDS = 5;              // minimum runtime to consider valid
 // ————————————————
 
-// Session storage (same pattern as Enode)
+// Session storage
 const sessions = {};
 const deviceStates = {}; // Track previous HVAC state + last post info
 
@@ -20,11 +20,6 @@ const missing = required.filter(key => !process.env[key]);
 
 if (missing.length > 0) {
 throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
-}
-
-// Validate thresholds
-if (TEMP_CHANGE_C_THRESHOLD <= 0 || TEMP_CHANGE_C_THRESHOLD > 5) {
-console.warn(`⚠️ Unusual temperature threshold: ${TEMP_CHANGE_C_THRESHOLD}°C`);
 }
 
 console.log(‘✅ Nest configuration validated:’, {
@@ -63,7 +58,6 @@ return Math.round((celsius * 9/5) + 32);
 }
 
 function shouldRetry(err) {
-// Retry on network errors and 5xx server errors
 const networkErrors = [‘ECONNABORTED’, ‘ENOTFOUND’, ‘ECONNRESET’, ‘EAI_AGAIN’, ‘ETIMEDOUT’];
 const retryableStatus = err.response?.status >= 500 || err.response?.status === 429;
 
@@ -72,10 +66,9 @@ return networkErrors.includes(err.code) || retryableStatus;
 
 async function sendToBubble(payload, retryCount = 0) {
 const maxRetries = 3;
-const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 10000); // Exponential backoff, max 10s
+const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 10000);
 
 try {
-// Validate payload before sending
 if (!payload || typeof payload !== ‘object’) {
 console.error(‘❌ Invalid payload for Bubble:’, payload);
 return false;
@@ -90,21 +83,13 @@ const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
   }
 });
 
-if (process.env.DEBUG_NEST_EVENTS === "1") {
-  console.log('✅ Sent to Bubble:', {
-    deviceId: payload.thermostatId,
-    isRuntimeEvent: payload.isRuntimeEvent,
-    currentTempF: payload.currentTempF,
-    hvacStatus: payload.hvacMode,
-    status: response.status
-  });
-} else {
-  console.log('✅ Sent to Bubble:', {
-    deviceId: payload.thermostatId,
-    isRuntimeEvent: payload.isRuntimeEvent,
-    tempF: payload.currentTempF
-  });
-}
+console.log('✅ Sent to Bubble:', {
+  deviceId: payload.thermostatId,
+  isRuntimeEvent: payload.isRuntimeEvent,
+  currentTempF: payload.currentTempF,
+  hvacMode: payload.hvacMode,
+  runtimeSeconds: payload.runtimeSeconds
+});
 return true;
 ```
 
@@ -156,7 +141,6 @@ Math.abs(coolSetpoint - lastState.lastPostedCoolSetpoint) >= SETPOINT_CHANGE_C_T
 const heatChanged = heatSetpoint != null && lastState.lastPostedHeatSetpoint != null &&
 Math.abs(heatSetpoint - lastState.lastPostedHeatSetpoint) >= SETPOINT_CHANGE_C_THRESHOLD;
 
-// Also trigger if we have a new setpoint and didn’t have one before
 const newCoolSetpoint = coolSetpoint != null && lastState.lastPostedCoolSetpoint == null;
 const newHeatSetpoint = heatSetpoint != null && lastState.lastPostedHeatSetpoint == null;
 
@@ -184,7 +168,7 @@ console.warn(`⚠️ Temperature outside reasonable range ${context}: ${temp}°C
 return temp;
 }
 
-// Standard payload creator - SAME shape for all events
+// Standard payload creator
 function createBubblePayload({
 userId,
 deviceId,
@@ -222,6 +206,7 @@ isRuntimeEvent,
 // Current status
 hvacMode: hvacStatus,     // "HEATING", "COOLING", "OFF"
 thermostatMode: mode,     // "HEAT", "COOL", "HEAT_COOL", "OFF"
+isHvacActive: hvacStatus === 'HEATING' || hvacStatus === 'COOLING',
 
 // Temperature data (F)
 currentTempF: celsiusToFahrenheit(validCurrentTemp),
@@ -309,7 +294,10 @@ eventCount: (lastState?.eventCount || 0) + 1
 }
 
 async function handleEvent(eventData) {
-// Add comprehensive validation
+// Log the event we’re processing
+console.log(`🔵 Processing Nest event: ${eventData.eventId || 'no-event-id'}`);
+
+// Add comprehensive validation with better debugging
 if (!eventData || typeof eventData !== ‘object’) {
 console.warn(‘⚠️ Invalid event data received:’, typeof eventData);
 return;
@@ -317,14 +305,22 @@ return;
 
 // Extract data with better error handling
 const userId = eventData.userId;
-const deviceName = eventData.resourceUpdate?.name;
-const traits = eventData.resourceUpdate?.traits;
+const resourceUpdate = eventData.resourceUpdate;
+const deviceName = resourceUpdate?.name;
+const traits = resourceUpdate?.traits;
 const timestampIso = eventData.timestamp;
 
 // Log raw event for debugging
 if (process.env.DEBUG_NEST_EVENTS === “1”) {
 console.log(‘🧩 RAW NEST EVENT:’);
 console.dir(eventData, { depth: null });
+console.log(‘🔍 EXTRACTED DATA:’, {
+userId,
+deviceName,
+hasTraits: !!traits,
+timestampIso,
+traitKeys: traits ? Object.keys(traits) : []
+});
 }
 
 // Extract device ID more safely
@@ -334,18 +330,23 @@ const parts = deviceName.split(’/’);
 deviceId = parts[parts.length - 1];
 }
 
-// Validate required fields
-if (!userId || !deviceId || !timestampIso) {
-console.warn(‘⚠️ Missing required fields in Nest event:’, {
-hasUserId: !!userId,
-hasDeviceId: !!deviceId,
-hasTimestamp: !!timestampIso,
-deviceName
-});
+// More flexible validation - don’t require all fields immediately
+if (!userId) {
+console.warn(‘⚠️ Missing userId in Nest event’);
 return;
 }
 
-// Extract traits with validation
+if (!deviceId) {
+console.warn(‘⚠️ Missing or invalid deviceId in Nest event:’, deviceName);
+return;
+}
+
+if (!timestampIso) {
+console.warn(‘⚠️ Missing timestamp in Nest event’);
+return;
+}
+
+// Extract traits with validation - handle missing traits more gracefully
 const hvacTrait = traits?.[‘sdm.devices.traits.ThermostatHvac’];
 const tempTrait = traits?.[‘sdm.devices.traits.Temperature’];
 const setpointTrait = traits?.[‘sdm.devices.traits.ThermostatTemperatureSetpoint’];
@@ -357,26 +358,46 @@ const coolSetpoint = setpointTrait?.coolCelsius;
 const heatSetpoint = setpointTrait?.heatCelsius;
 const mode = modeTrait?.mode;
 
-// Validate HVAC status is present (this seems to be required for your logic)
-if (!hvacStatus) {
+// Debug extracted values
 if (process.env.DEBUG_NEST_EVENTS === “1”) {
-console.warn(‘⚠️ No HVAC status in event, treating as temperature-only update:’, {
-deviceId,
-hasTemp: currentTemp != null,
-hasCoolSetpoint: coolSetpoint != null,
-hasHeatSetpoint: heatSetpoint != null
+console.log(‘🔍 EXTRACTED VALUES:’, {
+hvacStatus,
+currentTemp,
+coolSetpoint,
+heatSetpoint,
+mode,
+hasHvacTrait: !!hvacTrait,
+hasTempTrait: !!tempTrait,
+hasSetpointTrait: !!setpointTrait,
+hasModeTrait: !!modeTrait
 });
 }
 
-```
-// Handle temperature-only updates
+// Check if we have any meaningful data
+const hasTemperature = currentTemp != null;
+const hasSetpoints = coolSetpoint != null || heatSetpoint != null;
+const hasHvacStatus = hvacStatus != null;
+const hasMode = mode != null;
+
+if (!hasTemperature && !hasSetpoints && !hasHvacStatus && !hasMode) {
+console.warn(‘⚠️ Skipping incomplete Nest event - no temperature, setpoints, HVAC status, or mode’);
+return;
+}
+
+// Handle cases where we don’t have HVAC status but have other data
+if (!hasHvacStatus && (hasTemperature || hasSetpoints)) {
+console.log(`🌡️ Temperature/setpoint-only event for ${deviceId}`);
 await handleTemperatureOnlyUpdate({
-  userId, deviceId, deviceName, currentTemp, coolSetpoint, heatSetpoint, 
-  mode, timestampIso, eventData
+userId, deviceId, deviceName, currentTemp, coolSetpoint, heatSetpoint,
+mode, timestampIso, eventData
 });
 return;
-```
+}
 
+// Continue with full event processing if we have HVAC status
+if (!hasHvacStatus) {
+console.warn(‘⚠️ Skipping event - no HVAC status and no temperature/setpoint data’);
+return;
 }
 
 const key = makeKey(userId, deviceId);
@@ -396,7 +417,7 @@ startTime: eventTimeMs,
 startStatus: hvacStatus,
 startTemp: currentTemp
 };
-console.log(`🟢 Starting ${hvacStatus} session for ${key}`);
+console.log(`🟢 Starting ${hvacStatus} session for ${key.substring(0, 16)}...`);
 
 ```
 payload = createBubblePayload({
@@ -421,7 +442,7 @@ const runtimeSeconds = Math.floor(runtimeMs / 1000);
       runtimeSeconds <= maxRuntimeSeconds && 
       runtimeMs >= (MIN_RUNTIME_SECONDS * 1000)) {
     
-    console.log(`🔴 Ending ${session.startStatus} session for ${key}: ${runtimeSeconds}s`);
+    console.log(`🔴 Ending ${session.startStatus} session for ${key.substring(0, 16)}...: ${runtimeSeconds}s`);
     delete sessions[key];
     
     payload = createBubblePayload({
@@ -458,7 +479,7 @@ startTime: eventTimeMs,
 startStatus: hvacStatus,
 startTemp: currentTemp
 };
-console.log(`🔄 Restarting ${hvacStatus} session for ${key}`);
+console.log(`🔄 Restarting ${hvacStatus} session for ${key.substring(0, 16)}...`);
 
 ```
 payload = createBubblePayload({
@@ -488,7 +509,7 @@ if (!tempChanged && !setpointChanged && !forcePostDueToTime) {
   return;
 }
 
-console.log(`🌡️ Temperature/setpoint update for ${key}:`, {
+console.log(`🌡️ Temperature/setpoint update for ${key.substring(0, 16)}...:`, {
   tempChanged,
   setpointChanged, 
   forcePostDueToTime,
@@ -541,7 +562,7 @@ if (!state?.userId || !state?.deviceId || !state?.status) continue;
 ```
 const tooLongSincePost = !state.lastPostTime || (now - state.lastPostTime >= MIN_POST_INTERVAL_MS);
 
-// Heartbeat even if OFF to keep Bubble fresh, but this is easy to switch to "only when active"
+// Heartbeat even if OFF to keep Bubble fresh
 if (tooLongSincePost) {
   const timestampIso = new Date(now).toISOString();
   const eventTimeMs = now;
