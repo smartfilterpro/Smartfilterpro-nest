@@ -1,17 +1,16 @@
 const axios = require(‘axios’);
 
 // —————– Config knobs —————–
-const MIN_POST_INTERVAL_MS = 60_000;         // ensure at least one post per device per minute
-const TEMP_CHANGE_C_THRESHOLD = 0.1;         // post if ambient temp changes by ≥ 0.1°C
-const SETPOINT_CHANGE_C_THRESHOLD = 0.1;     // post if setpoint changes by ≥ 0.1°C
-const HEARTBEAT_INTERVAL_MS = 10_000;        // how often to scan for stale devices to post
-const MAX_RUNTIME_HOURS = 24;               // maximum reasonable runtime
-const MIN_RUNTIME_SECONDS = 5;              // minimum runtime to consider valid
-// ————————————————
+const MIN_POST_INTERVAL_MS = 60_000;  
+const TEMP_CHANGE_C_THRESHOLD = 0.1;  
+const SETPOINT_CHANGE_C_THRESHOLD = 0.1;  
+const HEARTBEAT_INTERVAL_MS = 10_000;  
+const MAX_RUNTIME_HOURS = 24;  
+const MIN_RUNTIME_SECONDS = 5;
 
 // Session storage
 const sessions = {};
-const deviceStates = {}; // Track previous HVAC state + last post info
+const deviceStates = {};
 
 // Add configuration validation
 function validateConfiguration() {
@@ -32,7 +31,6 @@ debugMode: process.env.DEBUG_NEST_EVENTS === “1”
 });
 }
 
-// Call on module load
 validateConfiguration();
 
 function toTimestamp(dateStr) {
@@ -75,6 +73,9 @@ return false;
 }
 
 ```
+// LOG THE PAYLOAD WE'RE SENDING
+console.log('🚀 SENDING TO BUBBLE:', JSON.stringify(payload, null, 2));
+
 const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
   timeout: 15000,
   headers: {
@@ -83,7 +84,8 @@ const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
   }
 });
 
-console.log('✅ Sent to Bubble:', {
+console.log('✅ BUBBLE RESPONSE:', response.status, response.data);
+console.log('✅ Sent to Bubble SUCCESS:', {
   deviceId: payload.thermostatId,
   isRuntimeEvent: payload.isRuntimeEvent,
   currentTempF: payload.currentTempF,
@@ -98,14 +100,15 @@ const isRetryable = shouldRetry(err);
 const canRetry = retryCount < maxRetries && isRetryable;
 
 ```
-console.error('❌ Failed to send to Bubble:', {
+console.error('❌ BUBBLE ERROR:', {
   deviceId: payload.thermostatId,
   error: err.response?.data || err.message,
   status: err.response?.status,
   code: err.code,
   retryCount,
   canRetry,
-  retryable: isRetryable
+  retryable: isRetryable,
+  fullError: err.toJSON ? err.toJSON() : err
 });
 
 if (canRetry) {
@@ -126,14 +129,14 @@ return `${userId}-${deviceId}`;
 
 function shouldPostTemperatureUpdate(currentTemp, lastPostedTemp) {
 if (currentTemp == null) return false;
-if (lastPostedTemp == null) return true; // First reading
+if (lastPostedTemp == null) return true;
 
 const delta = Math.abs(currentTemp - lastPostedTemp);
 return delta >= TEMP_CHANGE_C_THRESHOLD;
 }
 
 function shouldPostSetpointUpdate(coolSetpoint, heatSetpoint, lastState) {
-if (!lastState) return !!(coolSetpoint != null || heatSetpoint != null); // First reading
+if (!lastState) return !!(coolSetpoint != null || heatSetpoint != null);
 
 const coolChanged = coolSetpoint != null && lastState.lastPostedCoolSetpoint != null &&
 Math.abs(coolSetpoint - lastState.lastPostedCoolSetpoint) >= SETPOINT_CHANGE_C_THRESHOLD;
@@ -160,7 +163,6 @@ console.warn(`⚠️ Invalid temperature value ${context}: ${temp}`);
 return null;
 }
 
-// Validate reasonable temperature ranges (in Celsius)
 if (temp < -50 || temp > 80) {
 console.warn(`⚠️ Temperature outside reasonable range ${context}: ${temp}°C`);
 }
@@ -168,77 +170,12 @@ console.warn(`⚠️ Temperature outside reasonable range ${context}: ${temp}°C
 return temp;
 }
 
-// FIXED: Better trait extraction with fallbacks
-function extractNestTraits(eventData) {
-// First check for direct trait access
-let traits = eventData.resourceUpdate?.traits;
-
-// If not found, check other possible locations
-if (!traits) {
-traits = eventData.traits || eventData.data?.traits || eventData.resourceUpdate?.data?.traits;
-}
-
-// Log raw structure for debugging
-if (process.env.DEBUG_NEST_EVENTS === “1”) {
-console.log(‘🔍 TRAIT EXTRACTION DEBUG:’, {
-hasResourceUpdate: !!eventData.resourceUpdate,
-hasTraits: !!traits,
-resourceUpdateKeys: eventData.resourceUpdate ? Object.keys(eventData.resourceUpdate) : [],
-eventDataKeys: Object.keys(eventData),
-fullEventData: JSON.stringify(eventData, null, 2)
-});
-}
-
-if (!traits || typeof traits !== ‘object’) {
-console.warn(‘⚠️ No traits found in event data’);
-return null;
-}
-
-// Extract the specific traits we need
-const hvacTrait = traits[‘sdm.devices.traits.ThermostatHvac’];
-const tempTrait = traits[‘sdm.devices.traits.Temperature’];
-const setpointTrait = traits[‘sdm.devices.traits.ThermostatTemperatureSetpoint’];
-const modeTrait = traits[‘sdm.devices.traits.ThermostatMode’];
-
-return {
-hvacStatus: hvacTrait?.status,
-currentTemp: tempTrait?.ambientTemperatureCelsius,
-coolSetpoint: setpointTrait?.coolCelsius,
-heatSetpoint: setpointTrait?.heatCelsius,
-mode: modeTrait?.mode,
-rawTraits: traits // Keep raw traits for debugging
-};
-}
-
-// FIXED: Better device ID extraction
-function extractDeviceInfo(eventData) {
-let deviceName = eventData.resourceUpdate?.name;
-let deviceId;
-
-// Try multiple possible locations for device info
-if (!deviceName) {
-deviceName = eventData.name || eventData.device?.name || eventData.deviceName;
-}
-
-if (deviceName && typeof deviceName === ‘string’) {
-// Extract device ID from the resource name
-const parts = deviceName.split(’/’);
-deviceId = parts[parts.length - 1];
-} else {
-// Try direct device ID fields
-deviceId = eventData.deviceId || eventData.device?.id || eventData.resourceUpdate?.id;
-}
-
-return { deviceName, deviceId };
-}
-
-// Standard payload creator
 function createBubblePayload({
 userId,
 deviceId,
 deviceName,
-hvacStatus,          // “HEATING”,“COOLING”,“OFF”
-mode,                // “HEAT”,“COOL”,“HEAT_COOL”,“OFF”
+hvacStatus,
+mode,
 currentTemp,
 coolSetpoint,
 heatSetpoint,
@@ -249,400 +186,285 @@ runtimeSeconds = 0,
 isRuntimeEvent = false,
 sessionData = null
 }) {
-// Validate temperatures
 const validCurrentTemp = validateTemperature(currentTemp, ‘currentTemp’);
 const validCoolSetpoint = validateTemperature(coolSetpoint, ‘coolSetpoint’);
 const validHeatSetpoint = validateTemperature(heatSetpoint, ‘heatSetpoint’);
 const validStartTemp = validateTemperature(sessionData?.startTemp, ‘startTemp’);
 
-return {
-// User and device info
+const payload = {
 userId,
 thermostatId: deviceId,
 deviceName,
-
-```
-// Runtime data (0 for temperature updates, actual for runtime events)
 runtimeSeconds,
 runtimeMinutes: Math.round(runtimeSeconds / 60),
 isRuntimeEvent,
-
-// Current status
-hvacMode: hvacStatus,     // "HEATING", "COOLING", "OFF"
-thermostatMode: mode,     // "HEAT", "COOL", "HEAT_COOL", "OFF"
-isHvacActive: hvacStatus === 'HEATING' || hvacStatus === 'COOLING',
-
-// Temperature data (F)
+hvacMode: hvacStatus,
+thermostatMode: mode,
+isHvacActive: hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’,
 currentTempF: celsiusToFahrenheit(validCurrentTemp),
 coolSetpointF: celsiusToFahrenheit(validCoolSetpoint),
 heatSetpointF: celsiusToFahrenheit(validHeatSetpoint),
-
-// Session start temperatures (only meaningful for runtime events)
 startTempF: celsiusToFahrenheit(validStartTemp),
 endTempF: celsiusToFahrenheit(validCurrentTemp),
-
-// Raw celsius values
 currentTempC: validCurrentTemp,
 coolSetpointC: validCoolSetpoint,
 heatSetpointC: validHeatSetpoint,
 startTempC: validStartTemp,
 endTempC: validCurrentTemp,
-
-// Timestamps
 timestamp: timestampIso,
 eventId,
 eventTimestamp: eventTimeMs
-```
-
 };
+
+console.log(‘🔧 CREATED PAYLOAD:’, JSON.stringify(payload, null, 2));
+return payload;
 }
 
-async function handleTemperatureOnlyUpdate({
-userId, deviceId, deviceName, currentTemp, coolSetpoint, heatSetpoint,
-mode, timestampIso, eventData
-}) {
-const key = makeKey(userId, deviceId);
-const lastState = deviceStates[key];
-
-// Use last known HVAC status if we don’t have it in this event
-const hvacStatus = lastState?.status || ‘OFF’;
-
-const tempChanged = shouldPostTemperatureUpdate(currentTemp, lastState?.lastPostedTempC);
-const setpointChanged = shouldPostSetpointUpdate(coolSetpoint, heatSetpoint, lastState);
-const timeSinceLastPost = Date.now() - (lastState?.lastPostTime || 0);
-const forcePostDueToTime = timeSinceLastPost >= MIN_POST_INTERVAL_MS;
-
-if (!tempChanged && !setpointChanged && !forcePostDueToTime) {
-if (process.env.DEBUG_NEST_EVENTS === “1”) {
-console.log(`📊 Skipping temperature-only update for ${key}:`, {
-tempDelta: getTempDelta(currentTemp, lastState?.lastPostedTempC)?.toFixed(3),
-timeSincePost: Math.round(timeSinceLastPost/1000)
-});
-}
-return;
-}
-
-console.log(`🌡️ Temperature/setpoint update for ${key}:`, {
-tempChanged,
-setpointChanged,
-forcePostDueToTime,
-currentTemp: currentTemp?.toFixed(1),
-lastTemp: lastState?.lastPostedTempC?.toFixed(1)
-});
-
-const eventTimeMs = toTimestamp(timestampIso);
-const payload = createBubblePayload({
-userId, deviceId, deviceName,
-hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-timestampIso, eventId: eventData.eventId, eventTimeMs,
-runtimeSeconds: 0, isRuntimeEvent: false
-});
-
-const ok = await sendToBubble(payload);
-
-// Update state
-if (ok) {
-const now = Date.now();
-deviceStates[key] = {
-…lastState,
-userId, deviceId, deviceName,
-currentTemp, coolSetpoint, heatSetpoint, mode,
-lastUpdate: eventTimeMs,
-lastPostTime: now,
-lastPostedTempC: currentTemp,
-lastPostedCoolSetpoint: coolSetpoint,
-lastPostedHeatSetpoint: heatSetpoint,
-eventCount: (lastState?.eventCount || 0) + 1
-};
-}
-}
-
+// MAIN EVENT HANDLER WITH EXTREME DEBUGGING
 async function handleEvent(eventData) {
-// Log the event we’re processing
-console.log(`🔵 Processing Nest event: ${eventData.eventId || 'no-event-id'}`);
+console.log(’\n’ + ‘=’.repeat(80));
+console.log(`🔵 PROCESSING NEST EVENT: ${eventData.eventId || 'no-event-id'}`);
+console.log(’=’.repeat(80));
 
-// Add comprehensive validation with better debugging
+// LOG EVERYTHING ABOUT THE INCOMING EVENT
+console.log(‘📥 RAW EVENT DATA:’);
+console.log(JSON.stringify(eventData, null, 2));
+console.log(‘📊 EVENT DATA ANALYSIS:’);
+console.log(’- Type:’, typeof eventData);
+console.log(’- Keys:’, Object.keys(eventData || {}));
+console.log(’- Has resourceUpdate:’, !!eventData.resourceUpdate);
+console.log(’- Has traits:’, !!eventData.resourceUpdate?.traits);
+console.log(’- Has userId:’, !!eventData.userId);
+console.log(’- Has timestamp:’, !!eventData.timestamp);
+
 if (!eventData || typeof eventData !== ‘object’) {
-console.warn(‘⚠️ Invalid event data received:’, typeof eventData);
+console.error(‘❌ INVALID EVENT DATA’);
 return;
 }
 
-// FIXED: Better data extraction
+// EXTRACT BASIC INFO
 const userId = eventData.userId;
 const timestampIso = eventData.timestamp;
 
-// Extract device info with fallbacks
-const { deviceName, deviceId } = extractDeviceInfo(eventData);
+console.log(‘🔍 BASIC EXTRACTION:’);
+console.log(’- userId:’, userId);
+console.log(’- timestamp:’, timestampIso);
 
-// Extract traits with better error handling
-const traitData = extractNestTraits(eventData);
+// EXTRACT DEVICE INFO - TRY EVERY POSSIBLE LOCATION
+let deviceName, deviceId;
 
-// Log raw event for debugging
-if (process.env.DEBUG_NEST_EVENTS === “1”) {
-console.log(‘🧩 RAW NEST EVENT:’);
-console.dir(eventData, { depth: null });
-console.log(‘🔍 EXTRACTED DATA:’, {
-userId,
-deviceName,
-deviceId,
-timestampIso,
-traitData,
-hasTraitData: !!traitData
-});
+console.log(‘🔍 DEVICE INFO EXTRACTION:’);
+
+// Try resourceUpdate.name first
+if (eventData.resourceUpdate?.name) {
+deviceName = eventData.resourceUpdate.name;
+console.log(’- Found deviceName in resourceUpdate.name:’, deviceName);
 }
 
-// Validate essential fields
+// Try other locations
+if (!deviceName) {
+deviceName = eventData.name || eventData.device?.name || eventData.deviceName;
+console.log(’- Found deviceName in fallback location:’, deviceName);
+}
+
+if (deviceName && typeof deviceName === ‘string’) {
+const parts = deviceName.split(’/’);
+deviceId = parts[parts.length - 1];
+console.log(’- Extracted deviceId from deviceName:’, deviceId);
+} else {
+deviceId = eventData.deviceId || eventData.device?.id || eventData.resourceUpdate?.id;
+console.log(’- Found deviceId in direct field:’, deviceId);
+}
+
+console.log(’- Final deviceName:’, deviceName);
+console.log(’- Final deviceId:’, deviceId);
+
+// EXTRACT TRAITS - TRY EVERY POSSIBLE LOCATION
+let traits;
+
+console.log(‘🔍 TRAITS EXTRACTION:’);
+
+if (eventData.resourceUpdate?.traits) {
+traits = eventData.resourceUpdate.traits;
+console.log(’- Found traits in resourceUpdate.traits’);
+} else if (eventData.traits) {
+traits = eventData.traits;
+console.log(’- Found traits in direct traits field’);
+} else if (eventData.data?.traits) {
+traits = eventData.data.traits;
+console.log(’- Found traits in data.traits’);
+} else if (eventData.resourceUpdate?.data?.traits) {
+traits = eventData.resourceUpdate.data.traits;
+console.log(’- Found traits in resourceUpdate.data.traits’);
+}
+
+console.log(’- Traits found:’, !!traits);
+console.log(’- Traits type:’, typeof traits);
+console.log(’- Traits keys:’, traits ? Object.keys(traits) : ‘none’);
+
+if (traits) {
+console.log(’- Full traits object:’);
+console.log(JSON.stringify(traits, null, 2));
+}
+
+// EXTRACT INDIVIDUAL TRAIT VALUES
+let hvacStatus, currentTemp, coolSetpoint, heatSetpoint, mode;
+
+console.log(‘🔍 INDIVIDUAL TRAIT EXTRACTION:’);
+
+if (traits) {
+const hvacTrait = traits[‘sdm.devices.traits.ThermostatHvac’];
+const tempTrait = traits[‘sdm.devices.traits.Temperature’];
+const setpointTrait = traits[‘sdm.devices.traits.ThermostatTemperatureSetpoint’];
+const modeTrait = traits[‘sdm.devices.traits.ThermostatMode’];
+
+```
+console.log('- hvacTrait:', JSON.stringify(hvacTrait, null, 2));
+console.log('- tempTrait:', JSON.stringify(tempTrait, null, 2));
+console.log('- setpointTrait:', JSON.stringify(setpointTrait, null, 2));
+console.log('- modeTrait:', JSON.stringify(modeTrait, null, 2));
+
+hvacStatus = hvacTrait?.status;
+currentTemp = tempTrait?.ambientTemperatureCelsius;
+coolSetpoint = setpointTrait?.coolCelsius;
+heatSetpoint = setpointTrait?.heatCelsius;
+mode = modeTrait?.mode;
+```
+
+}
+
+console.log(‘🔍 FINAL EXTRACTED VALUES:’);
+console.log(’- hvacStatus:’, hvacStatus);
+console.log(’- currentTemp:’, currentTemp);
+console.log(’- coolSetpoint:’, coolSetpoint);
+console.log(’- heatSetpoint:’, heatSetpoint);
+console.log(’- mode:’, mode);
+
+// VALIDATION
+console.log(‘🔍 VALIDATION:’);
+console.log(’- Has userId:’, !!userId);
+console.log(’- Has deviceId:’, !!deviceId);
+console.log(’- Has timestampIso:’, !!timestampIso);
+console.log(’- Has traits:’, !!traits);
+
 if (!userId) {
-console.warn(‘⚠️ Missing userId in Nest event’);
+console.error(‘❌ VALIDATION FAILED: Missing userId’);
 return;
 }
 
 if (!deviceId) {
-console.warn(‘⚠️ Missing or invalid deviceId in Nest event:’, { deviceName, extractedId: deviceId });
+console.error(‘❌ VALIDATION FAILED: Missing deviceId’);
 return;
 }
 
 if (!timestampIso) {
-console.warn(‘⚠️ Missing timestamp in Nest event’);
+console.error(‘❌ VALIDATION FAILED: Missing timestamp’);
 return;
 }
 
-// Handle case where trait extraction failed
-if (!traitData) {
-console.warn(‘⚠️ Could not extract traits from Nest event’);
+if (!traits) {
+console.error(‘❌ VALIDATION FAILED: Missing traits’);
 return;
 }
 
-const { hvacStatus, currentTemp, coolSetpoint, heatSetpoint, mode } = traitData;
-
-// Debug extracted values
-if (process.env.DEBUG_NEST_EVENTS === “1”) {
-console.log(‘🔍 EXTRACTED VALUES:’, {
-hvacStatus,
-currentTemp,
-coolSetpoint,
-heatSetpoint,
-mode
-});
-}
-
-// FIXED: More permissive validation - send if we have ANY useful data
+// CHECK WHAT DATA WE HAVE
 const hasTemperature = currentTemp != null && Number.isFinite(currentTemp);
 const hasSetpoints = (coolSetpoint != null && Number.isFinite(coolSetpoint)) ||
 (heatSetpoint != null && Number.isFinite(heatSetpoint));
 const hasHvacStatus = hvacStatus != null && hvacStatus !== ‘’;
 const hasMode = mode != null && mode !== ‘’;
 
-if (!hasTemperature && !hasSetpoints && !hasHvacStatus && !hasMode) {
-console.warn(‘⚠️ Skipping incomplete Nest event - no useful data found:’, {
-hasTemperature,
-hasSetpoints,
-hasHvacStatus,
-hasMode,
-currentTemp,
-coolSetpoint,
-heatSetpoint,
-hvacStatus,
-mode
-});
-return;
-}
+console.log(‘🔍 DATA AVAILABILITY:’);
+console.log(’- hasTemperature:’, hasTemperature);
+console.log(’- hasSetpoints:’, hasSetpoints);
+console.log(’- hasHvacStatus:’, hasHvacStatus);
+console.log(’- hasMode:’, hasMode);
 
-// FORCE SEND even if incomplete - let Bubble handle it
-console.log(‘🚀 Forcing send with available data:’, {
-hasTemperature,
-hasSetpoints,
-hasHvacStatus,
-hasMode,
-currentTemp: currentTemp?.toFixed(1),
-hvacStatus,
-mode
-});
+// ALWAYS TRY TO SEND SOMETHING - EVEN IF INCOMPLETE
+console.log(‘🚀 ATTEMPTING TO SEND DATA REGARDLESS…’);
 
-// Handle cases where we don’t have HVAC status but have other data
-if (!hasHvacStatus && (hasTemperature || hasSetpoints)) {
-console.log(`🌡️ Temperature/setpoint-only event for ${deviceId}`);
-await handleTemperatureOnlyUpdate({
-userId, deviceId, deviceName, currentTemp, coolSetpoint, heatSetpoint,
-mode, timestampIso, eventData
-});
-return;
-}
-
-// Continue with full event processing
 const key = makeKey(userId, deviceId);
 const eventTimeMs = toTimestamp(timestampIso);
+const safeHvacStatus = hvacStatus || ‘UNKNOWN’;
+const safeMode = mode || ‘UNKNOWN’;
 
-// Determine activity - be more defensive with defaults
-const safeHvacStatus = hvacStatus || ‘OFF’;
-const isActive = safeHvacStatus === ‘HEATING’ || safeHvacStatus === ‘COOLING’;
-const wasActive = deviceStates[key]?.isActive || false;
-
-// Sessions
-let payload;
-
-if (isActive && !wasActive) {
-// Turned on — start session
-sessions[key] = {
-startTime: eventTimeMs,
-startStatus: safeHvacStatus,
-startTemp: currentTemp
-};
-console.log(`🟢 Starting ${safeHvacStatus} session for ${key.substring(0, 16)}...`);
-
-```
-payload = createBubblePayload({
-  userId, deviceId, deviceName,
-  hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-  timestampIso, eventId: eventData.eventId, eventTimeMs,
-  runtimeSeconds: 0, isRuntimeEvent: false
-});
-```
-
-} else if (!isActive && wasActive) {
-// Turned off — end session
-const session = sessions[key];
-if (session) {
-const runtimeMs = eventTimeMs - session.startTime;
-const runtimeSeconds = Math.floor(runtimeMs / 1000);
-
-```
-  // More robust runtime validation
-  const maxRuntimeSeconds = MAX_RUNTIME_HOURS * 3600;
-  if (runtimeSeconds >= MIN_RUNTIME_SECONDS && 
-      runtimeSeconds <= maxRuntimeSeconds && 
-      runtimeMs >= (MIN_RUNTIME_SECONDS * 1000)) {
-    
-    console.log(`🔴 Ending ${session.startStatus} session for ${key.substring(0, 16)}...: ${runtimeSeconds}s`);
-    delete sessions[key];
-    
-    payload = createBubblePayload({
-      userId, deviceId, deviceName,
-      hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-      timestampIso, eventId: eventData.eventId, eventTimeMs,
-      runtimeSeconds, isRuntimeEvent: true, sessionData: session
-    });
-  } else {
-    console.warn(`⚠️ Invalid runtime ${runtimeSeconds}s (${runtimeMs}ms) for ${key}, sending temp update instead`);
-    delete sessions[key];
-    
-    payload = createBubblePayload({
-      userId, deviceId, deviceName,
-      hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-      timestampIso, eventId: eventData.eventId, eventTimeMs,
-      runtimeSeconds: 0, isRuntimeEvent: false
-    });
-  }
-} else {
-  payload = createBubblePayload({
-    userId, deviceId, deviceName,
-    hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-    timestampIso, eventId: eventData.eventId, eventTimeMs,
-    runtimeSeconds: 0, isRuntimeEvent: false
-  });
-}
-```
-
-} else if (isActive && !sessions[key]) {
-// Active but we lost session (restart)
-sessions[key] = {
-startTime: eventTimeMs,
-startStatus: safeHvacStatus,
-startTemp: currentTemp
-};
-console.log(`🔄 Restarting ${safeHvacStatus} session for ${key.substring(0, 16)}...`);
-
-```
-payload = createBubblePayload({
-  userId, deviceId, deviceName,
-  hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-  timestampIso, eventId: eventData.eventId, eventTimeMs,
-  runtimeSeconds: 0, isRuntimeEvent: false
-});
-```
-
-} else {
-// No state change — check if we should post temperature update
-const lastState = deviceStates[key];
-const tempChanged = shouldPostTemperatureUpdate(currentTemp, lastState?.lastPostedTempC);
-const setpointChanged = shouldPostSetpointUpdate(coolSetpoint, heatSetpoint, lastState);
-const timeSinceLastPost = Date.now() - (lastState?.lastPostTime || 0);
-const forcePostDueToTime = timeSinceLastPost >= MIN_POST_INTERVAL_MS;
-
-```
-if (!tempChanged && !setpointChanged && !forcePostDueToTime) {
-  if (process.env.DEBUG_NEST_EVENTS === "1") {
-    console.log(`📊 Skipping update for ${key}:`, {
-      tempDelta: getTempDelta(currentTemp, lastState?.lastPostedTempC)?.toFixed(3),
-      timeSincePost: Math.round(timeSinceLastPost/1000)
-    });
-  }
-  return;
-}
-
-console.log(`🌡️ Temperature/setpoint update for ${key.substring(0, 16)}...:`, {
-  tempChanged,
-  setpointChanged, 
-  forcePostDueToTime,
-  currentTemp: currentTemp?.toFixed(1),
-  lastTemp: lastState?.lastPostedTempC?.toFixed(1)
-});
-
-payload = createBubblePayload({
-  userId, deviceId, deviceName,
-  hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
-  timestampIso, eventId: eventData.eventId, eventTimeMs,
-  runtimeSeconds: 0, isRuntimeEvent: false
-});
-```
-
-}
-
-// Send
-const ok = await sendToBubble(payload);
-
-// Track state for next time
-const now = Date.now();
-deviceStates[key] = {
-…deviceStates[key],
+// CREATE AND SEND PAYLOAD
+const payload = createBubblePayload({
 userId,
 deviceId,
-deviceName,
-isActive,
-status: safeHvacStatus,
-mode,
+deviceName: deviceName || `device-${deviceId}`,
+hvacStatus: safeHvacStatus,
+mode: safeMode,
 currentTemp,
 coolSetpoint,
 heatSetpoint,
-lastUpdate: eventTimeMs,
-lastPostTime: ok ? now : (deviceStates[key]?.lastPostTime ?? 0),
-lastPostedTempC: ok ? currentTemp : (deviceStates[key]?.lastPostedTempC ?? null),
-lastPostedCoolSetpoint: ok ? coolSetpoint : (deviceStates[key]?.lastPostedCoolSetpoint ?? null),
-lastPostedHeatSetpoint: ok ? heatSetpoint : (deviceStates[key]?.lastPostedHeatSetpoint ?? null),
-eventCount: (deviceStates[key]?.eventCount || 0) + 1
+timestampIso,
+eventId: eventData.eventId || `event-${Date.now()}`,
+eventTimeMs,
+runtimeSeconds: 0,
+isRuntimeEvent: false
+});
+
+console.log(‘🚀 ATTEMPTING SEND TO BUBBLE…’);
+const ok = await sendToBubble(payload);
+
+if (ok) {
+console.log(‘✅ SUCCESSFULLY SENT TO BUBBLE!’);
+
+```
+// Update state
+const now = Date.now();
+deviceStates[key] = {
+  ...deviceStates[key],
+  userId,
+  deviceId,
+  deviceName: deviceName || `device-${deviceId}`,
+  isActive: safeHvacStatus === 'HEATING' || safeHvacStatus === 'COOLING',
+  status: safeHvacStatus,
+  mode: safeMode,
+  currentTemp,
+  coolSetpoint,
+  heatSetpoint,
+  lastUpdate: eventTimeMs,
+  lastPostTime: now,
+  lastPostedTempC: currentTemp,
+  lastPostedCoolSetpoint: coolSetpoint,
+  lastPostedHeatSetpoint: heatSetpoint,
+  eventCount: (deviceStates[key]?.eventCount || 0) + 1
 };
+
+console.log('✅ UPDATED DEVICE STATE:', JSON.stringify(deviceStates[key], null, 2));
+```
+
+} else {
+console.error(‘❌ FAILED TO SEND TO BUBBLE’);
 }
 
-// –––––––– Heartbeat: ensure at-least-every-N-seconds posts ––––––––
+console.log(’=’.repeat(80));
+console.log(‘🔵 END OF EVENT PROCESSING’);
+console.log(’=’.repeat(80) + ‘\n’);
+}
+
+// Heartbeat and cleanup (simplified for debugging)
 setInterval(async () => {
+console.log(‘💓 Heartbeat check…’);
 const now = Date.now();
 for (const [key, state] of Object.entries(deviceStates)) {
-// Only heartbeat if we have enough info to build a payload
-if (!state?.userId || !state?.deviceId || !state?.status) continue;
+if (!state?.userId || !state?.deviceId) continue;
 
 ```
 const tooLongSincePost = !state.lastPostTime || (now - state.lastPostTime >= MIN_POST_INTERVAL_MS);
 
-// Heartbeat even if OFF to keep Bubble fresh
 if (tooLongSincePost) {
+  console.log(`💓 Sending heartbeat for ${key}`);
   const timestampIso = new Date(now).toISOString();
   const eventTimeMs = now;
   const payload = createBubblePayload({
     userId: state.userId,
     deviceId: state.deviceId,
-    deviceName: state.deviceName,
-    hvacStatus: state.status,
-    mode: state.mode,
+    deviceName: state.deviceName || `device-${state.deviceId}`,
+    hvacStatus: state.status || 'OFF',
+    mode: state.mode || 'OFF',
     currentTemp: state.currentTemp,
     coolSetpoint: state.coolSetpoint,
     heatSetpoint: state.heatSetpoint,
@@ -650,20 +472,12 @@ if (tooLongSincePost) {
     eventId: `heartbeat-${state.deviceId}-${now}`,
     eventTimeMs,
     runtimeSeconds: 0,
-    isRuntimeEvent: false,
-    sessionData: sessions[key] || null
+    isRuntimeEvent: false
   });
 
   const ok = await sendToBubble(payload);
   if (ok) {
     deviceStates[key].lastPostTime = now;
-    deviceStates[key].lastPostedTempC = state.currentTemp;
-    deviceStates[key].lastPostedCoolSetpoint = state.coolSetpoint;
-    deviceStates[key].lastPostedHeatSetpoint = state.heatSetpoint;
-    
-    if (process.env.DEBUG_NEST_EVENTS === "1") {
-      console.log(`💓 Heartbeat sent for ${key}`);
-    }
   }
 }
 ```
@@ -671,43 +485,10 @@ if (tooLongSincePost) {
 }
 }, HEARTBEAT_INTERVAL_MS);
 
-// –––––––– Cleanup ––––––––
-setInterval(() => {
-const sixHoursAgo = Date.now() - (6 * 60 * 60 * 1000);
-const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
-let cleanedSessions = 0;
-let cleanedStates = 0;
-
-// Clean up old sessions
-for (const [key, session] of Object.entries(sessions)) {
-const sessionTime = session.startTime || session;
-if (sessionTime < sixHoursAgo) {
-delete sessions[key];
-cleanedSessions++;
-}
-}
-
-// Clean up very old device states (but keep recent ones for state tracking)
-for (const [key, state] of Object.entries(deviceStates)) {
-if (state.lastUpdate && state.lastUpdate < oneDayAgo) {
-delete deviceStates[key];
-cleanedStates++;
-}
-}
-
-if (cleanedSessions > 0 || cleanedStates > 0) {
-console.log(`🧹 Cleaned up ${cleanedSessions} old sessions and ${cleanedStates} old device states`);
-}
-}, 6 * 60 * 60 * 1000); // Every 6 hours
-
-// Export for use
 module.exports = {
 handleEvent,
-// Expose for testing
 shouldPostTemperatureUpdate,
 shouldPostSetpointUpdate,
 validateTemperature,
-celsiusToFahrenheit,
-extractNestTraits,
-extractDeviceInfo
+celsiusToFahrenheit
 };
