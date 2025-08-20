@@ -20,14 +20,7 @@ if (missing.length > 0) {
 throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
 }
 
-console.log(‘✅ Nest configuration validated:’, {
-bubbleUrl: process.env.BUBBLE_WEBHOOK_URL,
-tempThreshold: `${TEMP_CHANGE_C_THRESHOLD}°C`,
-setpointThreshold: `${SETPOINT_CHANGE_C_THRESHOLD}°C`,
-minPostInterval: `${MIN_POST_INTERVAL_MS/1000}s`,
-heartbeatInterval: `${HEARTBEAT_INTERVAL_MS/1000}s`,
-debugMode: process.env.DEBUG_NEST_EVENTS === “1”
-});
+console.log(‘✅ Nest configuration validated’);
 }
 
 validateConfiguration();
@@ -65,8 +58,6 @@ return false;
 }
 
 ```
-console.log('🚀 SENDING TO BUBBLE:', JSON.stringify(payload, null, 2));
-
 const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
   timeout: 15000,
   headers: {
@@ -75,12 +66,19 @@ const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
   }
 });
 
-console.log('✅ BUBBLE SUCCESS:', response.status, response.data);
+console.log('✅ Sent to Bubble:', {
+  deviceId: payload.thermostatId,
+  isRuntimeEvent: payload.isRuntimeEvent,
+  currentTempF: payload.currentTempF,
+  hvacMode: payload.hvacMode,
+  runtimeSeconds: payload.runtimeSeconds
+});
 return true;
 ```
 
 } catch (err) {
-console.error(‘❌ BUBBLE ERROR:’, {
+console.error(‘❌ Failed to send to Bubble:’, {
+deviceId: payload.thermostatId,
 error: err.response?.data || err.message,
 status: err.response?.status,
 code: err.code
@@ -103,85 +101,193 @@ function makeKey(userId, deviceId) {
 return `${userId}-${deviceId}`;
 }
 
-// MAIN EVENT HANDLER - LOG EVERYTHING FIRST
-async function handleEvent(eventData) {
-// LOG ABSOLUTELY EVERYTHING FIRST - BEFORE ANY VALIDATION
-console.log(’\n’ + ‘🟦’.repeat(50));
-console.log(‘🔵 NEST EVENT RECEIVED’);
-console.log(‘🟦’.repeat(50));
-
-console.log(‘📥 TYPEOF eventData:’, typeof eventData);
-console.log(‘📥 eventData === null:’, eventData === null);
-console.log(‘📥 eventData === undefined:’, eventData === undefined);
-
-if (eventData) {
-console.log(‘📥 eventData.constructor:’, eventData.constructor?.name);
-console.log(‘📥 Object.keys(eventData):’, Object.keys(eventData));
-console.log(‘📥 JSON.stringify(eventData):’);
-try {
-console.log(JSON.stringify(eventData, null, 2));
-} catch (e) {
-console.log(‘❌ Could not stringify eventData:’, e.message);
-console.log(‘📥 eventData (direct log):’);
-console.log(eventData);
-}
-} else {
-console.log(‘❌ eventData is null/undefined’);
-}
-
-// NOW TRY THE ORIGINAL VALIDATION
-console.log(’\n📋 STARTING VALIDATION…’);
-
-if (!eventData || typeof eventData !== ‘object’) {
-console.error(‘❌ VALIDATION FAILED: eventData is not an object’);
-console.log(’- eventData:’, eventData);
-console.log(’- typeof eventData:’, typeof eventData);
+// DEEP OBJECT EXPLORER
+function exploreObject(obj, path = ‘’, maxDepth = 5, currentDepth = 0) {
+if (currentDepth >= maxDepth || obj === null || obj === undefined) {
 return;
 }
 
-console.log(‘✅ eventData is an object, continuing…’);
+if (typeof obj === ‘object’ && !Array.isArray(obj)) {
+for (const [key, value] of Object.entries(obj)) {
+const newPath = path ? `${path}.${key}` : key;
+console.log(`  ${' '.repeat(currentDepth * 2)}${newPath}: ${typeof value} = ${JSON.stringify(value)}`);
 
-// Check for the eventId that we see in the logs
-const eventId = eventData.eventId;
-console.log(‘🆔 eventId:’, eventId);
+```
+  if (typeof value === 'object' && value !== null) {
+    exploreObject(value, newPath, maxDepth, currentDepth + 1);
+  }
+}
+```
 
-// Extract data
+} else if (Array.isArray(obj)) {
+console.log(`  ${' '.repeat(currentDepth * 2)}${path}: Array[${obj.length}]`);
+obj.forEach((item, index) => {
+const newPath = `${path}[${index}]`;
+console.log(`  ${' '.repeat((currentDepth + 1) * 2)}${newPath}: ${typeof item} = ${JSON.stringify(item)}`);
+if (typeof item === ‘object’ && item !== null) {
+exploreObject(item, newPath, maxDepth, currentDepth + 2);
+}
+});
+}
+}
+
+// FIND ALL TEMPERATURE-RELATED FIELDS
+function findTemperatureFields(obj, path = ‘’) {
+const tempFields = [];
+
+function search(current, currentPath) {
+if (current === null || current === undefined) return;
+
+```
+if (typeof current === 'object') {
+  for (const [key, value] of Object.entries(current)) {
+    const newPath = currentPath ? `${currentPath}.${key}` : key;
+    
+    // Check if this could be a temperature field
+    if (key.toLowerCase().includes('temp') || 
+        key.toLowerCase().includes('celsius') || 
+        key.toLowerCase().includes('fahrenheit') ||
+        (typeof value === 'number' && value > -50 && value < 50)) {
+      tempFields.push({
+        path: newPath,
+        key: key,
+        value: value,
+        type: typeof value
+      });
+    }
+    
+    if (typeof value === 'object' && value !== null) {
+      search(value, newPath);
+    }
+  }
+}
+```
+
+}
+
+search(obj, path);
+return tempFields;
+}
+
+// MAIN EVENT HANDLER WITH COMPREHENSIVE LOGGING
+async function handleEvent(eventData) {
+console.log(’\n’ + ‘═’.repeat(100));
+console.log(`🔵 Processing Nest event: ${eventData.eventId || 'no-event-id'}`);
+console.log(‘═’.repeat(100));
+
+// STEP 1: LOG THE COMPLETE RAW EVENT
+console.log(‘📥 COMPLETE RAW EVENT DATA:’);
+console.log(‘─’.repeat(80));
+try {
+console.log(JSON.stringify(eventData, null, 2));
+} catch (e) {
+console.log(‘❌ Could not stringify event data:’, e.message);
+console.log(‘Direct log:’);
+console.log(eventData);
+}
+
+// STEP 2: EXPLORE THE OBJECT STRUCTURE
+console.log(’\n🔍 OBJECT STRUCTURE EXPLORATION:’);
+console.log(‘─’.repeat(80));
+exploreObject(eventData);
+
+// STEP 3: FIND ALL TEMPERATURE-LIKE FIELDS
+console.log(’\n🌡️ TEMPERATURE FIELD SEARCH:’);
+console.log(‘─’.repeat(80));
+const tempFields = findTemperatureFields(eventData);
+if (tempFields.length > 0) {
+console.log(‘Found potential temperature fields:’);
+tempFields.forEach(field => {
+console.log(`  - ${field.path}: ${field.value} (${field.type})`);
+});
+} else {
+console.log(‘❌ No temperature-like fields found!’);
+}
+
+// STEP 4: CHECK ALL POSSIBLE TRAIT LOCATIONS
+console.log(’\n🔍 TRAIT LOCATION CHECK:’);
+console.log(‘─’.repeat(80));
+
+const traitPaths = [
+‘resourceUpdate.traits’,
+‘traits’,
+‘data.traits’,
+‘resourceUpdate.data.traits’,
+‘device.traits’,
+‘update.traits’
+];
+
+let foundTraits = null;
+let traitsPath = null;
+
+for (const path of traitPaths) {
+const parts = path.split(’.’);
+let current = eventData;
+
+```
+for (const part of parts) {
+  if (current && typeof current === 'object' && part in current) {
+    current = current[part];
+  } else {
+    current = null;
+    break;
+  }
+}
+
+if (current && typeof current === 'object') {
+  console.log(`✅ Found traits at: ${path}`);
+  console.log('Available trait keys:', Object.keys(current));
+  foundTraits = current;
+  traitsPath = path;
+  break;
+} else {
+  console.log(`❌ No traits found at: ${path}`);
+}
+```
+
+}
+
+// STEP 5: EXAMINE TRAITS IN DETAIL
+if (foundTraits) {
+console.log(`\n🔍 DETAILED TRAITS ANALYSIS (from ${traitsPath}):`);
+console.log(‘─’.repeat(80));
+
+```
+for (const [traitName, traitData] of Object.entries(foundTraits)) {
+  console.log(`\nTrait: ${traitName}`);
+  console.log(`Data:`, JSON.stringify(traitData, null, 2));
+  
+  // Look for temperature data in this trait
+  if (traitData && typeof traitData === 'object') {
+    const traitTempFields = findTemperatureFields(traitData, traitName);
+    if (traitTempFields.length > 0) {
+      console.log('🌡️ Temperature fields in this trait:');
+      traitTempFields.forEach(field => {
+        console.log(`  - ${field.path}: ${field.value}`);
+      });
+    }
+  }
+}
+```
+
+}
+
+// STEP 6: TRY STANDARD EXTRACTION (ORIGINAL CODE)
+console.log(’\n🔍 STANDARD EXTRACTION ATTEMPT:’);
+console.log(‘─’.repeat(80));
+
 const userId = eventData.userId;
 const resourceUpdate = eventData.resourceUpdate;
 const deviceName = resourceUpdate?.name;
 const traits = resourceUpdate?.traits;
 const timestampIso = eventData.timestamp;
 
-console.log(’\n📊 BASIC FIELD EXTRACTION:’);
-console.log(’- userId:’, userId);
-console.log(’- resourceUpdate exists:’, !!resourceUpdate);
-console.log(’- deviceName:’, deviceName);
-console.log(’- traits exists:’, !!traits);
-console.log(’- timestampIso:’, timestampIso);
-
-if (resourceUpdate) {
-console.log(’- resourceUpdate keys:’, Object.keys(resourceUpdate));
-console.log(’- resourceUpdate:’, JSON.stringify(resourceUpdate, null, 2));
-}
-
-if (traits) {
-console.log(’- traits keys:’, Object.keys(traits));
-console.log(’- traits:’, JSON.stringify(traits, null, 2));
-}
-
-// Extract device ID
-let deviceId;
-if (deviceName && typeof deviceName === ‘string’) {
-const parts = deviceName.split(’/’);
-deviceId = parts[parts.length - 1];
-}
-
-console.log(’\n🔍 DEVICE INFO:’);
-console.log(’- deviceName:’, deviceName);
-console.log(’- deviceId:’, deviceId);
-
-// Extract trait values
-let hvacStatus, currentTemp, coolSetpoint, heatSetpoint, mode;
+console.log(‘Basic fields:’);
+console.log(`- userId: ${userId}`);
+console.log(`- deviceName: ${deviceName}`);
+console.log(`- timestamp: ${timestampIso}`);
+console.log(`- has resourceUpdate: ${!!resourceUpdate}`);
+console.log(`- has traits: ${!!traits}`);
 
 if (traits) {
 const hvacTrait = traits[‘sdm.devices.traits.ThermostatHvac’];
@@ -190,141 +296,38 @@ const setpointTrait = traits[‘sdm.devices.traits.ThermostatTemperatureSetpoint
 const modeTrait = traits[‘sdm.devices.traits.ThermostatMode’];
 
 ```
-console.log('\n🔍 TRAIT EXTRACTION:');
-console.log('- hvacTrait:', JSON.stringify(hvacTrait, null, 2));
-console.log('- tempTrait:', JSON.stringify(tempTrait, null, 2));
-console.log('- setpointTrait:', JSON.stringify(setpointTrait, null, 2));
-console.log('- modeTrait:', JSON.stringify(modeTrait, null, 2));
+console.log('\nTrait extraction:');
+console.log(`- ThermostatHvac: ${JSON.stringify(hvacTrait)}`);
+console.log(`- Temperature: ${JSON.stringify(tempTrait)}`);
+console.log(`- ThermostatTemperatureSetpoint: ${JSON.stringify(setpointTrait)}`);
+console.log(`- ThermostatMode: ${JSON.stringify(modeTrait)}`);
 
-hvacStatus = hvacTrait?.status;
-currentTemp = tempTrait?.ambientTemperatureCelsius;
-coolSetpoint = setpointTrait?.coolCelsius;
-heatSetpoint = setpointTrait?.heatCelsius;
-mode = modeTrait?.mode;
+const hvacStatus = hvacTrait?.status;
+const currentTemp = tempTrait?.ambientTemperatureCelsius;
+const coolSetpoint = setpointTrait?.coolCelsius;
+const heatSetpoint = setpointTrait?.heatCelsius;
+const mode = modeTrait?.mode;
+
+console.log('\nExtracted values:');
+console.log(`- hvacStatus: ${hvacStatus}`);
+console.log(`- currentTemp: ${currentTemp}`);
+console.log(`- coolSetpoint: ${coolSetpoint}`);
+console.log(`- heatSetpoint: ${heatSetpoint}`);
+console.log(`- mode: ${mode}`);
+
+// CONTINUE WITH THE REST OF YOUR LOGIC HERE...
+// For now, let's just focus on getting the raw data
 ```
 
 }
 
-console.log(’\n🎯 EXTRACTED VALUES:’);
-console.log(’- hvacStatus:’, hvacStatus);
-console.log(’- currentTemp:’, currentTemp);
-console.log(’- coolSetpoint:’, coolSetpoint);
-console.log(’- heatSetpoint:’, heatSetpoint);
-console.log(’- mode:’, mode);
+console.log(‘═’.repeat(100));
+console.log(‘🔵 END OF RAW EVENT ANALYSIS’);
+console.log(‘═’.repeat(100) + ‘\n’);
 
-// Validation checks
-console.log(’\n✅ VALIDATION CHECKS:’);
-console.log(’- userId present:’, !!userId);
-console.log(’- deviceId present:’, !!deviceId);
-console.log(’- timestampIso present:’, !!timestampIso);
-
-if (!userId) {
-console.error(‘❌ Missing userId in Nest event’);
-return;
+// Don’t actually process the event yet - just log everything
+console.log(‘⏸️ Event processing paused for analysis’);
 }
-
-if (!deviceId) {
-console.error(‘❌ Missing or invalid deviceId in Nest event:’, deviceName);
-return;
-}
-
-if (!timestampIso) {
-console.error(‘❌ Missing timestamp in Nest event’);
-return;
-}
-
-// Check data availability
-const hasTemperature = currentTemp != null && Number.isFinite(currentTemp);
-const hasSetpoints = (coolSetpoint != null && Number.isFinite(coolSetpoint)) ||
-(heatSetpoint != null && Number.isFinite(heatSetpoint));
-const hasHvacStatus = hvacStatus != null && hvacStatus !== ‘’;
-const hasMode = mode != null && mode !== ‘’;
-
-console.log(’\n🔍 DATA AVAILABILITY:’);
-console.log(’- hasTemperature:’, hasTemperature, ‘(value:’, currentTemp, ‘)’);
-console.log(’- hasSetpoints:’, hasSetpoints, ‘(cool:’, coolSetpoint, ‘, heat:’, heatSetpoint, ‘)’);
-console.log(’- hasHvacStatus:’, hasHvacStatus, ‘(value:’, hvacStatus, ‘)’);
-console.log(’- hasMode:’, hasMode, ‘(value:’, mode, ‘)’);
-
-if (!hasTemperature && !hasSetpoints && !hasHvacStatus && !hasMode) {
-console.warn(‘⚠️ SKIPPING: No useful data found in event’);
-console.log(’- This is where your events are being rejected’);
-console.log(’- Need at least one of: temperature, setpoints, hvac status, or mode’);
-return;
-}
-
-console.log(‘🚀 PROCEEDING WITH SEND - Found useful data!’);
-
-// Create and send payload
-const key = makeKey(userId, deviceId);
-const eventTimeMs = toTimestamp(timestampIso);
-
-const payload = {
-userId,
-thermostatId: deviceId,
-deviceName: deviceName || `device-${deviceId}`,
-runtimeSeconds: 0,
-runtimeMinutes: 0,
-isRuntimeEvent: false,
-hvacMode: hvacStatus || ‘UNKNOWN’,
-thermostatMode: mode || ‘UNKNOWN’,
-isHvacActive: hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’,
-currentTempF: celsiusToFahrenheit(currentTemp),
-coolSetpointF: celsiusToFahrenheit(coolSetpoint),
-heatSetpointF: celsiusToFahrenheit(heatSetpoint),
-currentTempC: currentTemp,
-coolSetpointC: coolSetpoint,
-heatSetpointC: heatSetpoint,
-timestamp: timestampIso,
-eventId: eventId || `event-${Date.now()}`,
-eventTimestamp: eventTimeMs
-};
-
-console.log(’\n🔧 CREATED PAYLOAD:’);
-console.log(JSON.stringify(payload, null, 2));
-
-const ok = await sendToBubble(payload);
-
-if (ok) {
-console.log(‘✅ SUCCESS: Data sent to Bubble!’);
-
-```
-// Update device state
-const now = Date.now();
-deviceStates[key] = {
-  userId,
-  deviceId,
-  deviceName: deviceName || `device-${deviceId}`,
-  isActive: hvacStatus === 'HEATING' || hvacStatus === 'COOLING',
-  status: hvacStatus || 'UNKNOWN',
-  mode: mode || 'UNKNOWN',
-  currentTemp,
-  coolSetpoint,
-  heatSetpoint,
-  lastUpdate: eventTimeMs,
-  lastPostTime: now,
-  lastPostedTempC: currentTemp,
-  lastPostedCoolSetpoint: coolSetpoint,
-  lastPostedHeatSetpoint: heatSetpoint,
-  eventCount: (deviceStates[key]?.eventCount || 0) + 1
-};
-
-console.log('✅ Updated device state for', key);
-```
-
-} else {
-console.error(‘❌ FAILED: Could not send to Bubble’);
-}
-
-console.log(‘🟦’.repeat(50));
-console.log(‘🔵 END NEST EVENT’);
-console.log(‘🟦’.repeat(50) + ‘\n’);
-}
-
-// Simplified heartbeat for debugging
-setInterval(async () => {
-console.log(‘💓 Heartbeat check - deviceStates count:’, Object.keys(deviceStates).length);
-}, HEARTBEAT_INTERVAL_MS);
 
 module.exports = {
 handleEvent
