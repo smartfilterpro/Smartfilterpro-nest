@@ -12,7 +12,6 @@ const MIN_RUNTIME_SECONDS = 5;
 const sessions = {};
 const deviceStates = {};
 
-// Add configuration validation
 function validateConfiguration() {
 const required = [‘BUBBLE_WEBHOOK_URL’];
 const missing = required.filter(key => !process.env[key]);
@@ -55,13 +54,6 @@ return null;
 return Math.round((celsius * 9/5) + 32);
 }
 
-function shouldRetry(err) {
-const networkErrors = [‘ECONNABORTED’, ‘ENOTFOUND’, ‘ECONNRESET’, ‘EAI_AGAIN’, ‘ETIMEDOUT’];
-const retryableStatus = err.response?.status >= 500 || err.response?.status === 429;
-
-return networkErrors.includes(err.code) || retryableStatus;
-}
-
 async function sendToBubble(payload, retryCount = 0) {
 const maxRetries = 3;
 const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 10000);
@@ -73,7 +65,6 @@ return false;
 }
 
 ```
-// LOG THE PAYLOAD WE'RE SENDING
 console.log('🚀 SENDING TO BUBBLE:', JSON.stringify(payload, null, 2));
 
 const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
@@ -84,35 +75,20 @@ const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
   }
 });
 
-console.log('✅ BUBBLE RESPONSE:', response.status, response.data);
-console.log('✅ Sent to Bubble SUCCESS:', {
-  deviceId: payload.thermostatId,
-  isRuntimeEvent: payload.isRuntimeEvent,
-  currentTempF: payload.currentTempF,
-  hvacMode: payload.hvacMode,
-  runtimeSeconds: payload.runtimeSeconds
-});
+console.log('✅ BUBBLE SUCCESS:', response.status, response.data);
 return true;
 ```
 
 } catch (err) {
-const isRetryable = shouldRetry(err);
-const canRetry = retryCount < maxRetries && isRetryable;
-
-```
-console.error('❌ BUBBLE ERROR:', {
-  deviceId: payload.thermostatId,
-  error: err.response?.data || err.message,
-  status: err.response?.status,
-  code: err.code,
-  retryCount,
-  canRetry,
-  retryable: isRetryable,
-  fullError: err.toJSON ? err.toJSON() : err
+console.error(‘❌ BUBBLE ERROR:’, {
+error: err.response?.data || err.message,
+status: err.response?.status,
+code: err.code
 });
 
-if (canRetry) {
-  console.log(`🔄 Retrying in ${retryDelay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
+```
+if (retryCount < maxRetries) {
+  console.log(`🔄 Retrying in ${retryDelay}ms...`);
   await new Promise(r => setTimeout(r, retryDelay));
   return sendToBubble(payload, retryCount + 1);
 }
@@ -127,190 +103,85 @@ function makeKey(userId, deviceId) {
 return `${userId}-${deviceId}`;
 }
 
-function shouldPostTemperatureUpdate(currentTemp, lastPostedTemp) {
-if (currentTemp == null) return false;
-if (lastPostedTemp == null) return true;
-
-const delta = Math.abs(currentTemp - lastPostedTemp);
-return delta >= TEMP_CHANGE_C_THRESHOLD;
-}
-
-function shouldPostSetpointUpdate(coolSetpoint, heatSetpoint, lastState) {
-if (!lastState) return !!(coolSetpoint != null || heatSetpoint != null);
-
-const coolChanged = coolSetpoint != null && lastState.lastPostedCoolSetpoint != null &&
-Math.abs(coolSetpoint - lastState.lastPostedCoolSetpoint) >= SETPOINT_CHANGE_C_THRESHOLD;
-
-const heatChanged = heatSetpoint != null && lastState.lastPostedHeatSetpoint != null &&
-Math.abs(heatSetpoint - lastState.lastPostedHeatSetpoint) >= SETPOINT_CHANGE_C_THRESHOLD;
-
-const newCoolSetpoint = coolSetpoint != null && lastState.lastPostedCoolSetpoint == null;
-const newHeatSetpoint = heatSetpoint != null && lastState.lastPostedHeatSetpoint == null;
-
-return coolChanged || heatChanged || newCoolSetpoint || newHeatSetpoint;
-}
-
-function getTempDelta(currentTemp, lastTemp) {
-if (currentTemp == null || lastTemp == null) return null;
-return Math.abs(currentTemp - lastTemp);
-}
-
-function validateTemperature(temp, context = ‘’) {
-if (temp == null) return null;
-
-if (!Number.isFinite(temp)) {
-console.warn(`⚠️ Invalid temperature value ${context}: ${temp}`);
-return null;
-}
-
-if (temp < -50 || temp > 80) {
-console.warn(`⚠️ Temperature outside reasonable range ${context}: ${temp}°C`);
-}
-
-return temp;
-}
-
-function createBubblePayload({
-userId,
-deviceId,
-deviceName,
-hvacStatus,
-mode,
-currentTemp,
-coolSetpoint,
-heatSetpoint,
-timestampIso,
-eventId,
-eventTimeMs,
-runtimeSeconds = 0,
-isRuntimeEvent = false,
-sessionData = null
-}) {
-const validCurrentTemp = validateTemperature(currentTemp, ‘currentTemp’);
-const validCoolSetpoint = validateTemperature(coolSetpoint, ‘coolSetpoint’);
-const validHeatSetpoint = validateTemperature(heatSetpoint, ‘heatSetpoint’);
-const validStartTemp = validateTemperature(sessionData?.startTemp, ‘startTemp’);
-
-const payload = {
-userId,
-thermostatId: deviceId,
-deviceName,
-runtimeSeconds,
-runtimeMinutes: Math.round(runtimeSeconds / 60),
-isRuntimeEvent,
-hvacMode: hvacStatus,
-thermostatMode: mode,
-isHvacActive: hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’,
-currentTempF: celsiusToFahrenheit(validCurrentTemp),
-coolSetpointF: celsiusToFahrenheit(validCoolSetpoint),
-heatSetpointF: celsiusToFahrenheit(validHeatSetpoint),
-startTempF: celsiusToFahrenheit(validStartTemp),
-endTempF: celsiusToFahrenheit(validCurrentTemp),
-currentTempC: validCurrentTemp,
-coolSetpointC: validCoolSetpoint,
-heatSetpointC: validHeatSetpoint,
-startTempC: validStartTemp,
-endTempC: validCurrentTemp,
-timestamp: timestampIso,
-eventId,
-eventTimestamp: eventTimeMs
-};
-
-console.log(‘🔧 CREATED PAYLOAD:’, JSON.stringify(payload, null, 2));
-return payload;
-}
-
-// MAIN EVENT HANDLER WITH EXTREME DEBUGGING
+// MAIN EVENT HANDLER - LOG EVERYTHING FIRST
 async function handleEvent(eventData) {
-console.log(’\n’ + ‘=’.repeat(80));
-console.log(`🔵 PROCESSING NEST EVENT: ${eventData.eventId || 'no-event-id'}`);
-console.log(’=’.repeat(80));
+// LOG ABSOLUTELY EVERYTHING FIRST - BEFORE ANY VALIDATION
+console.log(’\n’ + ‘🟦’.repeat(50));
+console.log(‘🔵 NEST EVENT RECEIVED’);
+console.log(‘🟦’.repeat(50));
 
-// LOG EVERYTHING ABOUT THE INCOMING EVENT
-console.log(‘📥 RAW EVENT DATA:’);
+console.log(‘📥 TYPEOF eventData:’, typeof eventData);
+console.log(‘📥 eventData === null:’, eventData === null);
+console.log(‘📥 eventData === undefined:’, eventData === undefined);
+
+if (eventData) {
+console.log(‘📥 eventData.constructor:’, eventData.constructor?.name);
+console.log(‘📥 Object.keys(eventData):’, Object.keys(eventData));
+console.log(‘📥 JSON.stringify(eventData):’);
+try {
 console.log(JSON.stringify(eventData, null, 2));
-console.log(‘📊 EVENT DATA ANALYSIS:’);
-console.log(’- Type:’, typeof eventData);
-console.log(’- Keys:’, Object.keys(eventData || {}));
-console.log(’- Has resourceUpdate:’, !!eventData.resourceUpdate);
-console.log(’- Has traits:’, !!eventData.resourceUpdate?.traits);
-console.log(’- Has userId:’, !!eventData.userId);
-console.log(’- Has timestamp:’, !!eventData.timestamp);
+} catch (e) {
+console.log(‘❌ Could not stringify eventData:’, e.message);
+console.log(‘📥 eventData (direct log):’);
+console.log(eventData);
+}
+} else {
+console.log(‘❌ eventData is null/undefined’);
+}
+
+// NOW TRY THE ORIGINAL VALIDATION
+console.log(’\n📋 STARTING VALIDATION…’);
 
 if (!eventData || typeof eventData !== ‘object’) {
-console.error(‘❌ INVALID EVENT DATA’);
+console.error(‘❌ VALIDATION FAILED: eventData is not an object’);
+console.log(’- eventData:’, eventData);
+console.log(’- typeof eventData:’, typeof eventData);
 return;
 }
 
-// EXTRACT BASIC INFO
+console.log(‘✅ eventData is an object, continuing…’);
+
+// Check for the eventId that we see in the logs
+const eventId = eventData.eventId;
+console.log(‘🆔 eventId:’, eventId);
+
+// Extract data
 const userId = eventData.userId;
+const resourceUpdate = eventData.resourceUpdate;
+const deviceName = resourceUpdate?.name;
+const traits = resourceUpdate?.traits;
 const timestampIso = eventData.timestamp;
 
-console.log(‘🔍 BASIC EXTRACTION:’);
+console.log(’\n📊 BASIC FIELD EXTRACTION:’);
 console.log(’- userId:’, userId);
-console.log(’- timestamp:’, timestampIso);
+console.log(’- resourceUpdate exists:’, !!resourceUpdate);
+console.log(’- deviceName:’, deviceName);
+console.log(’- traits exists:’, !!traits);
+console.log(’- timestampIso:’, timestampIso);
 
-// EXTRACT DEVICE INFO - TRY EVERY POSSIBLE LOCATION
-let deviceName, deviceId;
-
-console.log(‘🔍 DEVICE INFO EXTRACTION:’);
-
-// Try resourceUpdate.name first
-if (eventData.resourceUpdate?.name) {
-deviceName = eventData.resourceUpdate.name;
-console.log(’- Found deviceName in resourceUpdate.name:’, deviceName);
+if (resourceUpdate) {
+console.log(’- resourceUpdate keys:’, Object.keys(resourceUpdate));
+console.log(’- resourceUpdate:’, JSON.stringify(resourceUpdate, null, 2));
 }
 
-// Try other locations
-if (!deviceName) {
-deviceName = eventData.name || eventData.device?.name || eventData.deviceName;
-console.log(’- Found deviceName in fallback location:’, deviceName);
+if (traits) {
+console.log(’- traits keys:’, Object.keys(traits));
+console.log(’- traits:’, JSON.stringify(traits, null, 2));
 }
 
+// Extract device ID
+let deviceId;
 if (deviceName && typeof deviceName === ‘string’) {
 const parts = deviceName.split(’/’);
 deviceId = parts[parts.length - 1];
-console.log(’- Extracted deviceId from deviceName:’, deviceId);
-} else {
-deviceId = eventData.deviceId || eventData.device?.id || eventData.resourceUpdate?.id;
-console.log(’- Found deviceId in direct field:’, deviceId);
 }
 
-console.log(’- Final deviceName:’, deviceName);
-console.log(’- Final deviceId:’, deviceId);
+console.log(’\n🔍 DEVICE INFO:’);
+console.log(’- deviceName:’, deviceName);
+console.log(’- deviceId:’, deviceId);
 
-// EXTRACT TRAITS - TRY EVERY POSSIBLE LOCATION
-let traits;
-
-console.log(‘🔍 TRAITS EXTRACTION:’);
-
-if (eventData.resourceUpdate?.traits) {
-traits = eventData.resourceUpdate.traits;
-console.log(’- Found traits in resourceUpdate.traits’);
-} else if (eventData.traits) {
-traits = eventData.traits;
-console.log(’- Found traits in direct traits field’);
-} else if (eventData.data?.traits) {
-traits = eventData.data.traits;
-console.log(’- Found traits in data.traits’);
-} else if (eventData.resourceUpdate?.data?.traits) {
-traits = eventData.resourceUpdate.data.traits;
-console.log(’- Found traits in resourceUpdate.data.traits’);
-}
-
-console.log(’- Traits found:’, !!traits);
-console.log(’- Traits type:’, typeof traits);
-console.log(’- Traits keys:’, traits ? Object.keys(traits) : ‘none’);
-
-if (traits) {
-console.log(’- Full traits object:’);
-console.log(JSON.stringify(traits, null, 2));
-}
-
-// EXTRACT INDIVIDUAL TRAIT VALUES
+// Extract trait values
 let hvacStatus, currentTemp, coolSetpoint, heatSetpoint, mode;
-
-console.log(‘🔍 INDIVIDUAL TRAIT EXTRACTION:’);
 
 if (traits) {
 const hvacTrait = traits[‘sdm.devices.traits.ThermostatHvac’];
@@ -319,6 +190,7 @@ const setpointTrait = traits[‘sdm.devices.traits.ThermostatTemperatureSetpoint
 const modeTrait = traits[‘sdm.devices.traits.ThermostatMode’];
 
 ```
+console.log('\n🔍 TRAIT EXTRACTION:');
 console.log('- hvacTrait:', JSON.stringify(hvacTrait, null, 2));
 console.log('- tempTrait:', JSON.stringify(tempTrait, null, 2));
 console.log('- setpointTrait:', JSON.stringify(setpointTrait, null, 2));
@@ -333,95 +205,99 @@ mode = modeTrait?.mode;
 
 }
 
-console.log(‘🔍 FINAL EXTRACTED VALUES:’);
+console.log(’\n🎯 EXTRACTED VALUES:’);
 console.log(’- hvacStatus:’, hvacStatus);
 console.log(’- currentTemp:’, currentTemp);
 console.log(’- coolSetpoint:’, coolSetpoint);
 console.log(’- heatSetpoint:’, heatSetpoint);
 console.log(’- mode:’, mode);
 
-// VALIDATION
-console.log(‘🔍 VALIDATION:’);
-console.log(’- Has userId:’, !!userId);
-console.log(’- Has deviceId:’, !!deviceId);
-console.log(’- Has timestampIso:’, !!timestampIso);
-console.log(’- Has traits:’, !!traits);
+// Validation checks
+console.log(’\n✅ VALIDATION CHECKS:’);
+console.log(’- userId present:’, !!userId);
+console.log(’- deviceId present:’, !!deviceId);
+console.log(’- timestampIso present:’, !!timestampIso);
 
 if (!userId) {
-console.error(‘❌ VALIDATION FAILED: Missing userId’);
+console.error(‘❌ Missing userId in Nest event’);
 return;
 }
 
 if (!deviceId) {
-console.error(‘❌ VALIDATION FAILED: Missing deviceId’);
+console.error(‘❌ Missing or invalid deviceId in Nest event:’, deviceName);
 return;
 }
 
 if (!timestampIso) {
-console.error(‘❌ VALIDATION FAILED: Missing timestamp’);
+console.error(‘❌ Missing timestamp in Nest event’);
 return;
 }
 
-if (!traits) {
-console.error(‘❌ VALIDATION FAILED: Missing traits’);
-return;
-}
-
-// CHECK WHAT DATA WE HAVE
+// Check data availability
 const hasTemperature = currentTemp != null && Number.isFinite(currentTemp);
 const hasSetpoints = (coolSetpoint != null && Number.isFinite(coolSetpoint)) ||
 (heatSetpoint != null && Number.isFinite(heatSetpoint));
 const hasHvacStatus = hvacStatus != null && hvacStatus !== ‘’;
 const hasMode = mode != null && mode !== ‘’;
 
-console.log(‘🔍 DATA AVAILABILITY:’);
-console.log(’- hasTemperature:’, hasTemperature);
-console.log(’- hasSetpoints:’, hasSetpoints);
-console.log(’- hasHvacStatus:’, hasHvacStatus);
-console.log(’- hasMode:’, hasMode);
+console.log(’\n🔍 DATA AVAILABILITY:’);
+console.log(’- hasTemperature:’, hasTemperature, ‘(value:’, currentTemp, ‘)’);
+console.log(’- hasSetpoints:’, hasSetpoints, ‘(cool:’, coolSetpoint, ‘, heat:’, heatSetpoint, ‘)’);
+console.log(’- hasHvacStatus:’, hasHvacStatus, ‘(value:’, hvacStatus, ‘)’);
+console.log(’- hasMode:’, hasMode, ‘(value:’, mode, ‘)’);
 
-// ALWAYS TRY TO SEND SOMETHING - EVEN IF INCOMPLETE
-console.log(‘🚀 ATTEMPTING TO SEND DATA REGARDLESS…’);
+if (!hasTemperature && !hasSetpoints && !hasHvacStatus && !hasMode) {
+console.warn(‘⚠️ SKIPPING: No useful data found in event’);
+console.log(’- This is where your events are being rejected’);
+console.log(’- Need at least one of: temperature, setpoints, hvac status, or mode’);
+return;
+}
 
+console.log(‘🚀 PROCEEDING WITH SEND - Found useful data!’);
+
+// Create and send payload
 const key = makeKey(userId, deviceId);
 const eventTimeMs = toTimestamp(timestampIso);
-const safeHvacStatus = hvacStatus || ‘UNKNOWN’;
-const safeMode = mode || ‘UNKNOWN’;
 
-// CREATE AND SEND PAYLOAD
-const payload = createBubblePayload({
+const payload = {
 userId,
-deviceId,
+thermostatId: deviceId,
 deviceName: deviceName || `device-${deviceId}`,
-hvacStatus: safeHvacStatus,
-mode: safeMode,
-currentTemp,
-coolSetpoint,
-heatSetpoint,
-timestampIso,
-eventId: eventData.eventId || `event-${Date.now()}`,
-eventTimeMs,
 runtimeSeconds: 0,
-isRuntimeEvent: false
-});
+runtimeMinutes: 0,
+isRuntimeEvent: false,
+hvacMode: hvacStatus || ‘UNKNOWN’,
+thermostatMode: mode || ‘UNKNOWN’,
+isHvacActive: hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’,
+currentTempF: celsiusToFahrenheit(currentTemp),
+coolSetpointF: celsiusToFahrenheit(coolSetpoint),
+heatSetpointF: celsiusToFahrenheit(heatSetpoint),
+currentTempC: currentTemp,
+coolSetpointC: coolSetpoint,
+heatSetpointC: heatSetpoint,
+timestamp: timestampIso,
+eventId: eventId || `event-${Date.now()}`,
+eventTimestamp: eventTimeMs
+};
 
-console.log(‘🚀 ATTEMPTING SEND TO BUBBLE…’);
+console.log(’\n🔧 CREATED PAYLOAD:’);
+console.log(JSON.stringify(payload, null, 2));
+
 const ok = await sendToBubble(payload);
 
 if (ok) {
-console.log(‘✅ SUCCESSFULLY SENT TO BUBBLE!’);
+console.log(‘✅ SUCCESS: Data sent to Bubble!’);
 
 ```
-// Update state
+// Update device state
 const now = Date.now();
 deviceStates[key] = {
-  ...deviceStates[key],
   userId,
   deviceId,
   deviceName: deviceName || `device-${deviceId}`,
-  isActive: safeHvacStatus === 'HEATING' || safeHvacStatus === 'COOLING',
-  status: safeHvacStatus,
-  mode: safeMode,
+  isActive: hvacStatus === 'HEATING' || hvacStatus === 'COOLING',
+  status: hvacStatus || 'UNKNOWN',
+  mode: mode || 'UNKNOWN',
   currentTemp,
   coolSetpoint,
   heatSetpoint,
@@ -433,62 +309,23 @@ deviceStates[key] = {
   eventCount: (deviceStates[key]?.eventCount || 0) + 1
 };
 
-console.log('✅ UPDATED DEVICE STATE:', JSON.stringify(deviceStates[key], null, 2));
+console.log('✅ Updated device state for', key);
 ```
 
 } else {
-console.error(‘❌ FAILED TO SEND TO BUBBLE’);
+console.error(‘❌ FAILED: Could not send to Bubble’);
 }
 
-console.log(’=’.repeat(80));
-console.log(‘🔵 END OF EVENT PROCESSING’);
-console.log(’=’.repeat(80) + ‘\n’);
+console.log(‘🟦’.repeat(50));
+console.log(‘🔵 END NEST EVENT’);
+console.log(‘🟦’.repeat(50) + ‘\n’);
 }
 
-// Heartbeat and cleanup (simplified for debugging)
+// Simplified heartbeat for debugging
 setInterval(async () => {
-console.log(‘💓 Heartbeat check…’);
-const now = Date.now();
-for (const [key, state] of Object.entries(deviceStates)) {
-if (!state?.userId || !state?.deviceId) continue;
-
-```
-const tooLongSincePost = !state.lastPostTime || (now - state.lastPostTime >= MIN_POST_INTERVAL_MS);
-
-if (tooLongSincePost) {
-  console.log(`💓 Sending heartbeat for ${key}`);
-  const timestampIso = new Date(now).toISOString();
-  const eventTimeMs = now;
-  const payload = createBubblePayload({
-    userId: state.userId,
-    deviceId: state.deviceId,
-    deviceName: state.deviceName || `device-${state.deviceId}`,
-    hvacStatus: state.status || 'OFF',
-    mode: state.mode || 'OFF',
-    currentTemp: state.currentTemp,
-    coolSetpoint: state.coolSetpoint,
-    heatSetpoint: state.heatSetpoint,
-    timestampIso,
-    eventId: `heartbeat-${state.deviceId}-${now}`,
-    eventTimeMs,
-    runtimeSeconds: 0,
-    isRuntimeEvent: false
-  });
-
-  const ok = await sendToBubble(payload);
-  if (ok) {
-    deviceStates[key].lastPostTime = now;
-  }
-}
-```
-
-}
+console.log(‘💓 Heartbeat check - deviceStates count:’, Object.keys(deviceStates).length);
 }, HEARTBEAT_INTERVAL_MS);
 
 module.exports = {
-handleEvent,
-shouldPostTemperatureUpdate,
-shouldPostSetpointUpdate,
-validateTemperature,
-celsiusToFahrenheit
+handleEvent
 };
