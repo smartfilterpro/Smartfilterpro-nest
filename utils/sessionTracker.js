@@ -168,6 +168,70 @@ console.warn(`⚠️ Temperature outside reasonable range ${context}: ${temp}°C
 return temp;
 }
 
+// FIXED: Better trait extraction with fallbacks
+function extractNestTraits(eventData) {
+// First check for direct trait access
+let traits = eventData.resourceUpdate?.traits;
+
+// If not found, check other possible locations
+if (!traits) {
+traits = eventData.traits || eventData.data?.traits || eventData.resourceUpdate?.data?.traits;
+}
+
+// Log raw structure for debugging
+if (process.env.DEBUG_NEST_EVENTS === “1”) {
+console.log(‘🔍 TRAIT EXTRACTION DEBUG:’, {
+hasResourceUpdate: !!eventData.resourceUpdate,
+hasTraits: !!traits,
+resourceUpdateKeys: eventData.resourceUpdate ? Object.keys(eventData.resourceUpdate) : [],
+eventDataKeys: Object.keys(eventData),
+fullEventData: JSON.stringify(eventData, null, 2)
+});
+}
+
+if (!traits || typeof traits !== ‘object’) {
+console.warn(‘⚠️ No traits found in event data’);
+return null;
+}
+
+// Extract the specific traits we need
+const hvacTrait = traits[‘sdm.devices.traits.ThermostatHvac’];
+const tempTrait = traits[‘sdm.devices.traits.Temperature’];
+const setpointTrait = traits[‘sdm.devices.traits.ThermostatTemperatureSetpoint’];
+const modeTrait = traits[‘sdm.devices.traits.ThermostatMode’];
+
+return {
+hvacStatus: hvacTrait?.status,
+currentTemp: tempTrait?.ambientTemperatureCelsius,
+coolSetpoint: setpointTrait?.coolCelsius,
+heatSetpoint: setpointTrait?.heatCelsius,
+mode: modeTrait?.mode,
+rawTraits: traits // Keep raw traits for debugging
+};
+}
+
+// FIXED: Better device ID extraction
+function extractDeviceInfo(eventData) {
+let deviceName = eventData.resourceUpdate?.name;
+let deviceId;
+
+// Try multiple possible locations for device info
+if (!deviceName) {
+deviceName = eventData.name || eventData.device?.name || eventData.deviceName;
+}
+
+if (deviceName && typeof deviceName === ‘string’) {
+// Extract device ID from the resource name
+const parts = deviceName.split(’/’);
+deviceId = parts[parts.length - 1];
+} else {
+// Try direct device ID fields
+deviceId = eventData.deviceId || eventData.device?.id || eventData.resourceUpdate?.id;
+}
+
+return { deviceName, deviceId };
+}
+
 // Standard payload creator
 function createBubblePayload({
 userId,
@@ -303,12 +367,15 @@ console.warn(‘⚠️ Invalid event data received:’, typeof eventData);
 return;
 }
 
-// Extract data with better error handling
+// FIXED: Better data extraction
 const userId = eventData.userId;
-const resourceUpdate = eventData.resourceUpdate;
-const deviceName = resourceUpdate?.name;
-const traits = resourceUpdate?.traits;
 const timestampIso = eventData.timestamp;
+
+// Extract device info with fallbacks
+const { deviceName, deviceId } = extractDeviceInfo(eventData);
+
+// Extract traits with better error handling
+const traitData = extractNestTraits(eventData);
 
 // Log raw event for debugging
 if (process.env.DEBUG_NEST_EVENTS === “1”) {
@@ -317,27 +384,21 @@ console.dir(eventData, { depth: null });
 console.log(‘🔍 EXTRACTED DATA:’, {
 userId,
 deviceName,
-hasTraits: !!traits,
+deviceId,
 timestampIso,
-traitKeys: traits ? Object.keys(traits) : []
+traitData,
+hasTraitData: !!traitData
 });
 }
 
-// Extract device ID more safely
-let deviceId;
-if (deviceName && typeof deviceName === ‘string’) {
-const parts = deviceName.split(’/’);
-deviceId = parts[parts.length - 1];
-}
-
-// More flexible validation - don’t require all fields immediately
+// Validate essential fields
 if (!userId) {
 console.warn(‘⚠️ Missing userId in Nest event’);
 return;
 }
 
 if (!deviceId) {
-console.warn(‘⚠️ Missing or invalid deviceId in Nest event:’, deviceName);
+console.warn(‘⚠️ Missing or invalid deviceId in Nest event:’, { deviceName, extractedId: deviceId });
 return;
 }
 
@@ -346,17 +407,13 @@ console.warn(‘⚠️ Missing timestamp in Nest event’);
 return;
 }
 
-// Extract traits with validation - handle missing traits more gracefully
-const hvacTrait = traits?.[‘sdm.devices.traits.ThermostatHvac’];
-const tempTrait = traits?.[‘sdm.devices.traits.Temperature’];
-const setpointTrait = traits?.[‘sdm.devices.traits.ThermostatTemperatureSetpoint’];
-const modeTrait = traits?.[‘sdm.devices.traits.ThermostatMode’];
+// Handle case where trait extraction failed
+if (!traitData) {
+console.warn(‘⚠️ Could not extract traits from Nest event’);
+return;
+}
 
-const hvacStatus = hvacTrait?.status;
-const currentTemp = tempTrait?.ambientTemperatureCelsius;
-const coolSetpoint = setpointTrait?.coolCelsius;
-const heatSetpoint = setpointTrait?.heatCelsius;
-const mode = modeTrait?.mode;
+const { hvacStatus, currentTemp, coolSetpoint, heatSetpoint, mode } = traitData;
 
 // Debug extracted values
 if (process.env.DEBUG_NEST_EVENTS === “1”) {
@@ -365,24 +422,42 @@ hvacStatus,
 currentTemp,
 coolSetpoint,
 heatSetpoint,
-mode,
-hasHvacTrait: !!hvacTrait,
-hasTempTrait: !!tempTrait,
-hasSetpointTrait: !!setpointTrait,
-hasModeTrait: !!modeTrait
+mode
 });
 }
 
-// Check if we have any meaningful data
-const hasTemperature = currentTemp != null;
-const hasSetpoints = coolSetpoint != null || heatSetpoint != null;
-const hasHvacStatus = hvacStatus != null;
-const hasMode = mode != null;
+// FIXED: More permissive validation - send if we have ANY useful data
+const hasTemperature = currentTemp != null && Number.isFinite(currentTemp);
+const hasSetpoints = (coolSetpoint != null && Number.isFinite(coolSetpoint)) ||
+(heatSetpoint != null && Number.isFinite(heatSetpoint));
+const hasHvacStatus = hvacStatus != null && hvacStatus !== ‘’;
+const hasMode = mode != null && mode !== ‘’;
 
 if (!hasTemperature && !hasSetpoints && !hasHvacStatus && !hasMode) {
-console.warn(‘⚠️ Skipping incomplete Nest event - no temperature, setpoints, HVAC status, or mode’);
+console.warn(‘⚠️ Skipping incomplete Nest event - no useful data found:’, {
+hasTemperature,
+hasSetpoints,
+hasHvacStatus,
+hasMode,
+currentTemp,
+coolSetpoint,
+heatSetpoint,
+hvacStatus,
+mode
+});
 return;
 }
+
+// FORCE SEND even if incomplete - let Bubble handle it
+console.log(‘🚀 Forcing send with available data:’, {
+hasTemperature,
+hasSetpoints,
+hasHvacStatus,
+hasMode,
+currentTemp: currentTemp?.toFixed(1),
+hvacStatus,
+mode
+});
 
 // Handle cases where we don’t have HVAC status but have other data
 if (!hasHvacStatus && (hasTemperature || hasSetpoints)) {
@@ -394,17 +469,13 @@ mode, timestampIso, eventData
 return;
 }
 
-// Continue with full event processing if we have HVAC status
-if (!hasHvacStatus) {
-console.warn(‘⚠️ Skipping event - no HVAC status and no temperature/setpoint data’);
-return;
-}
-
+// Continue with full event processing
 const key = makeKey(userId, deviceId);
 const eventTimeMs = toTimestamp(timestampIso);
 
-// Determine activity
-const isActive = hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’;
+// Determine activity - be more defensive with defaults
+const safeHvacStatus = hvacStatus || ‘OFF’;
+const isActive = safeHvacStatus === ‘HEATING’ || safeHvacStatus === ‘COOLING’;
 const wasActive = deviceStates[key]?.isActive || false;
 
 // Sessions
@@ -414,15 +485,15 @@ if (isActive && !wasActive) {
 // Turned on — start session
 sessions[key] = {
 startTime: eventTimeMs,
-startStatus: hvacStatus,
+startStatus: safeHvacStatus,
 startTemp: currentTemp
 };
-console.log(`🟢 Starting ${hvacStatus} session for ${key.substring(0, 16)}...`);
+console.log(`🟢 Starting ${safeHvacStatus} session for ${key.substring(0, 16)}...`);
 
 ```
 payload = createBubblePayload({
   userId, deviceId, deviceName,
-  hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
+  hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
   timestampIso, eventId: eventData.eventId, eventTimeMs,
   runtimeSeconds: 0, isRuntimeEvent: false
 });
@@ -447,7 +518,7 @@ const runtimeSeconds = Math.floor(runtimeMs / 1000);
     
     payload = createBubblePayload({
       userId, deviceId, deviceName,
-      hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
+      hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
       timestampIso, eventId: eventData.eventId, eventTimeMs,
       runtimeSeconds, isRuntimeEvent: true, sessionData: session
     });
@@ -457,7 +528,7 @@ const runtimeSeconds = Math.floor(runtimeMs / 1000);
     
     payload = createBubblePayload({
       userId, deviceId, deviceName,
-      hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
+      hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
       timestampIso, eventId: eventData.eventId, eventTimeMs,
       runtimeSeconds: 0, isRuntimeEvent: false
     });
@@ -465,7 +536,7 @@ const runtimeSeconds = Math.floor(runtimeMs / 1000);
 } else {
   payload = createBubblePayload({
     userId, deviceId, deviceName,
-    hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
+    hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
     timestampIso, eventId: eventData.eventId, eventTimeMs,
     runtimeSeconds: 0, isRuntimeEvent: false
   });
@@ -476,15 +547,15 @@ const runtimeSeconds = Math.floor(runtimeMs / 1000);
 // Active but we lost session (restart)
 sessions[key] = {
 startTime: eventTimeMs,
-startStatus: hvacStatus,
+startStatus: safeHvacStatus,
 startTemp: currentTemp
 };
-console.log(`🔄 Restarting ${hvacStatus} session for ${key.substring(0, 16)}...`);
+console.log(`🔄 Restarting ${safeHvacStatus} session for ${key.substring(0, 16)}...`);
 
 ```
 payload = createBubblePayload({
   userId, deviceId, deviceName,
-  hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
+  hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
   timestampIso, eventId: eventData.eventId, eventTimeMs,
   runtimeSeconds: 0, isRuntimeEvent: false
 });
@@ -519,7 +590,7 @@ console.log(`🌡️ Temperature/setpoint update for ${key.substring(0, 16)}...:
 
 payload = createBubblePayload({
   userId, deviceId, deviceName,
-  hvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
+  hvacStatus: safeHvacStatus, mode, currentTemp, coolSetpoint, heatSetpoint,
   timestampIso, eventId: eventData.eventId, eventTimeMs,
   runtimeSeconds: 0, isRuntimeEvent: false
 });
@@ -538,7 +609,7 @@ userId,
 deviceId,
 deviceName,
 isActive,
-status: hvacStatus,
+status: safeHvacStatus,
 mode,
 currentTemp,
 coolSetpoint,
@@ -636,5 +707,7 @@ handleEvent,
 shouldPostTemperatureUpdate,
 shouldPostSetpointUpdate,
 validateTemperature,
-celsiusToFahrenheit
+celsiusToFahrenheit,
+extractNestTraits,
+extractDeviceInfo
 };
