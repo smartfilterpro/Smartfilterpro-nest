@@ -38,6 +38,23 @@ function celsiusToFahrenheit(celsius) {
   return Math.round((celsius * 9) / 5 + 32);
 }
 
+// Map current hvac/fan to canonical equipmentStatus
+function mapEquipmentStatus(hvacStatus, isFanOnly) {
+  if (hvacStatus === 'HEATING') return 'heat';
+  if (hvacStatus === 'COOLING') return 'cool';
+  if (isFanOnly) return 'fan';
+  if (hvacStatus === 'OFF' || !hvacStatus) return 'off';
+  return 'unknown';
+}
+
+function deriveCurrentFlags(hvacStatus, fanTimerOn) {
+  const isHeating = hvacStatus === 'HEATING';
+  const isCooling = hvacStatus === 'COOLING';
+  const isFanOnly = !!fanTimerOn && !isHeating && !isCooling;
+  const equipmentStatus = mapEquipmentStatus(hvacStatus, isFanOnly);
+  return { isHeating, isCooling, isFanOnly, equipmentStatus };
+}
+
 // Sanitize sensitive data for logging
 function sanitizeForLogging(data) {
   if (!data) return data;
@@ -89,12 +106,16 @@ async function handleNestEvent(eventData) {
   // Extract device ID from the long device name
   const deviceId = deviceName?.split('/').pop();
 
-  // Get HVAC status and temperature data
+  // Get HVAC status, temperature, mode, and fan
   const hvacStatus = traits?.['sdm.devices.traits.ThermostatHvac']?.status;
   const currentTemp = traits?.['sdm.devices.traits.Temperature']?.ambientTemperatureCelsius;
   const coolSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius;
   const heatSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius;
   const mode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
+
+  // Fan trait (used to infer fan-only)
+  const fanTimerMode = traits?.['sdm.devices.traits.Fan']?.timerMode; // "ON" | "OFF" | undefined
+  const fanTimerOn = fanTimerMode === 'ON';
 
   // DEBUG: Log extracted trait values
   console.log('DEBUG - Extracted trait values:');
@@ -103,6 +124,7 @@ async function handleNestEvent(eventData) {
   console.log(`- coolSetpoint: ${coolSetpoint}`);
   console.log(`- heatSetpoint: ${heatSetpoint}`);
   console.log(`- mode: ${mode}`);
+  console.log(`- fanTimerMode: ${fanTimerMode}`);
 
   // DEBUG: Check each trait individually
   if (traits) {
@@ -117,6 +139,9 @@ async function handleNestEvent(eventData) {
 
     const modeTrait = traits['sdm.devices.traits.ThermostatMode'];
     console.log(`- ThermostatMode trait: ${JSON.stringify(modeTrait)}`);
+
+    const fanTrait = traits['sdm.devices.traits.Fan'];
+    console.log(`- Fan trait: ${JSON.stringify(fanTrait)}`);
   }
 
   // Safe logging (sanitized data)
@@ -130,11 +155,8 @@ async function handleNestEvent(eventData) {
   console.log('DEBUG - Validation check:');
   console.log(`- userId present: ${!!userId}`);
   console.log(`- deviceId present: ${!!deviceId}`);
-  console.log(`- hvacStatus present: ${!!hvacStatus}`);
   console.log(`- timestamp present: ${!!timestamp}`);
-  console.log(`- currentTemp present: ${currentTemp != null}`);
 
-  // Only require userId, deviceId, and timestamp
   if (!userId || !deviceId || !timestamp) {
     console.warn('Skipping incomplete Nest event');
     if (!userId) console.log('  - Missing userId');
@@ -146,20 +168,24 @@ async function handleNestEvent(eventData) {
   const key = `${userId}-${deviceId}`;
   const eventTime = toTimestamp(timestamp);
 
-  // Check if this is a temperature-only event
+  // Pull previous (to populate "last*")
+  const prev = deviceStates[key] || {};
+  const lastIsCooling = !!prev.isCooling;
+  const lastIsHeating = !!prev.isHeating;
+  const lastIsFanOnly = !!prev.isFanOnly;
+  const lastEquipmentStatus = prev.equipmentStatus || 'unknown';
+
+  // If we got only a temp change, still send with "last*" from prev and current derived state from prev
   const isTemperatureOnlyEvent = !hvacStatus && currentTemp != null;
 
   if (isTemperatureOnlyEvent) {
     console.log('Temperature-only event detected');
 
-    // Use last known HVAC status or default to 'OFF'
-    const lastState = deviceStates[key];
-    const effectiveHvacStatus = lastState?.status || 'OFF';
-    const effectiveMode = lastState?.mode || mode || 'OFF';
+    // Fall back to last known state for current snapshot
+    const effectiveStatus = prev.status || 'OFF';
+    const effectiveMode = prev.mode || mode || 'OFF';
+    const effectiveFanOnly = prev.isFanOnly || false;
 
-    console.log(`Using last known HVAC status: ${effectiveHvacStatus}`);
-
-    // Create payload for temperature update
     const payload = {
       userId,
       thermostatId: deviceId,
@@ -167,8 +193,8 @@ async function handleNestEvent(eventData) {
       runtimeSeconds: 0,
       runtimeMinutes: 0,
       isRuntimeEvent: false,
-      hvacMode: effectiveHvacStatus,
-      isHvacActive: effectiveHvacStatus === 'HEATING' || effectiveHvacStatus === 'COOLING',
+      hvacMode: effectiveStatus,               // string from previous known state
+      isHvacActive: effectiveStatus === 'HEATING' || effectiveStatus === 'COOLING',
       thermostatMode: effectiveMode,
       currentTempF: celsiusToFahrenheit(currentTemp),
       coolSetpointF: celsiusToFahrenheit(coolSetpoint),
@@ -180,6 +206,16 @@ async function handleNestEvent(eventData) {
       heatSetpointC: heatSetpoint ?? null,
       startTempC: null,
       endTempC: currentTemp ?? null,
+
+      // NEW "last*" fields
+      lastIsCooling,
+      lastIsHeating,
+      lastIsFanOnly,
+      lastEquipmentStatus,
+
+      // Optional convenience: also include current equipmentStatus snapshot based on last-known
+      equipmentStatus: mapEquipmentStatus(effectiveStatus, effectiveFanOnly),
+
       timestamp,
       eventId: eventData.eventId,
       eventTimestamp: eventTime
@@ -188,18 +224,16 @@ async function handleNestEvent(eventData) {
     console.log('DEBUG - Created temperature-only payload:');
     console.log(JSON.stringify(payload, null, 2));
 
-    // Send to Bubble
     if (process.env.BUBBLE_WEBHOOK_URL) {
       try {
         console.log('DEBUG - Sending temperature update to Bubble...');
         await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
           timeout: 10000,
           headers: {
-            'User-Agent': 'Nest-Runtime-Tracker/1.0',
+            'User-Agent': 'Nest-Runtime-Tracker/1.1',
             'Content-Type': 'application/json'
           }
         });
-
         const logData = sanitizeForLogging({
           runtimeSeconds: payload.runtimeSeconds,
           isRuntimeEvent: payload.isRuntimeEvent,
@@ -216,7 +250,7 @@ async function handleNestEvent(eventData) {
       }
     }
 
-    // Update device state to track temperature
+    // Keep last known temps/timestamps fresh
     deviceStates[key] = {
       ...deviceStates[key],
       temp: currentTemp,
@@ -230,11 +264,14 @@ async function handleNestEvent(eventData) {
 
   console.log('DEBUG: Validation passed, proceeding with full HVAC event processing');
 
-  // Determine if HVAC is active
-  const isActive = hvacStatus === 'HEATING' || hvacStatus === 'COOLING';
-  const wasActive = deviceStates[key]?.isActive || false;
+  // Derive current booleans & equipment status using fan + hvac status
+  const { isHeating, isCooling, isFanOnly, equipmentStatus } = deriveCurrentFlags(hvacStatus, fanTimerOn);
 
-  // Create standard payload for Bubble
+  // Determine activity transitions for runtime sessions
+  const isActive = isHeating || isCooling; // runtime only for heat/cool (not fan-only)
+  const wasActive = !!prev.isActive;
+
+  // Create standard payload for Bubble (includes "last*" and current equipmentStatus)
   function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
     const payload = {
       userId,
@@ -243,9 +280,11 @@ async function handleNestEvent(eventData) {
       runtimeSeconds,
       runtimeMinutes: Math.round(runtimeSeconds / 60),
       isRuntimeEvent,
-      hvacMode: hvacStatus,
-      isHvacActive: isActive,
+      hvacMode: hvacStatus,                 // "HEATING" | "COOLING" | "OFF"
+      isHvacActive: isActive,               // heat/cool only (fan-only excluded from runtime)
       thermostatMode: mode,
+
+      // temps
       currentTempF: celsiusToFahrenheit(currentTemp),
       coolSetpointF: celsiusToFahrenheit(coolSetpoint),
       heatSetpointF: celsiusToFahrenheit(heatSetpoint),
@@ -256,6 +295,19 @@ async function handleNestEvent(eventData) {
       heatSetpointC: heatSetpoint ?? null,
       startTempC: sessionData?.startTemp ?? null,
       endTempC: currentTemp ?? null,
+
+      // NEW "last*" fields (from previous snapshot)
+      lastIsCooling,
+      lastIsHeating,
+      lastIsFanOnly,
+      lastEquipmentStatus,
+
+      // Also include current equipment status snapshot
+      equipmentStatus,                      // "cool" | "heat" | "fan" | "off" | "unknown"
+
+      // (optional) expose current fan-only flag for debugging/analytics
+      isFanOnly,                            // boolean
+
       timestamp,
       eventId: eventData.eventId,
       eventTimestamp: eventTime
@@ -269,7 +321,7 @@ async function handleNestEvent(eventData) {
   let payload;
 
   if (isActive && !wasActive) {
-    // Just turned on - start new session
+    // Just turned on (heat/cool) - start new runtime session
     sessions[key] = {
       startTime: eventTime,
       startStatus: hvacStatus,
@@ -278,7 +330,7 @@ async function handleNestEvent(eventData) {
     console.log(`Starting ${hvacStatus} session for ${key.substring(0, 16)}...`);
     payload = createBubblePayload(0, false);
   } else if (!isActive && wasActive) {
-    // Just turned off - calculate runtime
+    // Just turned off from heat/cool - end runtime session
     const session = sessions[key];
     if (session) {
       const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
@@ -295,7 +347,7 @@ async function handleNestEvent(eventData) {
       payload = createBubblePayload(0, false);
     }
   } else if (isActive && !sessions[key]) {
-    // System active but no session (restart scenario)
+    // Active but no session (restart scenario)
     sessions[key] = {
       startTime: eventTime,
       startStatus: hvacStatus,
@@ -304,7 +356,7 @@ async function handleNestEvent(eventData) {
     console.log(`Restarting ${hvacStatus} session for ${key.substring(0, 16)}...`);
     payload = createBubblePayload(0, false);
   } else {
-    // No state change, just temperature update
+    // No state change (or fan-only) → regular update only (no runtime increment)
     payload = createBubblePayload(0, false);
     if (!IS_PRODUCTION) console.log(`Temperature update: ${currentTemp}°C`);
   }
@@ -316,7 +368,7 @@ async function handleNestEvent(eventData) {
       await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
         timeout: 10000,
         headers: {
-          'User-Agent': 'Nest-Runtime-Tracker/1.0',
+          'User-Agent': 'Nest-Runtime-Tracker/1.1',
           'Content-Type': 'application/json'
         }
       });
@@ -339,7 +391,7 @@ async function handleNestEvent(eventData) {
           await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
             timeout: 10000,
             headers: {
-              'User-Agent': 'Nest-Runtime-Tracker/1.0',
+              'User-Agent': 'Nest-Runtime-Tracker/1.1',
               'Content-Type': 'application/json'
             }
           });
@@ -362,12 +414,16 @@ async function handleNestEvent(eventData) {
     }
   }
 
-  // Track current state
+  // Track current state for next event ("last*")
   deviceStates[key] = {
-    isActive,
-    status: hvacStatus,
+    isActive,                 // heat/cool only
+    status: hvacStatus,       // raw HEATING/COOLING/OFF
     mode: mode,
     temp: currentTemp,
+    isHeating,
+    isCooling,
+    isFanOnly,
+    equipmentStatus,          // mapped "heat"/"cool"/"fan"/"off"/"unknown"
     lastUpdate: eventTime
   };
 
