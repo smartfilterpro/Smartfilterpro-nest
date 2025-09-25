@@ -268,6 +268,9 @@ function requireAuth(req, res, next) {
 // Send staleness notification to Bubble
 async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   const deviceId = deviceKey.split('-').pop();
+  const lastActivityTime = deviceState.lastActivityAt || 0;
+  const hoursSinceLastActivity = lastActivityTime > 0 ? 
+    Math.floor((currentTime - lastActivityTime) / (60 * 60 * 1000)) : 0;
   
   const payload = {
     thermostatId: deviceId,
@@ -297,6 +300,11 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
     lastEquipmentStatus: deviceState.lastEquipmentStatus || 'unknown',
     equipmentStatus: 'stale',
     
+    // Add staleness timing information
+    hoursSinceLastActivity: hoursSinceLastActivity,
+    lastActivityTime: lastActivityTime > 0 ? new Date(lastActivityTime).toISOString() : null,
+    stalenessReason: hoursSinceLastActivity >= 24 ? 'extended_offline' : 'device_offline',
+    
     timestamp: new Date(currentTime).toISOString(),
     eventId: `stale-${Date.now()}`,
     eventTimestamp: currentTime
@@ -316,30 +324,17 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
         deviceId: payload.thermostatId,
         currentTempF: payload.currentTempF,
         isReachable: payload.isReachable,
-        lastActivity: new Date(deviceState.lastActivityAt || 0)
+        hoursSinceLastActivity: payload.hoursSinceLastActivity,
+        lastActivity: payload.lastActivityTime
       }));
     } catch (err) {
       console.error('Failed to send staleness notification to Bubble:', err.response?.status || err.code || err.message);
     }
   }
   
-  // Update device state to mark as unreachable
-  if (deviceStates[deviceKey]) {
-    deviceStates[deviceKey].isReachable = false;
-  }
-  
-  if (pool) {
-    try {
-      await pool.query(`
-        UPDATE device_states 
-        SET is_reachable = false, 
-            updated_at = NOW() 
-        WHERE device_key = $1
-      `, [deviceKey]);
-    } catch (error) {
-      console.error('Failed to update device reachability in database:', error.message);
-    }
-  }
+  // Note: We no longer immediately mark as unreachable here since we want to continue 
+  // sending notifications every 12 hours. The device will be marked unreachable in the 
+  // database via the UPDATE query in the staleness check interval.
 }
 
 async function handleNestEvent(eventData) {
@@ -874,10 +869,28 @@ setInterval(async () => {
   // Check memory-based devices
   for (const [key, state] of Object.entries(deviceStates)) {
     const lastActivity = state.lastActivityAt || 0;
+    const lastStalenessNotification = state.lastStalenessNotification || 0;
     
-    if (lastActivity > 0 && lastActivity < staleThreshold && state.isReachable !== false) {
-      console.log(`Device ${key} is stale (last activity: ${new Date(lastActivity)}), sending staleness notification`);
-      await sendStalenessNotification(key, state, now);
+    // Send notification if:
+    // 1. Device is stale (last activity > 12 hours ago)
+    // 2. Either never sent staleness notification OR last notification was > 12 hours ago
+    if (lastActivity > 0 && lastActivity < staleThreshold) {
+      const timeSinceLastNotification = now - lastStalenessNotification;
+      
+      if (lastStalenessNotification === 0 || timeSinceLastNotification >= STALENESS_THRESHOLD) {
+        const hoursSinceLastActivity = Math.floor((now - lastActivity) / (60 * 60 * 1000));
+        console.log(`Device ${key} is stale (${hoursSinceLastActivity} hours since last activity), sending staleness notification`);
+        
+        await sendStalenessNotification(key, state, now);
+        
+        // Update the last staleness notification time
+        state.lastStalenessNotification = now;
+        deviceStates[key] = state;
+      }
+    } else if (lastActivity >= staleThreshold && state.lastStalenessNotification) {
+      // Device came back online - reset staleness notification tracking
+      delete state.lastStalenessNotification;
+      deviceStates[key] = state;
     }
   }
   
@@ -885,20 +898,39 @@ setInterval(async () => {
   if (pool) {
     try {
       const staleDevices = await pool.query(`
-        SELECT device_key, last_activity_at, last_temperature, last_equipment_status, is_reachable
+        SELECT device_key, last_activity_at, last_temperature, last_equipment_status, 
+               is_reachable, last_staleness_notification
         FROM device_states 
         WHERE last_activity_at < $1 
-          AND is_reachable = true
           AND last_activity_at > $2
       `, [new Date(staleThreshold), new Date(now - (7 * 24 * 60 * 60 * 1000))]); // Don't check devices older than 7 days
       
       for (const device of staleDevices.rows) {
-        console.log(`Database device ${device.device_key} is stale, sending staleness notification`);
-        await sendStalenessNotification(device.device_key, {
-          lastTemperature: device.last_temperature,
-          lastEquipmentStatus: device.last_equipment_status,
-          lastActivityAt: new Date(device.last_activity_at).getTime()
-        }, now);
+        const lastStalenessNotification = device.last_staleness_notification ? 
+          new Date(device.last_staleness_notification).getTime() : 0;
+        const timeSinceLastNotification = now - lastStalenessNotification;
+        
+        if (lastStalenessNotification === 0 || timeSinceLastNotification >= STALENESS_THRESHOLD) {
+          const hoursSinceLastActivity = Math.floor((now - new Date(device.last_activity_at).getTime()) / (60 * 60 * 1000));
+          console.log(`Database device ${device.device_key} is stale (${hoursSinceLastActivity} hours), sending staleness notification`);
+          
+          await sendStalenessNotification(device.device_key, {
+            lastTemperature: device.last_temperature,
+            lastEquipmentStatus: device.last_equipment_status,
+            lastActivityAt: new Date(device.last_activity_at).getTime()
+          }, now);
+          
+          // Update database with last staleness notification time
+          try {
+            await pool.query(`
+              UPDATE device_states 
+              SET last_staleness_notification = NOW() 
+              WHERE device_key = $1
+            `, [device.device_key]);
+          } catch (updateError) {
+            console.error('Failed to update staleness notification time:', updateError.message);
+          }
+        }
       }
     } catch (error) {
       console.error('Error checking database for stale devices:', error.message);
