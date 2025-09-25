@@ -1,577 +1,4 @@
-'use strict';
-
-console.log('Starting Nest server...');
-
-const express = require('express');
-const axios = require('axios');
-const { Pool } = require('pg');
-require('dotenv').config();
-
-console.log('All modules loaded successfully');
-
-const app = express();
-const PORT = process.env.PORT || 8080;
-
-// Database configuration
-const DATABASE_URL = process.env.DATABASE_URL;
-const ENABLE_DATABASE = process.env.ENABLE_DATABASE !== "0"; // Enabled by default
-let pool = null;
-
-if (ENABLE_DATABASE && DATABASE_URL) {
-  pool = new Pool({
-    connectionString: DATABASE_URL,
-    ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
-    max: parseInt(process.env.DB_MAX_CONNECTIONS || '10'),
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000,
-  });
-
-  pool.on('error', (err) => {
-    console.error('Database pool error:', err.message);
-  });
-}
-
-// Security headers middleware
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  next();
-});
-
-app.use(express.json());
-
-// Session storage (keep for fallback when DB is disabled)
-const sessions = {};
-const deviceStates = {};
-
-// Environment check
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-
-// Enhanced monitoring and cleanup system
-const STALENESS_CHECK_INTERVAL = 60 * 60 * 1000; // Check every hour
-const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 12) * 60 * 60 * 1000; // Default 12 hours
-const CLEANUP_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
-const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000; // Default 4 hours
-
-// Database functions
-async function ensureDeviceExists(deviceKey) {
-  if (!pool) return;
-  try {
-    await pool.query(
-      `INSERT INTO device_states (device_key) VALUES ($1) ON CONFLICT (device_key) DO NOTHING`,
-      [deviceKey]
-    );
-  } catch (error) {
-    console.error(`Failed to ensure device ${deviceKey} exists:`, error.message);
-  }
-}
-
-async function getDeviceState(deviceKey) {
-  if (!pool) {
-    return deviceStates[deviceKey] || null;
-  }
-  
-  try {
-    const result = await pool.query(
-      `SELECT * FROM device_states WHERE device_key = $1`,
-      [deviceKey]
-    );
-    
-    if (result.rows.length === 0) {
-      return null;
-    }
-    
-    const row = result.rows[0];
-    return {
-      isRunning: row.is_running || false,
-      sessionStartedAt: row.session_started_at ? new Date(row.session_started_at).getTime() : null,
-      currentMode: row.current_mode || 'idle',
-      lastTemperature: row.last_temperature ? Number(row.last_temperature) : null,
-      lastHeatSetpoint: row.last_heat_setpoint ? Number(row.last_heat_setpoint) : null,
-      lastCoolSetpoint: row.last_cool_setpoint ? Number(row.last_cool_setpoint) : null,
-      lastEquipmentStatus: row.last_equipment_status,
-      isReachable: row.is_reachable !== false,
-      lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).getTime() : Date.now(),
-      lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).getTime() : Date.now()
-    };
-  } catch (error) {
-    console.error('Failed to get device state:', error.message);
-    return deviceStates[deviceKey] || null; // Fallback to memory
-  }
-}
-
-async function updateDeviceState(deviceKey, state) {
-  // Always update memory for immediate access
-  deviceStates[deviceKey] = state;
-  
-  if (!pool) return;
-  
-  try {
-    await ensureDeviceExists(deviceKey);
-    await pool.query(
-      `
-      UPDATE device_states SET
-        is_running = $2,
-        session_started_at = $3,
-        current_mode = $4,
-        last_temperature = $5,
-        last_heat_setpoint = $6,
-        last_cool_setpoint = $7,
-        last_equipment_status = $8,
-        is_reachable = $9,
-        last_seen_at = $10,
-        last_activity_at = $11,
-        updated_at = NOW()
-      WHERE device_key = $1
-      `,
-      [
-        deviceKey,
-        !!state.isRunning,
-        state.sessionStartedAt ? new Date(state.sessionStartedAt) : null,
-        state.currentMode || 'idle',
-        state.lastTemperature,
-        state.lastHeatSetpoint,
-        state.lastCoolSetpoint,
-        state.lastEquipmentStatus,
-        state.isReachable !== false,
-        state.lastSeenAt ? new Date(state.lastSeenAt) : new Date(),
-        state.lastActivityAt ? new Date(state.lastActivityAt) : new Date()
-      ]
-    );
-  } catch (error) {
-    console.error('Failed to update device state:', error.message);
-  }
-}
-
-async function logRuntimeSession(deviceKey, sessionData) {
-  if (!pool) return null;
-  
-  try {
-    await ensureDeviceExists(deviceKey);
-    const result = await pool.query(
-      `
-      INSERT INTO runtime_sessions 
-        (device_key, mode, equipment_status, started_at, ended_at, duration_seconds, 
-         start_temperature, end_temperature, heat_setpoint, cool_setpoint)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-      RETURNING id, session_id
-      `,
-      [
-        deviceKey,
-        sessionData.mode,
-        sessionData.equipmentStatus,
-        sessionData.startedAt ? new Date(sessionData.startedAt) : null,
-        sessionData.endedAt ? new Date(sessionData.endedAt) : null,
-        sessionData.durationSeconds,
-        sessionData.startTemperature,
-        sessionData.endTemperature,
-        sessionData.heatSetpoint,
-        sessionData.coolSetpoint
-      ]
-    );
-    return result.rows[0];
-  } catch (error) {
-    console.error('Failed to log runtime session:', error.message);
-    return null;
-  }
-}
-
-async function logTemperatureReading(deviceKey, temperature, units = 'F', eventType = 'reading') {
-  if (!pool) return;
-  
-  try {
-    await ensureDeviceExists(deviceKey);
-    await pool.query(
-      `INSERT INTO temperature_readings (device_key, temperature, units, event_type) VALUES ($1, $2, $3, $4)`,
-      [deviceKey, Number(temperature), String(units), String(eventType)]
-    );
-  } catch (error) {
-    console.error('Failed to log temperature reading:', error.message);
-  }
-}
-
-async function logEquipmentEvent(deviceKey, eventType, equipmentStatus, previousStatus, isActive, eventData = {}) {
-  if (!pool) return;
-  
-  try {
-    await ensureDeviceExists(deviceKey);
-    await pool.query(
-      `
-      INSERT INTO equipment_events 
-        (device_key, event_type, equipment_status, previous_status, is_active, event_data)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      `,
-      [deviceKey, eventType, equipmentStatus, previousStatus, !!isActive, JSON.stringify(eventData)]
-    );
-  } catch (error) {
-    console.error('Failed to log equipment event:', error.message);
-  }
-}
-
-function toTimestamp(dateStr) {
-  return new Date(dateStr).getTime();
-}
-
-function celsiusToFahrenheit(celsius) {
-  if (celsius == null || !Number.isFinite(celsius)) return null;
-  return Math.round((celsius * 9) / 5 + 32);
-}
-
-// Map current hvac/fan to canonical equipmentStatus
-function mapEquipmentStatus(hvacStatus, isFanOnly) {
-  if (hvacStatus === 'HEATING') return 'heat';
-  if (hvacStatus === 'COOLING') return 'cool';
-  if (isFanOnly) return 'fan';
-  if (hvacStatus === 'OFF' || !hvacStatus) return 'off';
-  return 'unknown';
-}
-
-function deriveCurrentFlags(hvacStatus, fanTimerOn) {
-  const isHeating = hvacStatus === 'HEATING';
-  const isCooling = hvacStatus === 'COOLING';
-  const isFanOnly = !!fanTimerOn && !isHeating && !isCooling;
-  const equipmentStatus = mapEquipmentStatus(hvacStatus, isFanOnly);
-  return { isHeating, isCooling, isFanOnly, equipmentStatus };
-}
-
-// Sanitize sensitive data for logging
-function sanitizeForLogging(data) {
-  if (!data) return data;
-  const sanitized = { ...data };
-  if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + '…';
-  if (sanitized.deviceName) {
-    const tail = sanitized.deviceName.split('/').pop() || '';
-    sanitized.deviceName = 'device-' + tail.substring(0, 8) + '…';
-  }
-  if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + '…';
-  return sanitized;
-}
-
-// Authentication middleware for admin endpoints
-function requireAuth(req, res, next) {
-  const authToken = req.headers.authorization?.replace('Bearer ', '');
-  const expectedToken = process.env.ADMIN_API_KEY;
-  
-  if (!expectedToken) {
-    return res.status(500).json({ error: 'Admin API key not configured' });
-  }
-  
-  if (!authToken || authToken !== expectedToken) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  next();
-}
-
-// Send staleness notification to Bubble
-async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
-  const deviceId = deviceKey.split('-').pop();
-  const lastActivityTime = deviceState.lastActivityAt || 0;
-  const hoursSinceLastActivity = lastActivityTime > 0 ? 
-    Math.floor((currentTime - lastActivityTime) / (60 * 60 * 1000)) : 0;
-  
-  const payload = {
-    thermostatId: deviceId,
-    deviceName: `Device ${deviceId}`,
-    runtimeSeconds: 0,
-    runtimeMinutes: 0,
-    isRuntimeEvent: false,
-    hvacMode: 'UNKNOWN',
-    isHvacActive: false,
-    thermostatMode: 'UNKNOWN',
-    isReachable: false, // Mark as unreachable due to staleness
-    
-    currentTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : null,
-    coolSetpointF: null,
-    heatSetpointF: null,
-    startTempF: null,
-    endTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : null,
-    currentTempC: deviceState.lastTemperature || null,
-    coolSetpointC: null,
-    heatSetpointC: null,
-    startTempC: null,
-    endTempC: deviceState.lastTemperature || null,
-    
-    lastIsCooling: false,
-    lastIsHeating: false,
-    lastIsFanOnly: false,
-    lastEquipmentStatus: deviceState.lastEquipmentStatus || 'unknown',
-    equipmentStatus: 'stale',
-    
-    // Add staleness timing information
-    hoursSinceLastActivity: hoursSinceLastActivity,
-    lastActivityTime: lastActivityTime > 0 ? new Date(lastActivityTime).toISOString() : null,
-    stalenessReason: hoursSinceLastActivity >= 24 ? 'extended_offline' : 'device_offline',
-    
-    timestamp: new Date(currentTime).toISOString(),
-    eventId: `stale-${Date.now()}`,
-    eventTimestamp: currentTime
-  };
-  
-  if (process.env.BUBBLE_WEBHOOK_URL) {
-    try {
-      await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
-        timeout: 10000,
-        headers: {
-          'User-Agent': 'Nest-Runtime-Tracker/1.2',
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      console.log('Sent staleness notification to Bubble:', sanitizeForLogging({
-        deviceId: payload.thermostatId,
-        currentTempF: payload.currentTempF,
-        isReachable: payload.isReachable,
-        hoursSinceLastActivity: payload.hoursSinceLastActivity,
-        lastActivity: payload.lastActivityTime
-      }));
-    } catch (err) {
-      console.error('Failed to send staleness notification to Bubble:', err.response?.status || err.code || err.message);
-    }
-  }
-  
-  // Note: We no longer immediately mark as unreachable here since we want to continue 
-  // sending notifications every 12 hours. The device will be marked unreachable in the 
-  // database via the UPDATE query in the staleness check interval.
-}
-
-async function handleNestEvent(eventData) {
-  console.log('DEBUG: Starting event processing');
-  if (!IS_PRODUCTION) console.log('Processing Nest event…');
-
-  console.log('DEBUG - Complete event data:');
-  console.log(JSON.stringify(eventData, null, 2));
-
-  const userId = eventData.userId;
-  const deviceName = eventData.resourceUpdate?.name;
-  const traits = eventData.resourceUpdate?.traits;
-  const timestamp = eventData.timestamp;
-
-  console.log('DEBUG - Basic field extraction:');
-  console.log(`- userId: ${userId}`);
-  console.log(`- deviceName: ${deviceName}`);
-  console.log(`- timestamp: ${timestamp}`);
-  console.log(`- resourceUpdate exists: ${!!eventData.resourceUpdate}`);
-  console.log(`- traits exists: ${!!traits}`);
-
-  if (eventData.resourceUpdate) {
-    console.log('DEBUG - resourceUpdate keys:', Object.keys(eventData.resourceUpdate));
-  }
-
-  console.log('DEBUG - Raw traits object:');
-  if (traits) {
-    console.log(JSON.stringify(traits, null, 2));
-    console.log('DEBUG - Available trait keys:', Object.keys(traits));
-  } else {
-    console.log('No traits found!');
-  }
-
-  const deviceId = deviceName?.split('/').pop();
-
-  // Primary traits
-  const hvacStatusRaw = traits?.['sdm.devices.traits.ThermostatHvac']?.status; // "HEATING" | "COOLING" | "OFF"
-  const currentTemp = traits?.['sdm.devices.traits.Temperature']?.ambientTemperatureCelsius;
-  const coolSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius;
-  const heatSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius;
-  const mode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
-
-  // Fan trait (to infer fan-only)
-  const fanTimerMode = traits?.['sdm.devices.traits.Fan']?.timerMode; // "ON" | "OFF"
-  const fanTimerOn = fanTimerMode === 'ON';
-
-  // Connectivity trait
-  const connectivityStatus = traits?.['sdm.devices.traits.Connectivity']?.status; // "ONLINE" | "OFFLINE"
-  const key = `${userId}-${deviceId}`;
-  
-  // Get previous state from database
-  const prev = await getDeviceState(key) || {};
-  
-  const isReachable = (connectivityStatus === 'OFFLINE')
-    ? false
-    : (connectivityStatus === 'ONLINE')
-      ? true
-      : (prev.isReachable ?? true); // default to true if unknown
-
-  // Log extracted values
-  console.log('DEBUG - Extracted trait values:');
-  console.log(`- hvacStatusRaw: ${hvacStatusRaw}`);
-  console.log(`- currentTemp: ${currentTemp}`);
-  console.log(`- coolSetpoint: ${coolSetpoint}`);
-  console.log(`- heatSetpoint: ${heatSetpoint}`);
-  console.log(`- mode: ${mode}`);
-  console.log(`- fanTimerMode: ${fanTimerMode}`);
-  console.log(`- connectivityStatus: ${connectivityStatus} -> isReachable=${isReachable}`);
-
-  if (!IS_PRODUCTION) {
-    console.log(
-      `Event data: userId=${userId?.substring(0, 8)}..., deviceId=${deviceId?.substring(0, 8)}..., hvac=${hvacStatusRaw}, temp=${currentTemp}°C`
-    );
-  }
-
-  // Basic validation
-  if (!userId || !deviceId || !timestamp) {
-    console.warn('Skipping incomplete Nest event');
-    if (!userId) console.log('  - Missing userId');
-    if (!deviceId) console.log('  - Missing deviceId');
-    if (!timestamp) console.log('  - Missing timestamp');
-    return;
-  }
-
-  const eventTime = toTimestamp(timestamp);
-
-  // previous ("last*") fields
-  const lastIsCooling = !!prev.lastEquipmentStatus?.includes('cool');
-  const lastIsHeating = !!prev.lastEquipmentStatus?.includes('heat');
-  const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes('fan');
-  const lastEquipmentStatus = prev.lastEquipmentStatus || 'unknown';
-
-  // Determine effective HVAC status when not present (e.g., connectivity-only or temp-only)
-  const hvacStatusEff = hvacStatusRaw ?? prev.currentMode ?? 'OFF';
-
-  // Connectivity-only?
-  const isConnectivityOnly = !!connectivityStatus && !hvacStatusRaw && currentTemp == null;
-
-  // Temperature-only?
-  const isTemperatureOnlyEvent = !hvacStatusRaw && currentTemp != null;
-
-  // ---- Temperature-only branch ----
-  if (isTemperatureOnlyEvent) {
-    console.log('Temperature-only event detected');
-
-    // Log temperature reading to database
-    await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
-
-    const effectiveMode = prev.currentMode || mode || 'OFF';
-    const effectiveFanOnly = prev.lastEquipmentStatus === 'fan';
-
-    const payload = {
-      userId,
-      thermostatId: deviceId,
-      deviceName: deviceName,
-      runtimeSeconds: 0,
-      runtimeMinutes: 0,
-      isRuntimeEvent: false,
-      hvacMode: hvacStatusEff,
-      isHvacActive: hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING',
-      thermostatMode: effectiveMode,
-      isReachable,
-
-      currentTempF: celsiusToFahrenheit(currentTemp),
-      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
-      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
-      startTempF: null,
-      endTempF: celsiusToFahrenheit(currentTemp),
-      currentTempC: currentTemp ?? null,
-      coolSetpointC: coolSetpoint ?? null,
-      heatSetpointC: heatSetpoint ?? null,
-      startTempC: null,
-      endTempC: currentTemp ?? null,
-
-      lastIsCooling,
-      lastIsHeating,
-      lastIsFanOnly,
-      lastEquipmentStatus,
-      equipmentStatus: mapEquipmentStatus(hvacStatusEff, effectiveFanOnly),
-
-      timestamp,
-      eventId: eventData.eventId,
-      eventTimestamp: eventTime
-    };
-
-    console.log('DEBUG - Created temperature-only payload:');
-    console.log(JSON.stringify(payload, null, 2));
-
-    if (process.env.BUBBLE_WEBHOOK_URL) {
-      try {
-        console.log('DEBUG - Sending temperature update to Bubble...');
-        await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
-          timeout: 10000,
-          headers: {
-            'User-Agent': 'Nest-Runtime-Tracker/1.2',
-            'Content-Type': 'application/json'
-          }
-        });
-        const logData = sanitizeForLogging({
-          runtimeSeconds: payload.runtimeSeconds,
-          isRuntimeEvent: payload.isRuntimeEvent,
-          hvacMode: payload.hvacMode,
-          isHvacActive: payload.isHvacActive,
-          currentTempF: payload.currentTempF,
-          isReachable: payload.isReachable
-        });
-        console.log('Sent temperature update to Bubble:', logData);
-      } catch (err) {
-        console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
-      }
-    }
-
-    // Update device state in database
-    await updateDeviceState(key, {
-      ...prev,
-      lastTemperature: currentTemp,
-      lastSeenAt: eventTime,
-      lastActivityAt: eventTime,
-      isReachable
-    });
-
-    console.log('DEBUG: Temperature-only event processing complete');
-    return;
-  }
-
-  // ---- Connectivity-only branch ----
-  if (isConnectivityOnly) {
-    console.log('Connectivity-only event detected');
-
-    const payload = {
-      userId,
-      thermostatId: deviceId,
-      deviceName: deviceName,
-      runtimeSeconds: 0,
-      runtimeMinutes: 0,
-      isRuntimeEvent: false,
-      hvacMode: hvacStatusEff,
-      isHvacActive: hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING',
-      thermostatMode: prev.currentMode || mode || 'OFF',
-      isReachable,
-
-      currentTempF: celsiusToFahrenheit(prev.lastTemperature),
-      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
-      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
-      startTempF: null,
-      endTempF: celsiusToFahrenheit(prev.lastTemperature),
-      currentTempC: prev.lastTemperature ?? null,
-      coolSetpointC: coolSetpoint ?? null,
-      heatSetpointC: heatSetpoint ?? null,
-      startTempC: null,
-      endTempC: prev.lastTemperature ?? null,
-
-      lastIsCooling,
-      lastIsHeating,
-      lastIsFanOnly,
-      lastEquipmentStatus,
-      equipmentStatus: prev.lastEquipmentStatus || mapEquipmentStatus(hvacStatusEff, prev.lastEquipmentStatus === 'fan'),
-
-      timestamp,
-      eventId: eventData.eventId,
-      eventTimestamp: eventTime
-    };
-
-    console.log('DEBUG - Created connectivity-only payload:');
-    console.log(JSON.stringify(payload, null, 2));
-
-    if (process.env.BUBBLE_WEBHOOK_URL) {
-      try {
-        console.log('DEBUG - Sending connectivity update to Bubble…');
-        await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
-          timeout: 10000,
-          headers: {
-            'User-Agent': 'Nest-Runtime-Tracker/1.2',
-            'Content-Type': 'application/json'
-          }
-        });
-        console.log('Sent connectivity update to Bubble:', sanitizeForLogging({ isReachable: payload.isReachable }));
+console.log('Sent connectivity update to Bubble:', sanitizeForLogging({ isReachable: payload.isReachable }));
       } catch (err) {
         console.error('Failed to send connectivity update to Bubble:', err.response?.status || err.code || err.message);
       }
@@ -1107,12 +534,15 @@ async function initializeDatabase() {
     const result = await pool.query('SELECT NOW() as now');
     console.log('Database connection established:', result.rows[0].now);
     
+    // Run migration
+    await runDatabaseMigration();
+    
     // Load existing device states into memory for faster access
     const stateResult = await pool.query('SELECT device_key FROM device_states');
     console.log(`Loaded ${stateResult.rows.length} existing device states from database`);
     
   } catch (error) {
-    console.error('Database connection failed:', error.message);
+    console.error('Database initialization failed:', error.message);
     console.warn('Falling back to memory-only state management');
   }
 }
@@ -1692,4 +1122,750 @@ async function startServer() {
 startServer().catch(error => {
   console.error('Failed to start server:', error.message);
   process.exit(1);
+});'use strict';
+
+console.log('Starting Nest server...');
+
+const express = require('express');
+const axios = require('axios');
+const { Pool } = require('pg');
+require('dotenv').config();
+
+console.log('All modules loaded successfully');
+
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// Database configuration
+const DATABASE_URL = process.env.DATABASE_URL;
+const ENABLE_DATABASE = process.env.ENABLE_DATABASE !== "0"; // Enabled by default
+let pool = null;
+
+if (ENABLE_DATABASE && DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+    max: parseInt(process.env.DB_MAX_CONNECTIONS || '10'),
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000,
+  });
+
+  pool.on('error', (err) => {
+    console.error('Database pool error:', err.message);
+  });
+}
+
+// Security headers middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
 });
+
+app.use(express.json());
+
+// Session storage (keep for fallback when DB is disabled)
+const sessions = {};
+const deviceStates = {};
+
+// Environment check
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// Enhanced monitoring and cleanup system
+const STALENESS_CHECK_INTERVAL = 60 * 60 * 1000; // Check every hour
+const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 12) * 60 * 60 * 1000; // Default 12 hours
+const CLEANUP_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
+const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000; // Default 4 hours
+
+// Database functions
+async function ensureDeviceExists(deviceKey) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO device_states (device_key) VALUES ($1) ON CONFLICT (device_key) DO NOTHING`,
+      [deviceKey]
+    );
+  } catch (error) {
+    console.error(`Failed to ensure device ${deviceKey} exists:`, error.message);
+  }
+}
+
+async function getDeviceState(deviceKey) {
+  if (!pool) {
+    return deviceStates[deviceKey] || null;
+  }
+  
+  try {
+    const result = await pool.query(
+      `SELECT * FROM device_states WHERE device_key = $1`,
+      [deviceKey]
+    );
+    
+    if (result.rows.length === 0) {
+      return null;
+    }
+    
+    const row = result.rows[0];
+    return {
+      isRunning: row.is_running || false,
+      sessionStartedAt: row.session_started_at ? new Date(row.session_started_at).getTime() : null,
+      currentMode: row.current_mode || 'idle',
+      lastTemperature: row.last_temperature ? Number(row.last_temperature) : null,
+      lastHeatSetpoint: row.last_heat_setpoint ? Number(row.last_heat_setpoint) : null,
+      lastCoolSetpoint: row.last_cool_setpoint ? Number(row.last_cool_setpoint) : null,
+      lastEquipmentStatus: row.last_equipment_status,
+      isReachable: row.is_reachable !== false,
+      lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).getTime() : Date.now(),
+      lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).getTime() : Date.now()
+    };
+  } catch (error) {
+    console.error('Failed to get device state:', error.message);
+    return deviceStates[deviceKey] || null; // Fallback to memory
+  }
+}
+
+async function updateDeviceState(deviceKey, state) {
+  // Always update memory for immediate access
+  deviceStates[deviceKey] = state;
+  
+  if (!pool) return;
+  
+  try {
+    await ensureDeviceExists(deviceKey);
+    await pool.query(
+      `
+      UPDATE device_states SET
+        is_running = $2,
+        session_started_at = $3,
+        current_mode = $4,
+        last_temperature = $5,
+        last_heat_setpoint = $6,
+        last_cool_setpoint = $7,
+        last_equipment_status = $8,
+        is_reachable = $9,
+        last_seen_at = $10,
+        last_activity_at = $11,
+        updated_at = NOW()
+      WHERE device_key = $1
+      `,
+      [
+        deviceKey,
+        !!state.isRunning,
+        state.sessionStartedAt ? new Date(state.sessionStartedAt) : null,
+        state.currentMode || 'idle',
+        state.lastTemperature,
+        state.lastHeatSetpoint,
+        state.lastCoolSetpoint,
+        state.lastEquipmentStatus,
+        state.isReachable !== false,
+        state.lastSeenAt ? new Date(state.lastSeenAt) : new Date(),
+        state.lastActivityAt ? new Date(state.lastActivityAt) : new Date()
+      ]
+    );
+  } catch (error) {
+    console.error('Failed to update device state:', error.message);
+  }
+}
+
+async function logRuntimeSession(deviceKey, sessionData) {
+  if (!pool) return null;
+  
+  try {
+    await ensureDeviceExists(deviceKey);
+    const result = await pool.query(
+      `
+      INSERT INTO runtime_sessions 
+        (device_key, mode, equipment_status, started_at, ended_at, duration_seconds, 
+         start_temperature, end_temperature, heat_setpoint, cool_setpoint)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING id, session_id
+      `,
+      [
+        deviceKey,
+        sessionData.mode,
+        sessionData.equipmentStatus,
+        sessionData.startedAt ? new Date(sessionData.startedAt) : null,
+        sessionData.endedAt ? new Date(sessionData.endedAt) : null,
+        sessionData.durationSeconds,
+        sessionData.startTemperature,
+        sessionData.endTemperature,
+        sessionData.heatSetpoint,
+        sessionData.coolSetpoint
+      ]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error('Failed to log runtime session:', error.message);
+    return null;
+  }
+}
+
+async function logTemperatureReading(deviceKey, temperature, units = 'F', eventType = 'reading') {
+  if (!pool) return;
+  
+  try {
+    await ensureDeviceExists(deviceKey);
+    await pool.query(
+      `INSERT INTO temperature_readings (device_key, temperature, units, event_type) VALUES ($1, $2, $3, $4)`,
+      [deviceKey, Number(temperature), String(units), String(eventType)]
+    );
+  } catch (error) {
+    console.error('Failed to log temperature reading:', error.message);
+  }
+}
+
+async function logEquipmentEvent(deviceKey, eventType, equipmentStatus, previousStatus, isActive, eventData = {}) {
+  if (!pool) return;
+  
+  try {
+    await ensureDeviceExists(deviceKey);
+    await pool.query(
+      `
+      INSERT INTO equipment_events 
+        (device_key, event_type, equipment_status, previous_status, is_active, event_data)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [deviceKey, eventType, equipmentStatus, previousStatus, !!isActive, JSON.stringify(eventData)]
+    );
+  } catch (error) {
+    console.error('Failed to log equipment event:', error.message);
+  }
+}
+
+function toTimestamp(dateStr) {
+  return new Date(dateStr).getTime();
+}
+
+function celsiusToFahrenheit(celsius) {
+  if (celsius == null || !Number.isFinite(celsius)) return null;
+  return Math.round((celsius * 9) / 5 + 32);
+}
+
+// Map current hvac/fan to canonical equipmentStatus
+function mapEquipmentStatus(hvacStatus, isFanOnly) {
+  if (hvacStatus === 'HEATING') return 'heat';
+  if (hvacStatus === 'COOLING') return 'cool';
+  if (isFanOnly) return 'fan';
+  if (hvacStatus === 'OFF' || !hvacStatus) return 'off';
+  return 'unknown';
+}
+
+function deriveCurrentFlags(hvacStatus, fanTimerOn) {
+  const isHeating = hvacStatus === 'HEATING';
+  const isCooling = hvacStatus === 'COOLING';
+  const isFanOnly = !!fanTimerOn && !isHeating && !isCooling;
+  const equipmentStatus = mapEquipmentStatus(hvacStatus, isFanOnly);
+  return { isHeating, isCooling, isFanOnly, equipmentStatus };
+}
+
+// Sanitize sensitive data for logging
+function sanitizeForLogging(data) {
+  if (!data) return data;
+  const sanitized = { ...data };
+  if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + '…';
+  if (sanitized.deviceName) {
+    const tail = sanitized.deviceName.split('/').pop() || '';
+    sanitized.deviceName = 'device-' + tail.substring(0, 8) + '…';
+  }
+  if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + '…';
+  return sanitized;
+}
+
+// Authentication middleware for admin endpoints
+function requireAuth(req, res, next) {
+  const authToken = req.headers.authorization?.replace('Bearer ', '');
+  const expectedToken = process.env.ADMIN_API_KEY;
+  
+  if (!expectedToken) {
+    return res.status(500).json({ error: 'Admin API key not configured' });
+  }
+  
+  if (!authToken || authToken !== expectedToken) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  next();
+}
+
+// Database migration function with proper field sizes
+async function runDatabaseMigration() {
+  if (!ENABLE_DATABASE || !pool) {
+    console.log('Database disabled - skipping migration');
+    return;
+  }
+
+  try {
+    console.log('Checking database schema...');
+
+    // Check if schema already exists
+    const schemaExists = await pool.query(`
+      SELECT COUNT(*) as count 
+      FROM information_schema.tables 
+      WHERE table_name = 'device_states' AND table_schema = 'public'
+    `);
+    
+    if (parseInt(schemaExists.rows[0].count) > 0) {
+      console.log('Database schema already exists - skipping migration');
+      return;
+    }
+
+    console.log('Creating database schema with proper field sizes...');
+    console.log('- device_key: VARCHAR(300) for long Nest device IDs');
+    console.log('- device_name: VARCHAR(600) for full device paths');
+    console.log('- other ID fields: VARCHAR(300)');
+    
+    const migrationSQL = `
+      -- Device state tracking table for Nest devices
+      CREATE TABLE IF NOT EXISTS device_states (
+          device_key VARCHAR(300) PRIMARY KEY,
+          frontend_id VARCHAR(300),
+          mac_id VARCHAR(300),
+          device_name VARCHAR(600),
+          units CHAR(1) DEFAULT 'F' CHECK (units IN ('F', 'C')),
+          location_id VARCHAR(300),
+          workspace_id VARCHAR(300),
+          
+          -- Current runtime session
+          is_running BOOLEAN DEFAULT FALSE,
+          session_started_at TIMESTAMPTZ,
+          current_mode VARCHAR(20) DEFAULT 'idle',
+          current_equipment_status VARCHAR(50),
+          
+          -- Last known values
+          last_temperature DECIMAL(5,2),
+          last_heat_setpoint DECIMAL(5,2),
+          last_cool_setpoint DECIMAL(5,2),
+          last_fan_status VARCHAR(10),
+          last_equipment_status VARCHAR(50),
+          
+          -- Session tracking
+          last_mode VARCHAR(20),
+          last_was_cooling BOOLEAN DEFAULT FALSE,
+          last_was_heating BOOLEAN DEFAULT FALSE,
+          last_was_fan_only BOOLEAN DEFAULT FALSE,
+          
+          -- Connectivity
+          is_reachable BOOLEAN DEFAULT TRUE,
+          last_seen_at TIMESTAMPTZ DEFAULT NOW(),
+          last_activity_at TIMESTAMPTZ DEFAULT NOW(),
+          last_post_at TIMESTAMPTZ DEFAULT NOW(),
+          last_staleness_notification TIMESTAMPTZ,
+          
+          -- Metadata
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Runtime sessions history
+      CREATE TABLE IF NOT EXISTS runtime_sessions (
+          id BIGSERIAL PRIMARY KEY,
+          device_key VARCHAR(300) NOT NULL REFERENCES device_states(device_key) ON DELETE CASCADE,
+          session_id UUID DEFAULT gen_random_uuid(),
+          
+          -- Session details
+          mode VARCHAR(20) NOT NULL,
+          equipment_status VARCHAR(50),
+          started_at TIMESTAMPTZ NOT NULL,
+          ended_at TIMESTAMPTZ,
+          duration_seconds INTEGER,
+          
+          -- Environmental data
+          start_temperature DECIMAL(5,2),
+          end_temperature DECIMAL(5,2),
+          heat_setpoint DECIMAL(5,2),
+          cool_setpoint DECIMAL(5,2),
+          
+          -- Session stats
+          tick_count INTEGER DEFAULT 0,
+          last_tick_at TIMESTAMPTZ,
+          
+          -- Metadata
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Equipment status changes log
+      CREATE TABLE IF NOT EXISTS equipment_events (
+          id BIGSERIAL PRIMARY KEY,
+          device_key VARCHAR(300) NOT NULL REFERENCES device_states(device_key) ON DELETE CASCADE,
+          event_type VARCHAR(50) NOT NULL,
+          equipment_status VARCHAR(50),
+          previous_status VARCHAR(50),
+          is_active BOOLEAN,
+          session_id UUID,
+          event_data JSONB,
+          recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Temperature readings log
+      CREATE TABLE IF NOT EXISTS temperature_readings (
+          id BIGSERIAL PRIMARY KEY,
+          device_key VARCHAR(300) NOT NULL REFERENCES device_states(device_key) ON DELETE CASCADE,
+          temperature DECIMAL(5,2) NOT NULL,
+          units CHAR(1) NOT NULL,
+          event_type VARCHAR(50),
+          session_id UUID,
+          recorded_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Indexes for performance
+      CREATE INDEX IF NOT EXISTS idx_device_states_last_seen ON device_states(last_seen_at);
+      CREATE INDEX IF NOT EXISTS idx_device_states_running ON device_states(is_running) WHERE is_running = TRUE;
+      CREATE INDEX IF NOT EXISTS idx_runtime_sessions_device_time ON runtime_sessions(device_key, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runtime_sessions_active ON runtime_sessions(device_key, ended_at) WHERE ended_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_temperature_readings_device_time ON temperature_readings(device_key, recorded_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_equipment_events_device_time ON equipment_events(device_key, recorded_at DESC);
+
+      -- Create trigger function if it doesn't exist
+      CREATE OR REPLACE FUNCTION update_updated_at_column()
+      RETURNS TRIGGER AS $$
+      BEGIN
+          NEW.updated_at = NOW();
+          RETURN NEW;
+      END;
+      $$ language 'plpgsql';
+
+      -- Create triggers only if they don't exist
+      DO $$
+      BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_device_states_updated_at') THEN
+              CREATE TRIGGER update_device_states_updated_at 
+                  BEFORE UPDATE ON device_states 
+                  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+          END IF;
+          
+          IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_runtime_sessions_updated_at') THEN
+              CREATE TRIGGER update_runtime_sessions_updated_at 
+                  BEFORE UPDATE ON runtime_sessions 
+                  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+          END IF;
+      END
+      $$;
+    `;
+
+    await pool.query(migrationSQL);
+    console.log('Database schema created successfully');
+    
+    // Verify the schema was created with correct field sizes
+    const checkSchema = await pool.query(`
+      SELECT column_name, character_maximum_length 
+      FROM information_schema.columns 
+      WHERE table_name = 'device_states' 
+        AND column_name IN ('device_key', 'device_name')
+    `);
+    
+    for (const row of checkSchema.rows) {
+      console.log(`Verified: ${row.column_name} = VARCHAR(${row.character_maximum_length})`);
+    }
+    
+  } catch (error) {
+    console.error('Database migration failed:', error.message);
+    console.warn('Continuing with memory-only operation...');
+  }
+}
+
+// Send staleness notification to Bubble
+async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
+  const deviceId = deviceKey.split('-').pop();
+  const lastActivityTime = deviceState.lastActivityAt || 0;
+  const hoursSinceLastActivity = lastActivityTime > 0 ? 
+    Math.floor((currentTime - lastActivityTime) / (60 * 60 * 1000)) : 0;
+  
+  const payload = {
+    thermostatId: deviceId,
+    deviceName: `Device ${deviceId}`,
+    runtimeSeconds: 0,
+    runtimeMinutes: 0,
+    isRuntimeEvent: false,
+    hvacMode: 'UNKNOWN',
+    isHvacActive: false,
+    thermostatMode: 'UNKNOWN',
+    isReachable: false, // Mark as unreachable due to staleness
+    
+    currentTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : null,
+    coolSetpointF: null,
+    heatSetpointF: null,
+    startTempF: null,
+    endTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : null,
+    currentTempC: deviceState.lastTemperature || null,
+    coolSetpointC: null,
+    heatSetpointC: null,
+    startTempC: null,
+    endTempC: deviceState.lastTemperature || null,
+    
+    lastIsCooling: false,
+    lastIsHeating: false,
+    lastIsFanOnly: false,
+    lastEquipmentStatus: deviceState.lastEquipmentStatus || 'unknown',
+    equipmentStatus: 'stale',
+    
+    // Add staleness timing information
+    hoursSinceLastActivity: hoursSinceLastActivity,
+    lastActivityTime: lastActivityTime > 0 ? new Date(lastActivityTime).toISOString() : null,
+    stalenessReason: hoursSinceLastActivity >= 24 ? 'extended_offline' : 'device_offline',
+    
+    timestamp: new Date(currentTime).toISOString(),
+    eventId: `stale-${Date.now()}`,
+    eventTimestamp: currentTime
+  };
+  
+  if (process.env.BUBBLE_WEBHOOK_URL) {
+    try {
+      await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Nest-Runtime-Tracker/1.2',
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      console.log('Sent staleness notification to Bubble:', sanitizeForLogging({
+        deviceId: payload.thermostatId,
+        currentTempF: payload.currentTempF,
+        isReachable: payload.isReachable,
+        hoursSinceLastActivity: payload.hoursSinceLastActivity,
+        lastActivity: payload.lastActivityTime
+      }));
+    } catch (err) {
+      console.error('Failed to send staleness notification to Bubble:', err.response?.status || err.code || err.message);
+    }
+  }
+}
+
+async function handleNestEvent(eventData) {
+  console.log('DEBUG: Starting event processing');
+  if (!IS_PRODUCTION) console.log('Processing Nest event…');
+
+  console.log('DEBUG - Complete event data:');
+  console.log(JSON.stringify(eventData, null, 2));
+
+  const userId = eventData.userId;
+  const deviceName = eventData.resourceUpdate?.name;
+  const traits = eventData.resourceUpdate?.traits;
+  const timestamp = eventData.timestamp;
+
+  console.log('DEBUG - Basic field extraction:');
+  console.log(`- userId: ${userId}`);
+  console.log(`- deviceName: ${deviceName}`);
+  console.log(`- timestamp: ${timestamp}`);
+  console.log(`- resourceUpdate exists: ${!!eventData.resourceUpdate}`);
+  console.log(`- traits exists: ${!!traits}`);
+
+  if (eventData.resourceUpdate) {
+    console.log('DEBUG - resourceUpdate keys:', Object.keys(eventData.resourceUpdate));
+  }
+
+  console.log('DEBUG - Raw traits object:');
+  if (traits) {
+    console.log(JSON.stringify(traits, null, 2));
+    console.log('DEBUG - Available trait keys:', Object.keys(traits));
+  } else {
+    console.log('No traits found!');
+  }
+
+  const deviceId = deviceName?.split('/').pop();
+
+  // Primary traits
+  const hvacStatusRaw = traits?.['sdm.devices.traits.ThermostatHvac']?.status; // "HEATING" | "COOLING" | "OFF"
+  const currentTemp = traits?.['sdm.devices.traits.Temperature']?.ambientTemperatureCelsius;
+  const coolSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius;
+  const heatSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius;
+  const mode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
+
+  // Fan trait (to infer fan-only)
+  const fanTimerMode = traits?.['sdm.devices.traits.Fan']?.timerMode; // "ON" | "OFF"
+  const fanTimerOn = fanTimerMode === 'ON';
+
+  // Connectivity trait
+  const connectivityStatus = traits?.['sdm.devices.traits.Connectivity']?.status; // "ONLINE" | "OFFLINE"
+  const key = `${userId}-${deviceId}`;
+  
+  // Get previous state from database
+  const prev = await getDeviceState(key) || {};
+  
+  const isReachable = (connectivityStatus === 'OFFLINE')
+    ? false
+    : (connectivityStatus === 'ONLINE')
+      ? true
+      : (prev.isReachable ?? true); // default to true if unknown
+
+  // Log extracted values
+  console.log('DEBUG - Extracted trait values:');
+  console.log(`- hvacStatusRaw: ${hvacStatusRaw}`);
+  console.log(`- currentTemp: ${currentTemp}`);
+  console.log(`- coolSetpoint: ${coolSetpoint}`);
+  console.log(`- heatSetpoint: ${heatSetpoint}`);
+  console.log(`- mode: ${mode}`);
+  console.log(`- fanTimerMode: ${fanTimerMode}`);
+  console.log(`- connectivityStatus: ${connectivityStatus} -> isReachable=${isReachable}`);
+
+  if (!IS_PRODUCTION) {
+    console.log(
+      `Event data: userId=${userId?.substring(0, 8)}..., deviceId=${deviceId?.substring(0, 8)}..., hvac=${hvacStatusRaw}, temp=${currentTemp}°C`
+    );
+  }
+
+  // Basic validation
+  if (!userId || !deviceId || !timestamp) {
+    console.warn('Skipping incomplete Nest event');
+    if (!userId) console.log('  - Missing userId');
+    if (!deviceId) console.log('  - Missing deviceId');
+    if (!timestamp) console.log('  - Missing timestamp');
+    return;
+  }
+
+  const eventTime = toTimestamp(timestamp);
+
+  // previous ("last*") fields
+  const lastIsCooling = !!prev.lastEquipmentStatus?.includes('cool');
+  const lastIsHeating = !!prev.lastEquipmentStatus?.includes('heat');
+  const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes('fan');
+  const lastEquipmentStatus = prev.lastEquipmentStatus || 'unknown';
+
+  // Determine effective HVAC status when not present (e.g., connectivity-only or temp-only)
+  const hvacStatusEff = hvacStatusRaw ?? prev.currentMode ?? 'OFF';
+
+  // Connectivity-only?
+  const isConnectivityOnly = !!connectivityStatus && !hvacStatusRaw && currentTemp == null;
+
+  // Temperature-only?
+  const isTemperatureOnlyEvent = !hvacStatusRaw && currentTemp != null;
+
+  // ---- Temperature-only branch ----
+  if (isTemperatureOnlyEvent) {
+    console.log('Temperature-only event detected');
+
+    // Log temperature reading to database
+    await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
+
+    const effectiveMode = prev.currentMode || mode || 'OFF';
+    const effectiveFanOnly = prev.lastEquipmentStatus === 'fan';
+
+    const payload = {
+      userId,
+      thermostatId: deviceId,
+      deviceName: deviceName,
+      runtimeSeconds: 0,
+      runtimeMinutes: 0,
+      isRuntimeEvent: false,
+      hvacMode: hvacStatusEff,
+      isHvacActive: hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING',
+      thermostatMode: effectiveMode,
+      isReachable,
+
+      currentTempF: celsiusToFahrenheit(currentTemp),
+      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
+      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
+      startTempF: null,
+      endTempF: celsiusToFahrenheit(currentTemp),
+      currentTempC: currentTemp ?? null,
+      coolSetpointC: coolSetpoint ?? null,
+      heatSetpointC: heatSetpoint ?? null,
+      startTempC: null,
+      endTempC: currentTemp ?? null,
+
+      lastIsCooling,
+      lastIsHeating,
+      lastIsFanOnly,
+      lastEquipmentStatus,
+      equipmentStatus: mapEquipmentStatus(hvacStatusEff, effectiveFanOnly),
+
+      timestamp,
+      eventId: eventData.eventId,
+      eventTimestamp: eventTime
+    };
+
+    console.log('DEBUG - Created temperature-only payload:');
+    console.log(JSON.stringify(payload, null, 2));
+
+    if (process.env.BUBBLE_WEBHOOK_URL) {
+      try {
+        console.log('DEBUG - Sending temperature update to Bubble...');
+        await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': 'Nest-Runtime-Tracker/1.2',
+            'Content-Type': 'application/json'
+          }
+        });
+        const logData = sanitizeForLogging({
+          runtimeSeconds: payload.runtimeSeconds,
+          isRuntimeEvent: payload.isRuntimeEvent,
+          hvacMode: payload.hvacMode,
+          isHvacActive: payload.isHvacActive,
+          currentTempF: payload.currentTempF,
+          isReachable: payload.isReachable
+        });
+        console.log('Sent temperature update to Bubble:', logData);
+      } catch (err) {
+        console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
+      }
+    }
+
+    // Update device state in database
+    await updateDeviceState(key, {
+      ...prev,
+      lastTemperature: currentTemp,
+      lastSeenAt: eventTime,
+      lastActivityAt: eventTime,
+      isReachable
+    });
+
+    console.log('DEBUG: Temperature-only event processing complete');
+    return;
+  }
+
+  // ---- Connectivity-only branch ----
+  if (isConnectivityOnly) {
+    console.log('Connectivity-only event detected');
+
+    const payload = {
+      userId,
+      thermostatId: deviceId,
+      deviceName: deviceName,
+      runtimeSeconds: 0,
+      runtimeMinutes: 0,
+      isRuntimeEvent: false,
+      hvacMode: hvacStatusEff,
+      isHvacActive: hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING',
+      thermostatMode: prev.currentMode || mode || 'OFF',
+      isReachable,
+
+      currentTempF: celsiusToFahrenheit(prev.lastTemperature),
+      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
+      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
+      startTempF: null,
+      endTempF: celsiusToFahrenheit(prev.lastTemperature),
+      currentTempC: prev.lastTemperature ?? null,
+      coolSetpointC: coolSetpoint ?? null,
+      heatSetpointC: heatSetpoint ?? null,
+      startTempC: null,
+      endTempC: prev.lastTemperature ?? null,
+
+      lastIsCooling,
+      lastIsHeating,
+      lastIsFanOnly,
+      lastEquipmentStatus,
+      equipmentStatus: prev.lastEquipmentStatus || mapEquipmentStatus(hvacStatusEff, prev.lastEquipmentStatus === 'fan'),
+
+      timestamp,
+      eventId: eventData.eventId,
+      eventTimestamp: eventTime
+    };
+
+    console.log('DEBUG - Created connectivity-only payload:');
+    console.log(JSON.stringify(payload, null, 2));
+
+    if (process.env.BUBBLE_WEBHOOK_URL) {
+      try {
+        console.log('DEBUG - Sending connectivity update to Bubble…');
+        await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': 'Nest-Runtime-Tracker/1.2',
+            'Content-Type': 'application/json'
+          }
+        });
+        console.log
