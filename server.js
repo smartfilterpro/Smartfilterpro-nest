@@ -556,8 +556,12 @@ async function handleNestEvent(eventData) {
 
     await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
-    const effectiveMode = prev.currentMode || mode || 'OFF';
-    const effectiveFanOnly = prev.lastEquipmentStatus === 'fan';
+    // Use current running state, not just previous mode
+    const isCurrentlyRunning = sessions[key] || prev.isRunning;
+    const currentEquipmentStatus = isCurrentlyRunning ? (prev.currentMode || 'unknown') : 'off';
+    const effectiveHvacMode = isCurrentlyRunning ? 
+      (prev.currentMode === 'cool' ? 'COOLING' : 
+       prev.currentMode === 'heat' ? 'HEATING' : 'OFF') : 'OFF';
 
     const payload = {
       userId,
@@ -566,9 +570,9 @@ async function handleNestEvent(eventData) {
       runtimeSeconds: 0,
       runtimeMinutes: 0,
       isRuntimeEvent: false,
-      hvacMode: hvacStatusEff,
-      isHvacActive: hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING',
-      thermostatMode: effectiveMode,
+      hvacMode: effectiveHvacMode,
+      isHvacActive: isCurrentlyRunning && (currentEquipmentStatus === 'cool' || currentEquipmentStatus === 'heat'),
+      thermostatMode: mode || prev.currentMode || 'OFF',
       isReachable,
 
       currentTempF: celsiusToFahrenheit(currentTemp),
@@ -586,7 +590,7 @@ async function handleNestEvent(eventData) {
       lastIsHeating,
       lastIsFanOnly,
       lastEquipmentStatus,
-      equipmentStatus: mapEquipmentStatus(hvacStatusEff, effectiveFanOnly),
+      equipmentStatus: currentEquipmentStatus,
 
       timestamp,
       eventId: eventData.eventId,
@@ -608,7 +612,8 @@ async function handleNestEvent(eventData) {
           hvacMode: payload.hvacMode,
           isHvacActive: payload.isHvacActive,
           currentTempF: payload.currentTempF,
-          isReachable: payload.isReachable
+          isReachable: payload.isReachable,
+          equipmentStatus: payload.equipmentStatus
         }));
       } catch (err) {
         console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
