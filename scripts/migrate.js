@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 
 const { Pool } = require('pg');
+const path = require('path');
+
+// Ensure we're using the correct path resolution
+process.chdir(path.dirname(__dirname));
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -89,6 +93,7 @@ async function createInitialSchema() {
         last_seen_at TIMESTAMPTZ DEFAULT NOW(),
         last_activity_at TIMESTAMPTZ DEFAULT NOW(),
         last_post_at TIMESTAMPTZ DEFAULT NOW(),
+        last_staleness_notification TIMESTAMPTZ,
         
         -- Metadata
         created_at TIMESTAMPTZ DEFAULT NOW(),
