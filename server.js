@@ -70,6 +70,31 @@ function extractRoomDisplayName(eventData) {
   return roomRelation?.displayName || null;
 }
 
+// Utility function to clean payload for Bubble
+function cleanPayloadForBubble(payload) {
+  const cleaned = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (value !== null && value !== undefined && value !== '') {
+      // Convert any remaining null/undefined to appropriate defaults
+      if (typeof value === 'number' && !isFinite(value)) {
+        continue; // Skip NaN or Infinity values
+      }
+      cleaned[key] = value;
+    } else if (key.includes('Temp') || key.includes('Setpoint')) {
+      // For temperature fields, use 0 instead of null
+      cleaned[key] = 0;
+    } else if (key === 'runtimeSeconds' || key === 'runtimeMinutes') {
+      // Runtime fields should be 0, not null
+      cleaned[key] = 0;
+    } else if (typeof payload[key] === 'boolean') {
+      // Keep boolean fields even if false
+      cleaned[key] = value || false;
+    }
+    // Skip other null/undefined values entirely
+  }
+  return cleaned;
+}
+
 // Database functions
 async function ensureDeviceExists(deviceKey) {
   if (!pool) return;
@@ -466,7 +491,7 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   const payload = {
     thermostatId: deviceId,
     deviceName: `Device ${deviceId}`,
-    roomDisplayName: deviceState.roomDisplayName || null,
+    roomDisplayName: deviceState.roomDisplayName || '',
     runtimeSeconds: 0,
     runtimeMinutes: 0,
     isRuntimeEvent: false,
@@ -475,25 +500,26 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
     thermostatMode: 'UNKNOWN',
     isReachable: false,
     
-    currentTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : null,
-    coolSetpointF: null,
-    heatSetpointF: null,
-    startTempF: null,
-    endTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : null,
-    currentTempC: deviceState.lastTemperature || null,
-    coolSetpointC: null,
-    heatSetpointC: null,
-    startTempC: null,
-    endTempC: deviceState.lastTemperature || null,
+    currentTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : 0,
+    coolSetpointF: 0,
+    heatSetpointF: 0,
+    startTempF: 0,
+    endTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : 0,
+    currentTempC: deviceState.lastTemperature || 0,
+    coolSetpointC: 0,
+    heatSetpointC: 0,
+    startTempC: 0,
+    endTempC: deviceState.lastTemperature || 0,
     
     lastIsCooling: false,
     lastIsHeating: false,
     lastIsFanOnly: false,
     lastEquipmentStatus: deviceState.lastEquipmentStatus || 'unknown',
     equipmentStatus: 'stale',
+    isFanOnly: false,
     
     hoursSinceLastActivity: hoursSinceLastActivity,
-    lastActivityTime: lastActivityTime > 0 ? new Date(lastActivityTime).toISOString() : null,
+    lastActivityTime: lastActivityTime > 0 ? new Date(lastActivityTime).toISOString() : '',
     stalenessReason: hoursSinceLastActivity >= 24 ? 'extended_offline' : 'device_offline',
     
     timestamp: new Date(currentTime).toISOString(),
@@ -503,7 +529,8 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   
   if (process.env.BUBBLE_WEBHOOK_URL) {
     try {
-      await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+      const cleanedPayload = cleanPayloadForBubble(payload);
+      await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
         timeout: 10000,
         headers: {
           'User-Agent': 'Nest-Runtime-Tracker/1.2',
@@ -592,6 +619,11 @@ async function handleNestEvent(eventData) {
 
   const hvacStatusEff = hvacStatusRaw ?? prev.currentMode ?? 'OFF';
 
+  // Use fallback values for undefined temperatures and setpoints
+  const effectiveCurrentTemp = currentTemp ?? prev.lastTemperature ?? 20; // Default to 20°C if no temp available
+  const effectiveCoolSetpoint = coolSetpoint ?? prev.lastCoolSetpoint ?? 22; // Default cool setpoint
+  const effectiveHeatSetpoint = heatSetpoint ?? prev.lastHeatSetpoint ?? 18; // Default heat setpoint
+
   // Temperature-only event
   const isTemperatureOnlyEvent = !hvacStatusRaw && currentTemp != null;
 
@@ -611,7 +643,7 @@ async function handleNestEvent(eventData) {
       userId,
       thermostatId: deviceId,
       deviceName: deviceName,
-      roomDisplayName: roomDisplayName,
+      roomDisplayName: roomDisplayName || '',
       runtimeSeconds: 0,
       runtimeMinutes: 0,
       isRuntimeEvent: false,
@@ -620,22 +652,23 @@ async function handleNestEvent(eventData) {
       thermostatMode: mode || prev.currentMode || 'OFF',
       isReachable,
 
-      currentTempF: celsiusToFahrenheit(currentTemp),
-      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
-      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
-      startTempF: null,
-      endTempF: celsiusToFahrenheit(currentTemp),
-      currentTempC: currentTemp ?? null,
-      coolSetpointC: coolSetpoint ?? null,
-      heatSetpointC: heatSetpoint ?? null,
-      startTempC: null,
-      endTempC: currentTemp ?? null,
+      currentTempF: celsiusToFahrenheit(effectiveCurrentTemp),
+      coolSetpointF: celsiusToFahrenheit(effectiveCoolSetpoint),
+      heatSetpointF: celsiusToFahrenheit(effectiveHeatSetpoint),
+      startTempF: 0,
+      endTempF: celsiusToFahrenheit(effectiveCurrentTemp),
+      currentTempC: effectiveCurrentTemp,
+      coolSetpointC: effectiveCoolSetpoint,
+      heatSetpointC: effectiveHeatSetpoint,
+      startTempC: 0,
+      endTempC: effectiveCurrentTemp,
 
       lastIsCooling,
       lastIsHeating,
       lastIsFanOnly,
       lastEquipmentStatus,
       equipmentStatus: currentEquipmentStatus,
+      isFanOnly: false,
 
       timestamp,
       eventId: eventData.eventId,
@@ -644,7 +677,11 @@ async function handleNestEvent(eventData) {
 
     if (process.env.BUBBLE_WEBHOOK_URL) {
       try {
-        await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+        const cleanedPayload = cleanPayloadForBubble(payload);
+        console.log('DEBUG - Sending temperature update payload to Bubble:');
+        console.log(JSON.stringify(cleanedPayload, null, 2));
+        
+        await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
           timeout: 10000,
           headers: {
             'User-Agent': 'Nest-Runtime-Tracker/1.2',
@@ -663,6 +700,9 @@ async function handleNestEvent(eventData) {
         }));
       } catch (err) {
         console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
+        if (err.response?.data) {
+          console.error('Bubble error response:', err.response.data);
+        }
       }
     }
 
@@ -689,7 +729,7 @@ async function handleNestEvent(eventData) {
       userId,
       thermostatId: deviceId,
       deviceName: deviceName,
-      roomDisplayName: roomDisplayName,
+      roomDisplayName: roomDisplayName || '',
       runtimeSeconds: 0,
       runtimeMinutes: 0,
       isRuntimeEvent: false,
@@ -698,22 +738,23 @@ async function handleNestEvent(eventData) {
       thermostatMode: prev.currentMode || mode || 'OFF',
       isReachable,
 
-      currentTempF: celsiusToFahrenheit(prev.lastTemperature),
-      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
-      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
-      startTempF: null,
-      endTempF: celsiusToFahrenheit(prev.lastTemperature),
-      currentTempC: prev.lastTemperature ?? null,
-      coolSetpointC: coolSetpoint ?? null,
-      heatSetpointC: heatSetpoint ?? null,
-      startTempC: null,
-      endTempC: prev.lastTemperature ?? null,
+      currentTempF: celsiusToFahrenheit(prev.lastTemperature) || 0,
+      coolSetpointF: celsiusToFahrenheit(effectiveCoolSetpoint),
+      heatSetpointF: celsiusToFahrenheit(effectiveHeatSetpoint),
+      startTempF: 0,
+      endTempF: celsiusToFahrenheit(prev.lastTemperature) || 0,
+      currentTempC: prev.lastTemperature || 0,
+      coolSetpointC: effectiveCoolSetpoint,
+      heatSetpointC: effectiveHeatSetpoint,
+      startTempC: 0,
+      endTempC: prev.lastTemperature || 0,
 
       lastIsCooling,
       lastIsHeating,
       lastIsFanOnly,
       lastEquipmentStatus,
       equipmentStatus: prev.lastEquipmentStatus || mapEquipmentStatus(hvacStatusEff, prev.lastEquipmentStatus === 'fan'),
+      isFanOnly: false,
 
       timestamp,
       eventId: eventData.eventId,
@@ -722,7 +763,11 @@ async function handleNestEvent(eventData) {
 
     if (process.env.BUBBLE_WEBHOOK_URL) {
       try {
-        await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+        const cleanedPayload = cleanPayloadForBubble(payload);
+        console.log('DEBUG - Sending connectivity update payload to Bubble:');
+        console.log(JSON.stringify(cleanedPayload, null, 2));
+        
+        await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
           timeout: 10000,
           headers: {
             'User-Agent': 'Nest-Runtime-Tracker/1.2',
@@ -735,6 +780,9 @@ async function handleNestEvent(eventData) {
         }));
       } catch (err) {
         console.error('Failed to send connectivity update to Bubble:', err.response?.status || err.code || err.message);
+        if (err.response?.data) {
+          console.error('Bubble error response:', err.response.data);
+        }
       }
     }
 
@@ -779,25 +827,25 @@ async function handleNestEvent(eventData) {
       userId,
       thermostatId: deviceId,
       deviceName: deviceName,
-      roomDisplayName: roomDisplayName,
+      roomDisplayName: roomDisplayName || '',
       runtimeSeconds,
       runtimeMinutes: Math.round(runtimeSeconds / 60),
       isRuntimeEvent,
       hvacMode: hvacStatusEff,
       isHvacActive: isActive,
-      thermostatMode: mode,
+      thermostatMode: mode || 'OFF',
       isReachable,
 
-      currentTempF: celsiusToFahrenheit(currentTemp),
-      coolSetpointF: celsiusToFahrenheit(coolSetpoint),
-      heatSetpointF: celsiusToFahrenheit(heatSetpoint),
-      startTempF: sessionData?.startTemperature ? celsiusToFahrenheit(sessionData.startTemperature) : null,
-      endTempF: celsiusToFahrenheit(currentTemp),
-      currentTempC: currentTemp ?? null,
-      coolSetpointC: coolSetpoint ?? null,
-      heatSetpointC: heatSetpoint ?? null,
-      startTempC: sessionData?.startTemperature ?? null,
-      endTempC: currentTemp ?? null,
+      currentTempF: celsiusToFahrenheit(effectiveCurrentTemp),
+      coolSetpointF: celsiusToFahrenheit(effectiveCoolSetpoint),
+      heatSetpointF: celsiusToFahrenheit(effectiveHeatSetpoint),
+      startTempF: sessionData?.startTemperature ? celsiusToFahrenheit(sessionData.startTemperature) : 0,
+      endTempF: celsiusToFahrenheit(effectiveCurrentTemp),
+      currentTempC: effectiveCurrentTemp,
+      coolSetpointC: effectiveCoolSetpoint,
+      heatSetpointC: effectiveHeatSetpoint,
+      startTempC: sessionData?.startTemperature || 0,
+      endTempC: effectiveCurrentTemp,
 
       lastIsCooling,
       lastIsHeating,
@@ -845,7 +893,7 @@ async function handleNestEvent(eventData) {
     const sessionData = {
       startTime: eventTime,
       startStatus: equipmentStatus,
-      startTemperature: currentTemp
+      startTemperature: effectiveCurrentTemp
     };
     sessions[key] = sessionData;
     sessionChanged = true;
@@ -862,7 +910,7 @@ async function handleNestEvent(eventData) {
       session = {
         startTime: prev.sessionStartedAt,
         startStatus: prev.currentMode || 'unknown',
-        startTemperature: prev.lastTemperature
+        startTemperature: prev.lastTemperature || effectiveCurrentTemp
       };
       console.log('Using database session data for runtime calculation');
     }
@@ -881,9 +929,9 @@ async function handleNestEvent(eventData) {
           endedAt: eventTime,
           durationSeconds: runtimeSeconds,
           startTemperature: session.startTemperature,
-          endTemperature: currentTemp,
-          heatSetpoint: heatSetpoint,
-          coolSetpoint: coolSetpoint
+          endTemperature: effectiveCurrentTemp,
+          heatSetpoint: effectiveHeatSetpoint,
+          coolSetpoint: effectiveCoolSetpoint
         });
 
         payload = createBubblePayload(runtimeSeconds, true, session);
@@ -907,7 +955,7 @@ async function handleNestEvent(eventData) {
     const sessionData = {
       startTime: eventTime,
       startStatus: equipmentStatus,
-      startTemperature: currentTemp
+      startTemperature: effectiveCurrentTemp
     };
     sessions[key] = sessionData;
     sessionChanged = true;
@@ -935,8 +983,8 @@ async function handleNestEvent(eventData) {
   } else {
     // No state change
     payload = createBubblePayload(0, false);
-    if (currentTemp && !IS_PRODUCTION) {
-      console.log(`🌡️  Temperature update: ${currentTemp}°C (${celsiusToFahrenheit(currentTemp)}°F)`);
+    if (effectiveCurrentTemp && !IS_PRODUCTION) {
+      console.log(`🌡️  Temperature update: ${effectiveCurrentTemp}°C (${celsiusToFahrenheit(effectiveCurrentTemp)}°F)`);
     }
   }
 
@@ -960,8 +1008,11 @@ async function handleNestEvent(eventData) {
 
   if (process.env.BUBBLE_WEBHOOK_URL) {
     try {
-      console.log('DEBUG - Sending to Bubble…');
-      await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+      const cleanedPayload = cleanPayloadForBubble(payload);
+      console.log('DEBUG - Sending full HVAC payload to Bubble:');
+      console.log(JSON.stringify(cleanedPayload, null, 2));
+      
+      await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
         timeout: 10000,
         headers: {
           'User-Agent': 'Nest-Runtime-Tracker/1.2',
@@ -981,10 +1032,14 @@ async function handleNestEvent(eventData) {
       console.log('Sent to Bubble:', logData);
     } catch (err) {
       console.error('Failed to send to Bubble:', err.response?.status || err.code || err.message);
+      if (err.response?.data) {
+        console.error('Bubble error response:', err.response.data);
+      }
       const retryDelay = 5000;
       setTimeout(async () => {
         try {
-          await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+          const cleanedPayload = cleanPayloadForBubble(payload);
+          await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
             timeout: 10000,
             headers: {
               'User-Agent': 'Nest-Runtime-Tracker/1.2',
