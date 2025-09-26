@@ -49,53 +49,107 @@ const deviceStates = {};
 // Environment check
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// Enhanced monitoring and cleanup system
+// Monitoring, cleanup, runtime handling
 const STALENESS_CHECK_INTERVAL = 60 * 60 * 1000;
 const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 12) * 60 * 60 * 1000;
 const CLEANUP_INTERVAL = 6 * 60 * 60 * 1000;
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
-// Utility function to extract room display name
+// NEW: Post-run fan tail ms (default 2 min)
+const POST_RUN_TAIL_MS = parseInt(process.env.POST_RUN_TAIL_MS || '120000'); 
+
+/* ─────────────────────────── Utilities ─────────────────────────── */
+
+function nowMs() { return Date.now(); }
+
+function toTimestamp(dateStr) {
+  return new Date(dateStr).getTime();
+}
+
+function celsiusToFahrenheit(celsius) {
+  if (celsius == null || !Number.isFinite(celsius)) return null;
+  return Math.round((celsius * 9) / 5 + 32);
+}
+
 function extractRoomDisplayName(eventData) {
   const parentRelations = eventData.resourceUpdate?.parentRelations;
-  if (!parentRelations || !Array.isArray(parentRelations)) {
-    return null;
-  }
-  
-  // Find the room relation (typically contains '/rooms/' in the parent path)
+  if (!parentRelations || !Array.isArray(parentRelations)) return null;
   const roomRelation = parentRelations.find(relation => 
     relation.parent && relation.parent.includes('/rooms/')
   );
-  
   return roomRelation?.displayName || null;
 }
 
-// Utility function to clean payload for Bubble
+function sanitizeForLogging(data) {
+  if (!data) return data;
+  const sanitized = { ...data };
+  if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + '…';
+  if (sanitized.deviceName) {
+    const tail = sanitized.deviceName.split('/').pop() || '';
+    sanitized.deviceName = 'device-' + tail.substring(0, 8) + '…';
+  }
+  if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + '…';
+  return sanitized;
+}
+
 function cleanPayloadForBubble(payload) {
   const cleaned = {};
   for (const [key, value] of Object.entries(payload)) {
     if (value !== null && value !== undefined && value !== '') {
-      // Convert any remaining null/undefined to appropriate defaults
-      if (typeof value === 'number' && !isFinite(value)) {
-        continue; // Skip NaN or Infinity values
-      }
+      if (typeof value === 'number' && !isFinite(value)) continue;
       cleaned[key] = value;
     } else if (key.includes('Temp') || key.includes('Setpoint')) {
-      // For temperature fields, use 0 instead of null
       cleaned[key] = 0;
     } else if (key === 'runtimeSeconds' || key === 'runtimeMinutes') {
-      // Runtime fields should be 0, not null
       cleaned[key] = 0;
     } else if (typeof payload[key] === 'boolean') {
-      // Keep boolean fields even if false
-      cleaned[key] = value || false;
+      cleaned[key] = Boolean(value);
     }
-    // Skip other null/undefined values entirely
   }
   return cleaned;
 }
 
-// Database functions
+function requireAuth(req, res, next) {
+  const authToken = req.headers.authorization?.replace('Bearer ', '');
+  const expectedToken = process.env.ADMIN_API_KEY;
+  if (!expectedToken) return res.status(500).json({ error: 'Admin API key not configured' });
+  if (!authToken || authToken !== expectedToken) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+// Tail helper: is current time within stored fan tail
+function withinFanTail(prev, eventTimeMs) {
+  const until = prev?.lastFanTailUntil || 0;
+  const t = eventTimeMs || nowMs();
+  return until > 0 && t <= until;
+}
+
+// Map hvac/fan flags incl. synthetic tail
+function deriveCurrentFlags(hvacStatus, fanTimerOn, prev, eventTimeMs) {
+  const isHeating = hvacStatus === 'HEATING';
+  const isCooling = hvacStatus === 'COOLING';
+
+  let isFanOnly = Boolean(fanTimerOn) && !isHeating && !isCooling;
+
+  // If neither heating nor cooling and fan trait absent/off, honor synthetic tail
+  if (!isHeating && !isCooling && !isFanOnly && withinFanTail(prev, eventTimeMs)) {
+    isFanOnly = true;
+  }
+
+  const isActive = Boolean(isHeating || isCooling || isFanOnly);
+
+  let equipmentStatus = 'off';
+  if (isHeating && isFanOnly) equipmentStatus = 'heat+fan';
+  else if (isCooling && isFanOnly) equipmentStatus = 'cool+fan';
+  else if (isHeating) equipmentStatus = 'heat';
+  else if (isCooling) equipmentStatus = 'cool';
+  else if (isFanOnly) equipmentStatus = 'fan';
+
+  return { isHeating, isCooling, isFanOnly, isActive, equipmentStatus };
+}
+
+/* ─────────────────────────── Database ─────────────────────────── */
+
 async function ensureDeviceExists(deviceKey) {
   if (!pool) return;
   try {
@@ -109,33 +163,28 @@ async function ensureDeviceExists(deviceKey) {
 }
 
 async function getDeviceState(deviceKey) {
-  if (!pool) {
-    return deviceStates[deviceKey] || null;
-  }
-  
+  if (!pool) return deviceStates[deviceKey] || null;
+
   try {
     const result = await pool.query(
       `SELECT * FROM device_states WHERE device_key = $1`,
       [deviceKey]
     );
-    
-    if (result.rows.length === 0) {
-      return null;
-    }
-    
+    if (result.rows.length === 0) return null;
     const row = result.rows[0];
     return {
       isRunning: row.is_running || false,
       sessionStartedAt: row.session_started_at ? new Date(row.session_started_at).getTime() : null,
       currentMode: row.current_mode || 'idle',
-      lastTemperature: row.last_temperature ? Number(row.last_temperature) : null,
-      lastHeatSetpoint: row.last_heat_setpoint ? Number(row.last_heat_setpoint) : null,
-      lastCoolSetpoint: row.last_cool_setpoint ? Number(row.last_cool_setpoint) : null,
+      lastTemperature: row.last_temperature != null ? Number(row.last_temperature) : null,
+      lastHeatSetpoint: row.last_heat_setpoint != null ? Number(row.last_heat_setpoint) : null,
+      lastCoolSetpoint: row.last_cool_setpoint != null ? Number(row.last_cool_setpoint) : null,
       lastEquipmentStatus: row.last_equipment_status,
       isReachable: row.is_reachable !== false,
       lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).getTime() : Date.now(),
       lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).getTime() : Date.now(),
-      roomDisplayName: row.room_display_name
+      roomDisplayName: row.room_display_name,
+      lastFanTailUntil: row.last_fan_tail_until ? new Date(row.last_fan_tail_until).getTime() : 0,
     };
   } catch (error) {
     console.error('Failed to get device state:', error.message);
@@ -145,9 +194,8 @@ async function getDeviceState(deviceKey) {
 
 async function updateDeviceState(deviceKey, state) {
   deviceStates[deviceKey] = state;
-  
   if (!pool) return;
-  
+
   try {
     await ensureDeviceExists(deviceKey);
     await pool.query(
@@ -164,12 +212,13 @@ async function updateDeviceState(deviceKey, state) {
         last_seen_at = $10,
         last_activity_at = $11,
         room_display_name = $12,
+        last_fan_tail_until = $13,
         updated_at = NOW()
       WHERE device_key = $1
       `,
       [
         deviceKey,
-        !!state.isRunning,
+        Boolean(state.isRunning),
         state.sessionStartedAt ? new Date(state.sessionStartedAt) : null,
         state.currentMode || 'idle',
         state.lastTemperature,
@@ -179,7 +228,8 @@ async function updateDeviceState(deviceKey, state) {
         state.isReachable !== false,
         state.lastSeenAt ? new Date(state.lastSeenAt) : new Date(),
         state.lastActivityAt ? new Date(state.lastActivityAt) : new Date(),
-        state.roomDisplayName
+        state.roomDisplayName,
+        state.lastFanTailUntil ? new Date(state.lastFanTailUntil) : null,
       ]
     );
   } catch (error) {
@@ -189,7 +239,6 @@ async function updateDeviceState(deviceKey, state) {
 
 async function logRuntimeSession(deviceKey, sessionData) {
   if (!pool) return null;
-  
   try {
     await ensureDeviceExists(deviceKey);
     const result = await pool.query(
@@ -222,7 +271,6 @@ async function logRuntimeSession(deviceKey, sessionData) {
 
 async function logTemperatureReading(deviceKey, temperature, units = 'F', eventType = 'reading') {
   if (!pool) return;
-  
   try {
     await ensureDeviceExists(deviceKey);
     await pool.query(
@@ -236,7 +284,6 @@ async function logTemperatureReading(deviceKey, temperature, units = 'F', eventT
 
 async function logEquipmentEvent(deviceKey, eventType, equipmentStatus, previousStatus, isActive, eventData = {}) {
   if (!pool) return;
-  
   try {
     await ensureDeviceExists(deviceKey);
     await pool.query(
@@ -245,85 +292,15 @@ async function logEquipmentEvent(deviceKey, eventType, equipmentStatus, previous
         (device_key, event_type, equipment_status, previous_status, is_active, event_data)
       VALUES ($1, $2, $3, $4, $5, $6)
       `,
-      [deviceKey, eventType, equipmentStatus, previousStatus, !!isActive, JSON.stringify(eventData)]
+      [deviceKey, eventType, equipmentStatus, previousStatus, Boolean(isActive), JSON.stringify(eventData)]
     );
   } catch (error) {
     console.error('Failed to log equipment event:', error.message);
   }
 }
 
-function toTimestamp(dateStr) {
-  return new Date(dateStr).getTime();
-}
+/* ─────────────────────── Migration / Schema ─────────────────────── */
 
-function celsiusToFahrenheit(celsius) {
-  if (celsius == null || !Number.isFinite(celsius)) return null;
-  return Math.round((celsius * 9) / 5 + 32);
-}
-
-function mapEquipmentStatus(hvacStatus, isFanOnly) {
-  if (hvacStatus === 'HEATING') return 'heat';
-  if (hvacStatus === 'COOLING') return 'cool';
-  if (isFanOnly) return 'fan';
-  if (hvacStatus === 'OFF' || !hvacStatus) return 'off';
-  return 'unknown';
-}
-
-// Updated function to determine if the system is actively running (fan moving air)
-function deriveCurrentFlags(hvacStatus, fanTimerOn) {
-  const isHeating = hvacStatus === 'HEATING';
-  const isCooling = hvacStatus === 'COOLING';
-  const isFanOnly = !!fanTimerOn && !isHeating && !isCooling;
-  
-  // Key change: Any of these conditions means the fan is running and we count runtime
-  const isActive = isHeating || isCooling || isFanOnly;
-  
-  let equipmentStatus;
-  if (isHeating && isFanOnly) {
-    equipmentStatus = 'heat+fan';  // Heating with fan explicitly on
-  } else if (isCooling && isFanOnly) {
-    equipmentStatus = 'cool+fan';  // Cooling with fan explicitly on
-  } else if (isHeating) {
-    equipmentStatus = 'heat';      // Heating (fan implied)
-  } else if (isCooling) {
-    equipmentStatus = 'cool';      // Cooling (fan implied)
-  } else if (isFanOnly) {
-    equipmentStatus = 'fan';       // Fan only
-  } else {
-    equipmentStatus = 'off';       // Everything off
-  }
-  
-  return { isHeating, isCooling, isFanOnly, isActive, equipmentStatus };
-}
-
-function sanitizeForLogging(data) {
-  if (!data) return data;
-  const sanitized = { ...data };
-  if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + '…';
-  if (sanitized.deviceName) {
-    const tail = sanitized.deviceName.split('/').pop() || '';
-    sanitized.deviceName = 'device-' + tail.substring(0, 8) + '…';
-  }
-  if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + '…';
-  return sanitized;
-}
-
-function requireAuth(req, res, next) {
-  const authToken = req.headers.authorization?.replace('Bearer ', '');
-  const expectedToken = process.env.ADMIN_API_KEY;
-  
-  if (!expectedToken) {
-    return res.status(500).json({ error: 'Admin API key not configured' });
-  }
-  
-  if (!authToken || authToken !== expectedToken) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  next();
-}
-
-// Database migration with proper field sizes
 async function runDatabaseMigration() {
   if (!ENABLE_DATABASE || !pool) {
     console.log('Database disabled - skipping migration');
@@ -338,36 +315,38 @@ async function runDatabaseMigration() {
       FROM information_schema.tables 
       WHERE table_name = 'device_states' AND table_schema = 'public'
     `);
-    
+
     if (parseInt(schemaExists.rows[0].count) > 0) {
-      // Check if room_display_name column exists
-      const columnExists = await pool.query(`
-        SELECT COUNT(*) as count
-        FROM information_schema.columns
-        WHERE table_name = 'device_states' 
-          AND column_name = 'room_display_name'
-          AND table_schema = 'public'
-      `);
-      
-      if (parseInt(columnExists.rows[0].count) === 0) {
-        console.log('Adding room_display_name column to existing schema...');
-        await pool.query(`
-          ALTER TABLE device_states 
-          ADD COLUMN room_display_name VARCHAR(200)
-        `);
-        console.log('Added room_display_name column');
-      } else {
-        console.log('Database schema already exists - skipping migration');
-      }
+      // Add columns if missing
+      const addColIfMissing = async (table, column, type) => {
+        const r = await pool.query(`
+          SELECT COUNT(*) as count
+          FROM information_schema.columns
+          WHERE table_name = $1 AND column_name = $2 AND table_schema = 'public'
+        `, [table, column]);
+        if (parseInt(r.rows[0].count) === 0) {
+          console.log(`Adding ${column} to ${table}...`);
+          await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+          console.log(`Added ${column}`);
+        }
+      };
+
+      await addColIfMissing('device_states', 'room_display_name', 'VARCHAR(200)');
+      await addColIfMissing('device_states', 'last_fan_tail_until', 'TIMESTAMPTZ');
+
+      console.log('Database schema already exists - ensured new columns');
       return;
     }
 
+    // Fresh create
     console.log('Creating database schema with proper field sizes...');
-    console.log('- device_key: VARCHAR(300) for long Nest device IDs');
-    console.log('- device_name: VARCHAR(600) for full device paths');
-    console.log('- room_display_name: VARCHAR(200) for room names');
+    console.log('- device_key: VARCHAR(300)');
+    console.log('- device_name: VARCHAR(600)');
+    console.log('- room_display_name: VARCHAR(200)');
     
     const migrationSQL = `
+      CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
       CREATE TABLE IF NOT EXISTS device_states (
           device_key VARCHAR(300) PRIMARY KEY,
           frontend_id VARCHAR(300),
@@ -388,6 +367,8 @@ async function runDatabaseMigration() {
           last_cool_setpoint DECIMAL(5,2),
           last_fan_status VARCHAR(10),
           last_equipment_status VARCHAR(50),
+
+          last_fan_tail_until TIMESTAMPTZ,
           
           last_mode VARCHAR(20),
           last_was_cooling BOOLEAN DEFAULT FALSE,
@@ -483,23 +464,13 @@ async function runDatabaseMigration() {
 
     await pool.query(migrationSQL);
     console.log('Database schema created successfully');
-    
-    const checkSchema = await pool.query(`
-      SELECT column_name, character_maximum_length 
-      FROM information_schema.columns 
-      WHERE table_name = 'device_states' 
-        AND column_name IN ('device_key', 'device_name', 'room_display_name')
-    `);
-    
-    for (const row of checkSchema.rows) {
-      console.log(`Verified: ${row.column_name} = VARCHAR(${row.character_maximum_length})`);
-    }
-    
   } catch (error) {
     console.error('Database migration failed:', error.message);
     console.warn('Continuing with memory-only operation...');
   }
 }
+
+/* ─────────────────────── Notifications ─────────────────────── */
 
 async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   const deviceId = deviceKey.split('-').pop();
@@ -571,6 +542,8 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   }
 }
 
+/* ─────────────────────── Event Handling ─────────────────────── */
+
 async function handleNestEvent(eventData) {
   console.log('DEBUG: Starting event processing');
   if (!IS_PRODUCTION) console.log('Processing Nest event…');
@@ -580,7 +553,6 @@ async function handleNestEvent(eventData) {
   const traits = eventData.resourceUpdate?.traits;
   const timestamp = eventData.timestamp;
 
-  // Extract room display name
   const roomDisplayName = extractRoomDisplayName(eventData);
 
   console.log('DEBUG - Basic field extraction:');
@@ -598,12 +570,10 @@ async function handleNestEvent(eventData) {
   const heatSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius;
   const mode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
 
-  // Fan trait - Enhanced fan detection
+  // Fan trait
+  const hasFanTrait = Object.prototype.hasOwnProperty.call(traits || {}, 'sdm.devices.traits.Fan');
   const fanTimerMode = traits?.['sdm.devices.traits.Fan']?.timerMode;
   const fanTimerOn = fanTimerMode === 'ON';
-  
-  // Note: Some Nest devices might have additional fan status indicators
-  // If available, we could also check for fan status in other traits
 
   // Connectivity trait
   const connectivityStatus = traits?.['sdm.devices.traits.Connectivity']?.status;
@@ -623,7 +593,7 @@ async function handleNestEvent(eventData) {
   console.log(`- coolSetpoint: ${coolSetpoint}`);
   console.log(`- heatSetpoint: ${heatSetpoint}`);
   console.log(`- mode: ${mode}`);
-  console.log(`- fanTimerMode: ${fanTimerMode} (fanTimerOn: ${fanTimerOn})`);
+  console.log(`- hasFanTrait: ${hasFanTrait}, fanTimerMode: ${fanTimerMode} (fanTimerOn: ${fanTimerOn})`);
   console.log(`- connectivityStatus: ${connectivityStatus} -> isReachable=${isReachable}`);
 
   // Basic validation
@@ -639,24 +609,20 @@ async function handleNestEvent(eventData) {
   const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes('fan');
   const lastEquipmentStatus = prev.lastEquipmentStatus || 'unknown';
 
-  // Fix the hvacStatusEff calculation to properly map stored modes to HVAC status
+  // Resolve hvac status effective
   let hvacStatusEff;
   if (hvacStatusRaw) {
-    hvacStatusEff = hvacStatusRaw; // Use the actual status from the event
+    hvacStatusEff = hvacStatusRaw;
   } else if (prev.currentMode) {
-    // Convert stored equipment mode to HVAC status
     switch (prev.currentMode) {
       case 'cool':
       case 'cool+fan':
-        hvacStatusEff = 'COOLING';
-        break;
+        hvacStatusEff = 'COOLING'; break;
       case 'heat':
       case 'heat+fan':
-        hvacStatusEff = 'HEATING';
-        break;
+        hvacStatusEff = 'HEATING'; break;
       case 'fan':
-        hvacStatusEff = 'OFF'; // Fan only doesn't have a specific HVAC status
-        break;
+        hvacStatusEff = 'OFF'; break;
       default:
         hvacStatusEff = 'OFF';
     }
@@ -666,43 +632,41 @@ async function handleNestEvent(eventData) {
 
   console.log(`DEBUG - HVAC Status Resolution: hvacStatusRaw="${hvacStatusRaw}", prev.currentMode="${prev.currentMode}", hvacStatusEff="${hvacStatusEff}"`);
 
-  // Use fallback values for undefined temperatures and setpoints
+  // Effective temps/setpoints
   const effectiveCurrentTemp = currentTemp ?? prev.lastTemperature ?? 20;
   const effectiveCoolSetpoint = coolSetpoint ?? prev.lastCoolSetpoint ?? 22;
   const effectiveHeatSetpoint = heatSetpoint ?? prev.lastHeatSetpoint ?? 18;
 
-  // Temperature-only event
+  // Classification
   const isTemperatureOnlyEvent = !hvacStatusRaw && currentTemp != null;
-
-  // Connectivity-only event
   const isConnectivityOnly = !!connectivityStatus && !hvacStatusRaw && currentTemp == null;
 
   console.log(`DEBUG - Event Classification: isTemperatureOnlyEvent=${isTemperatureOnlyEvent}, isConnectivityOnly=${isConnectivityOnly}`);
 
+  /* ───────────── Temperature-only event ───────────── */
   if (isTemperatureOnlyEvent) {
     console.log('Temperature-only event detected');
 
     await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
-    // Use current running state, not just previous mode
-    const isCurrentlyRunning = sessions[key] || prev.isRunning;
-    const currentEquipmentStatus = isCurrentlyRunning ? (prev.currentMode || 'unknown') : 'off';
-    
-    // Fix the HVAC mode mapping - handle both the stored mode and convert to proper HVAC status
+    const isCurrentlyRunning = Boolean(sessions[key]) || Boolean(prev.isRunning) || withinFanTail(prev, eventTime);
+
     let effectiveHvacMode = 'OFF';
     if (isCurrentlyRunning) {
-      if (prev.currentMode === 'cool' || prev.currentMode === 'cool+fan') {
+      if (withinFanTail(prev, eventTime)) {
+        effectiveHvacMode = 'FAN_ONLY';
+      } else if (prev.currentMode === 'cool' || prev.currentMode === 'cool+fan') {
         effectiveHvacMode = 'COOLING';
       } else if (prev.currentMode === 'heat' || prev.currentMode === 'heat+fan') {
         effectiveHvacMode = 'HEATING';
       } else if (prev.currentMode === 'fan') {
         effectiveHvacMode = 'FAN_ONLY';
-      } else {
-        effectiveHvacMode = 'OFF';
       }
     }
 
-    console.log(`Temperature event - isCurrentlyRunning: ${isCurrentlyRunning}, currentEquipmentStatus: ${currentEquipmentStatus}, effectiveHvacMode: ${effectiveHvacMode}`);
+    const currentEquipmentStatus = isCurrentlyRunning
+      ? (withinFanTail(prev, eventTime) ? 'fan' : (prev.currentMode || 'unknown'))
+      : 'off';
 
     const payload = {
       userId,
@@ -713,7 +677,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: 0,
       isRuntimeEvent: false,
       hvacMode: effectiveHvacMode,
-      isHvacActive: isCurrentlyRunning, // Any fan activity counts as active
+      isHvacActive: Boolean(isCurrentlyRunning),
       thermostatMode: mode || prev.currentMode || 'OFF',
       isReachable,
 
@@ -733,7 +697,7 @@ async function handleNestEvent(eventData) {
       lastIsFanOnly,
       lastEquipmentStatus,
       equipmentStatus: currentEquipmentStatus,
-      isFanOnly: currentEquipmentStatus === 'fan',
+      isFanOnly: Boolean(currentEquipmentStatus === 'fan'),
 
       timestamp,
       eventId: eventData.eventId,
@@ -765,9 +729,7 @@ async function handleNestEvent(eventData) {
         }));
       } catch (err) {
         console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
-        if (err.response?.data) {
-          console.error('Bubble error response:', err.response.data);
-        }
+        if (err.response?.data) console.error('Bubble error response:', err.response.data);
       }
     }
 
@@ -777,13 +739,15 @@ async function handleNestEvent(eventData) {
       lastSeenAt: eventTime,
       lastActivityAt: eventTime,
       isReachable,
-      roomDisplayName: roomDisplayName || prev.roomDisplayName
+      roomDisplayName: roomDisplayName || prev.roomDisplayName,
+      lastFanTailUntil: prev.lastFanTailUntil && prev.lastFanTailUntil > eventTime ? prev.lastFanTailUntil : 0,
     });
 
     console.log('DEBUG: Temperature-only event processing complete');
     return;
   }
 
+  /* ───────────── Connectivity-only event ───────────── */
   if (isConnectivityOnly) {
     console.log('Connectivity-only event detected');
 
@@ -796,7 +760,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: 0,
       isRuntimeEvent: false,
       hvacMode: hvacStatusEff,
-      isHvacActive: hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING' || prev.currentMode === 'fan',
+      isHvacActive: Boolean(hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING' || prev.currentMode === 'fan' || withinFanTail(prev, eventTime)),
       thermostatMode: prev.currentMode || mode || 'OFF',
       isReachable,
 
@@ -816,7 +780,7 @@ async function handleNestEvent(eventData) {
       lastIsFanOnly,
       lastEquipmentStatus,
       equipmentStatus: prev.lastEquipmentStatus || 'off',
-      isFanOnly: prev.lastEquipmentStatus === 'fan',
+      isFanOnly: Boolean(prev.lastEquipmentStatus === 'fan' || withinFanTail(prev, eventTime)),
 
       timestamp,
       eventId: eventData.eventId,
@@ -842,9 +806,7 @@ async function handleNestEvent(eventData) {
         }));
       } catch (err) {
         console.error('Failed to send connectivity update to Bubble:', err.response?.status || err.code || err.message);
-        if (err.response?.data) {
-          console.error('Bubble error response:', err.response.data);
-        }
+        if (err.response?.data) console.error('Bubble error response:', err.response.data);
       }
     }
 
@@ -853,7 +815,8 @@ async function handleNestEvent(eventData) {
       isReachable,
       lastSeenAt: eventTime,
       lastActivityAt: eventTime,
-      roomDisplayName: roomDisplayName || prev.roomDisplayName
+      roomDisplayName: roomDisplayName || prev.roomDisplayName,
+      lastFanTailUntil: prev.lastFanTailUntil && prev.lastFanTailUntil > eventTime ? prev.lastFanTailUntil : 0,
     });
 
     console.log('DEBUG: Connectivity-only event processing complete');
@@ -862,10 +825,11 @@ async function handleNestEvent(eventData) {
 
   console.log('DEBUG: Validation passed, proceeding with full HVAC event processing');
 
-  // Derive current flags - UPDATED TO INCLUDE FAN-ONLY RUNTIME
-  const { isHeating, isCooling, isFanOnly, isActive, equipmentStatus } = deriveCurrentFlags(hvacStatusEff, fanTimerOn);
+  // Flags (tail-aware)
+  const { isHeating, isCooling, isFanOnly, isActive, equipmentStatus } =
+    deriveCurrentFlags(hvacStatusEff, fanTimerOn, prev, eventTime);
 
-  const wasActive = !!prev.isRunning;
+  const wasActive = Boolean(prev.isRunning);
 
   console.log(`DEBUG - State Analysis: isActive=${isActive} (heating:${isHeating}, cooling:${isCooling}, fanOnly:${isFanOnly}), wasActive=${wasActive}, equipmentStatus="${equipmentStatus}", prev.isRunning=${prev.isRunning}`);
   console.log(`DEBUG - Session Check: sessions[key]=${!!sessions[key]}, sessionStartTime=${sessions[key]?.startTime}`);
@@ -877,16 +841,24 @@ async function handleNestEvent(eventData) {
       'EquipmentStateChanged',
       equipmentStatus,
       prev.lastEquipmentStatus,
-      isActive,
+      Boolean(isActive),
       {
         temperature: currentTemp,
-        fanTimerOn: fanTimerOn,
-        isHeating: isHeating,
-        isCooling: isCooling,
-        isFanOnly: isFanOnly,
+        fanTimerOn: Boolean(fanTimerOn),
+        isHeating: Boolean(isHeating),
+        isCooling: Boolean(isCooling),
+        isFanOnly: Boolean(isFanOnly),
         timestamp: eventTime
       }
     );
+  }
+
+  // If we just went to OFF and previously were heating/cooling, start/extend fan tail window
+  const hvacWentToOff = (hvacStatusEff === 'OFF');
+  const prevWasHeatOrCool = ['heat','heat+fan','cool','cool+fan'].includes(prev.currentMode);
+  let nextLastFanTailUntil = prev.lastFanTailUntil || 0;
+  if (hvacWentToOff && (wasActive || prevWasHeatOrCool)) {
+    nextLastFanTailUntil = Math.max(nextLastFanTailUntil, eventTime + POST_RUN_TAIL_MS);
   }
 
   function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
@@ -899,7 +871,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: Math.round(runtimeSeconds / 60),
       isRuntimeEvent,
       hvacMode: hvacStatusEff,
-      isHvacActive: isActive, // Now includes fan-only operation
+      isHvacActive: Boolean(isActive),
       thermostatMode: mode || 'OFF',
       isReachable,
 
@@ -920,7 +892,7 @@ async function handleNestEvent(eventData) {
       lastEquipmentStatus,
 
       equipmentStatus,
-      isFanOnly,
+      isFanOnly: Boolean(isFanOnly),
 
       timestamp,
       eventId: eventData.eventId,
@@ -930,12 +902,9 @@ async function handleNestEvent(eventData) {
 
   let payload;
 
-  // Runtime calculation logic - UPDATED TO INCLUDE FAN RUNTIME
+  // Runtime calc (incl. fan-only)
   if (isActive && !wasActive) {
-    // Just turned on (heating, cooling, or fan-only)
     console.log(`🟢 HVAC/Fan turning ON: ${equipmentStatus} for ${key.substring(0, 16)}`);
-    
-    // Close any existing session first
     if (sessions[key] || prev.isRunning) {
       console.warn('Warning: Starting new session while previous session still active - closing previous session');
       if (sessions[key]?.startTime) {
@@ -955,19 +924,17 @@ async function handleNestEvent(eventData) {
         }
       }
     }
-    
     const sessionData = {
       startTime: eventTime,
       startStatus: equipmentStatus,
       startTemperature: effectiveCurrentTemp
     };
     sessions[key] = sessionData;
-    
     payload = createBubblePayload(0, false);
     console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
 
-  } else if (!isActive && wasActive) {
-    // Just turned off - THIS IS WHERE RUNTIME SHOULD BE CALCULATED
+  } else if (!isActive && wasActive && !withinFanTail(prev, eventTime)) {
+    // Only end the session if we are NOT in a synthetic tail
     console.log(`🔴 HVAC/Fan turning OFF for ${key.substring(0, 16)}`);
     
     let session = sessions[key];
@@ -983,7 +950,6 @@ async function handleNestEvent(eventData) {
     if (session?.startTime) {
       const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
       const runtimeMinutes = Math.round(runtimeSeconds / 60);
-      
       console.log(`⏱️  Runtime calculation: ${runtimeSeconds}s (${runtimeMinutes}m) from ${new Date(session.startTime).toLocaleTimeString()} to ${new Date(eventTime).toLocaleTimeString()}`);
       
       if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
@@ -998,7 +964,6 @@ async function handleNestEvent(eventData) {
           heatSetpoint: effectiveHeatSetpoint,
           coolSetpoint: effectiveCoolSetpoint
         });
-
         payload = createBubblePayload(runtimeSeconds, true, session);
         console.log(`✅ Ended session: ${runtimeSeconds}s runtime (${session.startStatus})`);
       } else {
@@ -1009,33 +974,26 @@ async function handleNestEvent(eventData) {
       console.warn('❌ No session data found for runtime calculation');
       payload = createBubblePayload(0, false);
     }
-    
     delete sessions[key];
 
   } else if (isActive && !sessions[key] && !prev.isRunning) {
-    // Active but no session tracked
     console.log(`🟡 HVAC/Fan is active but no session tracked for ${key.substring(0, 16)} - starting recovery session`);
-    
     const sessionData = {
       startTime: eventTime,
       startStatus: equipmentStatus,
       startTemperature: effectiveCurrentTemp
     };
     sessions[key] = sessionData;
-    
     payload = createBubblePayload(0, false);
     console.log(`✅ Recovery session started for ${equipmentStatus}`);
 
   } else if (isActive && sessions[key]) {
-    // Currently running
     const session = sessions[key];
     const currentRuntimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
     const runtimeMinutes = Math.round(currentRuntimeSeconds / 60);
-    
     const lastUpdate = prev.lastActivityAt || 0;
     const timeSinceLastUpdate = eventTime - lastUpdate;
     const shouldSendRuntimeUpdate = timeSinceLastUpdate > (10 * 60 * 1000);
-    
     if (shouldSendRuntimeUpdate && currentRuntimeSeconds > 60) {
       console.log(`🔄 Runtime update: ${currentRuntimeSeconds}s (${runtimeMinutes}m) - ${equipmentStatus}`);
       payload = createBubblePayload(currentRuntimeSeconds, false, session);
@@ -1044,27 +1002,29 @@ async function handleNestEvent(eventData) {
     }
 
   } else {
-    // No state change
     payload = createBubblePayload(0, false);
     if (effectiveCurrentTemp && !IS_PRODUCTION) {
       console.log(`🌡️  State update: ${effectiveCurrentTemp}°C (${celsiusToFahrenheit(effectiveCurrentTemp)}°F)`);
     }
   }
 
-  // Update device state
+  // New state (persist tail window if later than event)
+  const carryTail = nextLastFanTailUntil && nextLastFanTailUntil > eventTime ? nextLastFanTailUntil : (prev.lastFanTailUntil || 0);
+
   const newState = {
     ...prev,
-    isRunning: isActive, // Now includes fan-only operation
+    isRunning: Boolean(isActive),
     sessionStartedAt: isActive ? (sessions[key]?.startTime || prev.sessionStartedAt) : null,
     currentMode: equipmentStatus,
-    lastTemperature: currentTemp || prev.lastTemperature,
+    lastTemperature: currentTemp ?? prev.lastTemperature,
     lastHeatSetpoint: heatSetpoint !== undefined ? heatSetpoint : prev.lastHeatSetpoint,
     lastCoolSetpoint: coolSetpoint !== undefined ? coolSetpoint : prev.lastCoolSetpoint,
     lastEquipmentStatus: equipmentStatus,
     isReachable,
     lastSeenAt: eventTime,
     lastActivityAt: eventTime,
-    roomDisplayName: roomDisplayName || prev.roomDisplayName
+    roomDisplayName: roomDisplayName || prev.roomDisplayName,
+    lastFanTailUntil: carryTail,
   };
 
   await updateDeviceState(key, newState);
@@ -1096,9 +1056,7 @@ async function handleNestEvent(eventData) {
       console.log('Sent to Bubble:', logData);
     } catch (err) {
       console.error('Failed to send to Bubble:', err.response?.status || err.code || err.message);
-      if (err.response?.data) {
-        console.error('Bubble error response:', err.response.data);
-      }
+      if (err.response?.data) console.error('Bubble error response:', err.response.data);
       const retryDelay = 5000;
       setTimeout(async () => {
         try {
@@ -1133,21 +1091,21 @@ async function handleNestEvent(eventData) {
   console.log('DEBUG: Event processing complete');
 }
 
-// Staleness monitoring
+/* ─────────────────────── Staleness Monitor ─────────────────────── */
+
 setInterval(async () => {
   const now = Date.now();
   const staleThreshold = now - STALENESS_THRESHOLD;
   
   console.log('Checking for stale devices...');
   
-  // Check memory-based devices
+  // Memory states
   for (const [key, state] of Object.entries(deviceStates)) {
     const lastActivity = state.lastActivityAt || 0;
     const lastStalenessNotification = state.lastStalenessNotification || 0;
     
     if (lastActivity > 0 && lastActivity < staleThreshold) {
       const timeSinceLastNotification = now - lastStalenessNotification;
-      
       if (lastStalenessNotification === 0 || timeSinceLastNotification >= STALENESS_THRESHOLD) {
         const hoursSinceLastActivity = Math.floor((now - lastActivity) / (60 * 60 * 1000));
         console.log(`Device ${key} is stale (${hoursSinceLastActivity} hours since last activity), sending staleness notification`);
@@ -1163,7 +1121,7 @@ setInterval(async () => {
     }
   }
   
-  // Check database-based devices if enabled
+  // DB states
   if (pool) {
     try {
       const staleDevices = await pool.query(`
@@ -1207,22 +1165,19 @@ setInterval(async () => {
   }
 }, STALENESS_CHECK_INTERVAL);
 
-// Database initialization
+/* ─────────────────────── Startup / Routes ─────────────────────── */
+
 async function initializeDatabase() {
   if (!ENABLE_DATABASE || !pool) {
     console.log('Database disabled - using memory-only state');
     return;
   }
-
   try {
     const result = await pool.query('SELECT NOW() as now');
     console.log('Database connection established:', result.rows[0].now);
-    
     await runDatabaseMigration();
-    
     const stateResult = await pool.query('SELECT device_key FROM device_states');
     console.log(`Loaded ${stateResult.rows.length} existing device states from database`);
-    
   } catch (error) {
     console.error('Database initialization failed:', error.message);
     console.warn('Falling back to memory-only state management');
@@ -1276,6 +1231,7 @@ app.get('/admin/health', requireAuth, async (req, res) => {
     config: {
       stalenessThresholdHours: STALENESS_THRESHOLD / (60 * 60 * 1000),
       runtimeTimeoutHours: RUNTIME_TIMEOUT / (60 * 60 * 1000),
+      postRunTailMs: POST_RUN_TAIL_MS,
       databaseEnabled: ENABLE_DATABASE,
       bubbleConfigured: !!process.env.BUBBLE_WEBHOOK_URL
     },
@@ -1283,10 +1239,9 @@ app.get('/admin/health', requireAuth, async (req, res) => {
   });
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', async (req, res) => {
   let dbStatus = 'disabled';
-  
   if (pool) {
     try {
       await pool.query('SELECT 1');
@@ -1295,7 +1250,6 @@ app.get('/health', async (req, res) => {
       dbStatus = 'error';
     }
   }
-
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -1317,7 +1271,6 @@ app.post('/webhook', async (req, res) => {
       console.error('Invalid Pub/Sub message structure');
       return res.status(400).send('Invalid Pub/Sub message');
     }
-
     let eventData;
     try {
       eventData = JSON.parse(Buffer.from(pubsubMessage.data, 'base64').toString());
@@ -1327,9 +1280,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     console.log('Processing Nest event:', eventData.eventId || 'unknown-event');
-
     await handleNestEvent(eventData);
-
     res.status(200).send('OK');
   } catch (error) {
     console.error('Webhook error:', error.message);
@@ -1337,7 +1288,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Error handling
+// Not found / errors
 app.use('*', (req, res) => {
   res.status(404).send('Not Found');
 });
@@ -1350,24 +1301,19 @@ app.use((error, req, res, next) => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('Received SIGINT, shutting down gracefully...');
-  if (pool) {
-    await pool.end();
-  }
+  if (pool) await pool.end();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   console.log('Received SIGTERM, shutting down gracefully...');
-  if (pool) {
-    await pool.end();
-  }
+  if (pool) await pool.end();
   process.exit(0);
 });
 
 // Start server
 async function startServer() {
   await initializeDatabase();
-  
   app.listen(PORT, () => {
     console.log(`Server started successfully`);
     console.log(`Configuration:`);
@@ -1377,6 +1323,7 @@ async function startServer() {
     console.log(`- Database: ${ENABLE_DATABASE && DATABASE_URL ? 'Enabled' : 'Disabled (memory-only)'}`);
     console.log(`- Staleness threshold: ${STALENESS_THRESHOLD / (60 * 60 * 1000)} hours`);
     console.log(`- Runtime timeout: ${RUNTIME_TIMEOUT / (60 * 60 * 1000)} hours`);
+    console.log(`- Post-run tail: ${POST_RUN_TAIL_MS} ms`);
     console.log(`Ready to receive Nest events at /webhook`);
   });
 }
