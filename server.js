@@ -55,6 +55,21 @@ const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 
 const CLEANUP_INTERVAL = 6 * 60 * 60 * 1000;
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
+// Utility function to extract room display name
+function extractRoomDisplayName(eventData) {
+  const parentRelations = eventData.resourceUpdate?.parentRelations;
+  if (!parentRelations || !Array.isArray(parentRelations)) {
+    return null;
+  }
+  
+  // Find the room relation (typically contains '/rooms/' in the parent path)
+  const roomRelation = parentRelations.find(relation => 
+    relation.parent && relation.parent.includes('/rooms/')
+  );
+  
+  return roomRelation?.displayName || null;
+}
+
 // Database functions
 async function ensureDeviceExists(deviceKey) {
   if (!pool) return;
@@ -94,7 +109,8 @@ async function getDeviceState(deviceKey) {
       lastEquipmentStatus: row.last_equipment_status,
       isReachable: row.is_reachable !== false,
       lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).getTime() : Date.now(),
-      lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).getTime() : Date.now()
+      lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).getTime() : Date.now(),
+      roomDisplayName: row.room_display_name
     };
   } catch (error) {
     console.error('Failed to get device state:', error.message);
@@ -122,6 +138,7 @@ async function updateDeviceState(deviceKey, state) {
         is_reachable = $9,
         last_seen_at = $10,
         last_activity_at = $11,
+        room_display_name = $12,
         updated_at = NOW()
       WHERE device_key = $1
       `,
@@ -136,7 +153,8 @@ async function updateDeviceState(deviceKey, state) {
         state.lastEquipmentStatus,
         state.isReachable !== false,
         state.lastSeenAt ? new Date(state.lastSeenAt) : new Date(),
-        state.lastActivityAt ? new Date(state.lastActivityAt) : new Date()
+        state.lastActivityAt ? new Date(state.lastActivityAt) : new Date(),
+        state.roomDisplayName
       ]
     );
   } catch (error) {
@@ -278,13 +296,32 @@ async function runDatabaseMigration() {
     `);
     
     if (parseInt(schemaExists.rows[0].count) > 0) {
-      console.log('Database schema already exists - skipping migration');
+      // Check if room_display_name column exists
+      const columnExists = await pool.query(`
+        SELECT COUNT(*) as count
+        FROM information_schema.columns
+        WHERE table_name = 'device_states' 
+          AND column_name = 'room_display_name'
+          AND table_schema = 'public'
+      `);
+      
+      if (parseInt(columnExists.rows[0].count) === 0) {
+        console.log('Adding room_display_name column to existing schema...');
+        await pool.query(`
+          ALTER TABLE device_states 
+          ADD COLUMN room_display_name VARCHAR(200)
+        `);
+        console.log('Added room_display_name column');
+      } else {
+        console.log('Database schema already exists - skipping migration');
+      }
       return;
     }
 
     console.log('Creating database schema with proper field sizes...');
     console.log('- device_key: VARCHAR(300) for long Nest device IDs');
     console.log('- device_name: VARCHAR(600) for full device paths');
+    console.log('- room_display_name: VARCHAR(200) for room names');
     
     const migrationSQL = `
       CREATE TABLE IF NOT EXISTS device_states (
@@ -292,6 +329,7 @@ async function runDatabaseMigration() {
           frontend_id VARCHAR(300),
           mac_id VARCHAR(300),
           device_name VARCHAR(600),
+          room_display_name VARCHAR(200),
           units CHAR(1) DEFAULT 'F' CHECK (units IN ('F', 'C')),
           location_id VARCHAR(300),
           workspace_id VARCHAR(300),
@@ -406,7 +444,7 @@ async function runDatabaseMigration() {
       SELECT column_name, character_maximum_length 
       FROM information_schema.columns 
       WHERE table_name = 'device_states' 
-        AND column_name IN ('device_key', 'device_name')
+        AND column_name IN ('device_key', 'device_name', 'room_display_name')
     `);
     
     for (const row of checkSchema.rows) {
@@ -428,6 +466,7 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   const payload = {
     thermostatId: deviceId,
     deviceName: `Device ${deviceId}`,
+    roomDisplayName: deviceState.roomDisplayName || null,
     runtimeSeconds: 0,
     runtimeMinutes: 0,
     isRuntimeEvent: false,
@@ -474,6 +513,7 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
       
       console.log('Sent staleness notification to Bubble:', sanitizeForLogging({
         deviceId: payload.thermostatId,
+        roomDisplayName: payload.roomDisplayName,
         currentTempF: payload.currentTempF,
         isReachable: payload.isReachable,
         hoursSinceLastActivity: payload.hoursSinceLastActivity,
@@ -494,10 +534,14 @@ async function handleNestEvent(eventData) {
   const traits = eventData.resourceUpdate?.traits;
   const timestamp = eventData.timestamp;
 
+  // Extract room display name
+  const roomDisplayName = extractRoomDisplayName(eventData);
+
   console.log('DEBUG - Basic field extraction:');
   console.log(`- userId: ${userId}`);
   console.log(`- deviceName: ${deviceName}`);
   console.log(`- timestamp: ${timestamp}`);
+  console.log(`- roomDisplayName: ${roomDisplayName}`);
 
   const deviceId = deviceName?.split('/').pop();
 
@@ -567,6 +611,7 @@ async function handleNestEvent(eventData) {
       userId,
       thermostatId: deviceId,
       deviceName: deviceName,
+      roomDisplayName: roomDisplayName,
       runtimeSeconds: 0,
       runtimeMinutes: 0,
       isRuntimeEvent: false,
@@ -613,7 +658,8 @@ async function handleNestEvent(eventData) {
           isHvacActive: payload.isHvacActive,
           currentTempF: payload.currentTempF,
           isReachable: payload.isReachable,
-          equipmentStatus: payload.equipmentStatus
+          equipmentStatus: payload.equipmentStatus,
+          roomDisplayName: payload.roomDisplayName
         }));
       } catch (err) {
         console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
@@ -625,7 +671,8 @@ async function handleNestEvent(eventData) {
       lastTemperature: currentTemp,
       lastSeenAt: eventTime,
       lastActivityAt: eventTime,
-      isReachable
+      isReachable,
+      roomDisplayName: roomDisplayName || prev.roomDisplayName
     });
 
     console.log('DEBUG: Temperature-only event processing complete');
@@ -642,6 +689,7 @@ async function handleNestEvent(eventData) {
       userId,
       thermostatId: deviceId,
       deviceName: deviceName,
+      roomDisplayName: roomDisplayName,
       runtimeSeconds: 0,
       runtimeMinutes: 0,
       isRuntimeEvent: false,
@@ -681,7 +729,10 @@ async function handleNestEvent(eventData) {
             'Content-Type': 'application/json'
           }
         });
-        console.log('Sent connectivity update to Bubble:', sanitizeForLogging({ isReachable: payload.isReachable }));
+        console.log('Sent connectivity update to Bubble:', sanitizeForLogging({ 
+          isReachable: payload.isReachable,
+          roomDisplayName: payload.roomDisplayName
+        }));
       } catch (err) {
         console.error('Failed to send connectivity update to Bubble:', err.response?.status || err.code || err.message);
       }
@@ -691,7 +742,8 @@ async function handleNestEvent(eventData) {
       ...prev,
       isReachable,
       lastSeenAt: eventTime,
-      lastActivityAt: eventTime
+      lastActivityAt: eventTime,
+      roomDisplayName: roomDisplayName || prev.roomDisplayName
     });
 
     console.log('DEBUG: Connectivity-only event processing complete');
@@ -727,6 +779,7 @@ async function handleNestEvent(eventData) {
       userId,
       thermostatId: deviceId,
       deviceName: deviceName,
+      roomDisplayName: roomDisplayName,
       runtimeSeconds,
       runtimeMinutes: Math.round(runtimeSeconds / 60),
       isRuntimeEvent,
@@ -899,7 +952,8 @@ async function handleNestEvent(eventData) {
     lastEquipmentStatus: equipmentStatus,
     isReachable,
     lastSeenAt: eventTime,
-    lastActivityAt: eventTime
+    lastActivityAt: eventTime,
+    roomDisplayName: roomDisplayName || prev.roomDisplayName
   };
 
   await updateDeviceState(key, newState);
@@ -921,7 +975,8 @@ async function handleNestEvent(eventData) {
         hvacMode: payload.hvacMode,
         isHvacActive: payload.isHvacActive,
         currentTempF: payload.currentTempF,
-        isReachable: payload.isReachable
+        isReachable: payload.isReachable,
+        roomDisplayName: payload.roomDisplayName
       });
       console.log('Sent to Bubble:', logData);
     } catch (err) {
@@ -949,7 +1004,8 @@ async function handleNestEvent(eventData) {
       hvacMode: payload.hvacMode,
       isHvacActive: payload.isHvacActive,
       currentTempF: payload.currentTempF,
-      isReachable: payload.isReachable
+      isReachable: payload.isReachable,
+      roomDisplayName: payload.roomDisplayName
     });
     console.log('Would send to Bubble (no URL configured):', logData);
   }
@@ -992,7 +1048,7 @@ setInterval(async () => {
     try {
       const staleDevices = await pool.query(`
         SELECT device_key, last_activity_at, last_temperature, last_equipment_status, 
-               is_reachable, last_staleness_notification
+               is_reachable, last_staleness_notification, room_display_name
         FROM device_states 
         WHERE last_activity_at < $1 
           AND last_activity_at > $2
@@ -1010,7 +1066,8 @@ setInterval(async () => {
           await sendStalenessNotification(device.device_key, {
             lastTemperature: device.last_temperature,
             lastEquipmentStatus: device.last_equipment_status,
-            lastActivityAt: new Date(device.last_activity_at).getTime()
+            lastActivityAt: new Date(device.last_activity_at).getTime(),
+            roomDisplayName: device.room_display_name
           }, now);
           
           try {
