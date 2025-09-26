@@ -55,7 +55,7 @@ const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 
 const CLEANUP_INTERVAL = 6 * 60 * 60 * 1000;
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
-// NEW: Post-run fan tail ms (default 2 min)
+// Post-run fan tail ms (default 2 min)
 const POST_RUN_TAIL_MS = parseInt(process.env.POST_RUN_TAIL_MS || '120000'); 
 
 /* ─────────────────────────── Utilities ─────────────────────────── */
@@ -649,7 +649,8 @@ async function handleNestEvent(eventData) {
 
     await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
-    const isCurrentlyRunning = Boolean(sessions[key]) || Boolean(prev.isRunning) || withinFanTail(prev, eventTime);
+    // Only live session or tail can mark it active (avoid stale prev.isRunning)
+    const isCurrentlyRunning = Boolean(sessions[key]) || withinFanTail(prev, eventTime);
 
     let effectiveHvacMode = 'OFF';
     if (isCurrentlyRunning) {
@@ -740,7 +741,7 @@ async function handleNestEvent(eventData) {
       lastActivityAt: eventTime,
       isReachable,
       roomDisplayName: roomDisplayName || prev.roomDisplayName,
-      lastFanTailUntil: prev.lastFanTailUntil && prev.lastFanTailUntil > eventTime ? prev.lastFanTailUntil : 0,
+      lastFanTailUntil: withinFanTail(prev, eventTime) ? prev.lastFanTailUntil : 0,
     });
 
     console.log('DEBUG: Temperature-only event processing complete');
@@ -816,7 +817,7 @@ async function handleNestEvent(eventData) {
       lastSeenAt: eventTime,
       lastActivityAt: eventTime,
       roomDisplayName: roomDisplayName || prev.roomDisplayName,
-      lastFanTailUntil: prev.lastFanTailUntil && prev.lastFanTailUntil > eventTime ? prev.lastFanTailUntil : 0,
+      lastFanTailUntil: withinFanTail(prev, eventTime) ? prev.lastFanTailUntil : 0,
     });
 
     console.log('DEBUG: Connectivity-only event processing complete');
@@ -853,12 +854,17 @@ async function handleNestEvent(eventData) {
     );
   }
 
-  // If we just went to OFF and previously were heating/cooling, start/extend fan tail window
+  // Tail arming logic (only on real heat/cool → OFF, and not during existing tail)
   const hvacWentToOff = (hvacStatusEff === 'OFF');
   const prevWasHeatOrCool = ['heat','heat+fan','cool','cool+fan'].includes(prev.currentMode);
   let nextLastFanTailUntil = prev.lastFanTailUntil || 0;
-  if (hvacWentToOff && (wasActive || prevWasHeatOrCool)) {
+
+  if (hvacWentToOff && prevWasHeatOrCool && !withinFanTail(prev, eventTime)) {
     nextLastFanTailUntil = Math.max(nextLastFanTailUntil, eventTime + POST_RUN_TAIL_MS);
+  }
+  // If Fan trait is present and explicitly OFF, kill any tail immediately
+  if (hvacWentToOff && hasFanTrait && !fanTimerOn) {
+    nextLastFanTailUntil = 0;
   }
 
   function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
@@ -934,7 +940,7 @@ async function handleNestEvent(eventData) {
     console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
 
   } else if (!isActive && wasActive && !withinFanTail(prev, eventTime)) {
-    // Only end the session if we are NOT in a synthetic tail
+    // Only end the session if NOT in a synthetic tail
     console.log(`🔴 HVAC/Fan turning OFF for ${key.substring(0, 16)}`);
     
     let session = sessions[key];
@@ -1008,8 +1014,11 @@ async function handleNestEvent(eventData) {
     }
   }
 
-  // New state (persist tail window if later than event)
-  const carryTail = nextLastFanTailUntil && nextLastFanTailUntil > eventTime ? nextLastFanTailUntil : (prev.lastFanTailUntil || 0);
+  // Persist tail correctly: if we set a newer tail, use it; if current time beyond tail, clear it
+  const carryTail =
+    nextLastFanTailUntil && nextLastFanTailUntil > eventTime
+      ? nextLastFanTailUntil
+      : (withinFanTail(prev, eventTime) ? prev.lastFanTailUntil : 0);
 
   const newState = {
     ...prev,
