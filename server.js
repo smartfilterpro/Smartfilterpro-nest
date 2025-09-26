@@ -628,96 +628,109 @@ async function handleNestEvent(eventData) {
   const isTemperatureOnlyEvent = !hvacStatusRaw && currentTemp != null;
 
   if (isTemperatureOnlyEvent) {
-    console.log('Temperature-only event detected');
+  console.log('Temperature-only event detected');
 
-    await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
+  await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
-    // Use current running state, not just previous mode
-    const isCurrentlyRunning = sessions[key] || prev.isRunning;
-    const currentEquipmentStatus = isCurrentlyRunning ? (prev.currentMode || 'unknown') : 'off';
-    const effectiveHvacMode = isCurrentlyRunning ? 
-      (prev.currentMode === 'cool' ? 'COOLING' : 
-       prev.currentMode === 'heat' ? 'HEATING' : 'OFF') : 'OFF';
+  // Use current running state, not just previous mode
+  const isCurrentlyRunning = sessions[key] || prev.isRunning;
+  const currentEquipmentStatus = isCurrentlyRunning ? (prev.currentMode || 'unknown') : 'off';
+  
+  // Fix the HVAC mode mapping - handle both the stored mode and convert to proper HVAC status
+  let effectiveHvacMode = 'OFF';
+  if (isCurrentlyRunning) {
+    if (prev.currentMode === 'cool') {
+      effectiveHvacMode = 'COOLING';
+    } else if (prev.currentMode === 'heat') {
+      effectiveHvacMode = 'HEATING';
+    } else if (prev.currentMode === 'fan') {
+      effectiveHvacMode = 'FAN_ONLY';
+    } else {
+      effectiveHvacMode = 'OFF';
+    }
+  }
 
-    const payload = {
-      userId,
-      thermostatId: deviceId,
-      deviceName: deviceName,
-      roomDisplayName: roomDisplayName || '',
-      runtimeSeconds: 0,
-      runtimeMinutes: 0,
-      isRuntimeEvent: false,
-      hvacMode: effectiveHvacMode,
-      isHvacActive: isCurrentlyRunning && (currentEquipmentStatus === 'cool' || currentEquipmentStatus === 'heat'),
-      thermostatMode: mode || prev.currentMode || 'OFF',
-      isReachable,
+  console.log(`Temperature event - isCurrentlyRunning: ${isCurrentlyRunning}, currentEquipmentStatus: ${currentEquipmentStatus}, effectiveHvacMode: ${effectiveHvacMode}`);
 
-      currentTempF: celsiusToFahrenheit(effectiveCurrentTemp),
-      coolSetpointF: celsiusToFahrenheit(effectiveCoolSetpoint),
-      heatSetpointF: celsiusToFahrenheit(effectiveHeatSetpoint),
-      startTempF: 0,
-      endTempF: celsiusToFahrenheit(effectiveCurrentTemp),
-      currentTempC: effectiveCurrentTemp,
-      coolSetpointC: effectiveCoolSetpoint,
-      heatSetpointC: effectiveHeatSetpoint,
-      startTempC: 0,
-      endTempC: effectiveCurrentTemp,
+  const payload = {
+    userId,
+    thermostatId: deviceId,
+    deviceName: deviceName,
+    roomDisplayName: roomDisplayName || '',
+    runtimeSeconds: 0,
+    runtimeMinutes: 0,
+    isRuntimeEvent: false,
+    hvacMode: effectiveHvacMode,
+    isHvacActive: isCurrentlyRunning && (currentEquipmentStatus === 'cool' || currentEquipmentStatus === 'heat'),
+    thermostatMode: mode || prev.currentMode || 'OFF',
+    isReachable,
 
-      lastIsCooling,
-      lastIsHeating,
-      lastIsFanOnly,
-      lastEquipmentStatus,
-      equipmentStatus: currentEquipmentStatus,
-      isFanOnly: false,
+    currentTempF: celsiusToFahrenheit(effectiveCurrentTemp),
+    coolSetpointF: celsiusToFahrenheit(effectiveCoolSetpoint),
+    heatSetpointF: celsiusToFahrenheit(effectiveHeatSetpoint),
+    startTempF: 0,
+    endTempF: celsiusToFahrenheit(effectiveCurrentTemp),
+    currentTempC: effectiveCurrentTemp,
+    coolSetpointC: effectiveCoolSetpoint,
+    heatSetpointC: effectiveHeatSetpoint,
+    startTempC: 0,
+    endTempC: effectiveCurrentTemp,
 
-      timestamp,
-      eventId: eventData.eventId,
-      eventTimestamp: eventTime
-    };
+    lastIsCooling,
+    lastIsHeating,
+    lastIsFanOnly,
+    lastEquipmentStatus,
+    equipmentStatus: currentEquipmentStatus,
+    isFanOnly: false,
 
-    if (process.env.BUBBLE_WEBHOOK_URL) {
-      try {
-        const cleanedPayload = cleanPayloadForBubble(payload);
-        console.log('DEBUG - Sending temperature update payload to Bubble:');
-        console.log(JSON.stringify(cleanedPayload, null, 2));
-        
-        await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
-          timeout: 10000,
-          headers: {
-            'User-Agent': 'Nest-Runtime-Tracker/1.2',
-            'Content-Type': 'application/json'
-          }
-        });
-        console.log('Sent temperature update to Bubble:', sanitizeForLogging({
-          runtimeSeconds: payload.runtimeSeconds,
-          isRuntimeEvent: payload.isRuntimeEvent,
-          hvacMode: payload.hvacMode,
-          isHvacActive: payload.isHvacActive,
-          currentTempF: payload.currentTempF,
-          isReachable: payload.isReachable,
-          equipmentStatus: payload.equipmentStatus,
-          roomDisplayName: payload.roomDisplayName
-        }));
-      } catch (err) {
-        console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
-        if (err.response?.data) {
-          console.error('Bubble error response:', err.response.data);
+    timestamp,
+    eventId: eventData.eventId,
+    eventTimestamp: eventTime
+  };
+
+  if (process.env.BUBBLE_WEBHOOK_URL) {
+    try {
+      const cleanedPayload = cleanPayloadForBubble(payload);
+      console.log('DEBUG - Sending temperature update payload to Bubble:');
+      console.log(JSON.stringify(cleanedPayload, null, 2));
+      
+      await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Nest-Runtime-Tracker/1.2',
+          'Content-Type': 'application/json'
         }
+      });
+      console.log('Sent temperature update to Bubble:', sanitizeForLogging({
+        runtimeSeconds: payload.runtimeSeconds,
+        isRuntimeEvent: payload.isRuntimeEvent,
+        hvacMode: payload.hvacMode,
+        isHvacActive: payload.isHvacActive,
+        currentTempF: payload.currentTempF,
+        isReachable: payload.isReachable,
+        equipmentStatus: payload.equipmentStatus,
+        roomDisplayName: payload.roomDisplayName
+      }));
+    } catch (err) {
+      console.error('Failed to send temperature update to Bubble:', err.response?.status || err.code || err.message);
+      if (err.response?.data) {
+        console.error('Bubble error response:', err.response.data);
       }
     }
-
-    await updateDeviceState(key, {
-      ...prev,
-      lastTemperature: currentTemp,
-      lastSeenAt: eventTime,
-      lastActivityAt: eventTime,
-      isReachable,
-      roomDisplayName: roomDisplayName || prev.roomDisplayName
-    });
-
-    console.log('DEBUG: Temperature-only event processing complete');
-    return;
   }
+
+  await updateDeviceState(key, {
+    ...prev,
+    lastTemperature: currentTemp,
+    lastSeenAt: eventTime,
+    lastActivityAt: eventTime,
+    isReachable,
+    roomDisplayName: roomDisplayName || prev.roomDisplayName
+  });
+
+  console.log('DEBUG: Temperature-only event processing complete');
+  return;
+}
 
   // Connectivity-only event
   const isConnectivityOnly = !!connectivityStatus && !hvacStatusRaw && currentTemp == null;
