@@ -135,6 +135,13 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
       const bubblePayload = sessions.toBubblePayload(result);
       const postResp = await postToBubble(bubblePayload);
 
+      console.log('[BUBBLE]', {
+      isHvacActive: bubblePayload.isHvacActive,
+      hvacMode: bubblePayload.hvacMode,
+      runtimeSeconds: bubblePayload.runtimeSeconds
+      });
+
+
       console.log(
         `[POST] device=${short(input.deviceId)} active=${result.isHvacActive} ` +
         `mode=${result.thermostatMode} status=${result.equipmentStatus} ` +
