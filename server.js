@@ -167,8 +167,8 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
       // Summary log
       console.log(
         `[SUMMARY] device=${short(input.deviceId)} room="${input.roomDisplayName}" ` +
-        `active=${result.isHvacActive} mode=${result.thermostatMode} ` +
-        `equipment=${result.equipmentStatus} fanOnly=${result.isFanOnly} ` +
+        `active=${bubblePayload.isHvacActive} mode=${bubblePayload.hvacMode} ` +
+        `equipment=${bubblePayload.equipmentStatus} fanOnly=${bubblePayload.isFanOnly} ` +
         `temp=${result.currentTempC}°C ` +
         `runtime=${bubblePayload.runtimeSeconds ?? '—'}s`
       );
