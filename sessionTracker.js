@@ -6,30 +6,18 @@
  */
 
 const RECENT_WINDOW_MS = 120_000;
-const COOL_DELTA_ON = 0.0;
-const HEAT_DELTA_ON = 0.0;
-const TREND_DELTA = 0.03;
-const FAN_TAIL_MS = Number(process.env.NEST_FAN_TAIL_MS || 30000);
-
-// Logging control
-const DEBUG = process.env.DEBUG === 'true' || process.env.NODE_ENV !== 'production';
-
-function log(...args) {
-  if (DEBUG) console.log('[SessionTracker]', ...args);
-}
-
-function logWarn(...args) {
-  console.warn('[SessionTracker WARN]', ...args);
-}
+const COOL_DELTA_ON = 0.0;   // was 0.3
+const HEAT_DELTA_ON = 0.0;   // was 0.3
+const TREND_DELTA   = 0.03;  // was 0.05 (be a bit more sensitive to trend)
 
 /* ============================== PARSING ================================ */
 
 function parseSdmPushMessage(body) {
+  // Accept either Pub/Sub push (base64) or direct SDM JSON (hand test)
   try {
-    // Pub/Sub push format
+    // Pub/Sub
     if (body && body.message && body.message.data) {
       const json = Buffer.from(body.message.data, 'base64').toString('utf8');
-      log('Decoded Pub/Sub message:', json);
       const parsed = JSON.parse(json);
 
       const events = [];
@@ -40,60 +28,52 @@ function parseSdmPushMessage(body) {
           traits: ru?.traits || {},
           timestamp: parsed?.eventTime || new Date().toISOString(),
         });
-        log(`Parsed event for device: ${ru.name}`);
-      } else {
-        logWarn('No resourceUpdate found in message');
       }
-      
       return {
         events,
         userId: null,
-        projectId: parsed?.userId || null,
+        projectId: parsed?.userId || null, // SDM confusingly names this sometimes
         structureId: null,
       };
     }
 
-    // Direct JSON test format
+    // Direct JSON (test posts)
     if (body && body.resourceUpdate) {
-      log('Direct JSON format detected, converting...');
       return parseSdmPushMessage({
         message: { data: Buffer.from(JSON.stringify(body)).toString('base64') },
       });
     }
 
-    // Already-normalized format
+    // Already-normalized
     if (Array.isArray(body?.events)) {
-      log(`Already-normalized format with ${body.events.length} events`);
       return { events: body.events, userId: body.userId || null, projectId: null, structureId: null };
     }
-
-    logWarn('Unrecognized message format:', typeof body);
   } catch (e) {
-    logWarn('parseSdmPushMessage failed:', e.message, e.stack);
+    console.warn('[WARN] parseSdmPushMessage failed:', e.message);
   }
   return null;
 }
 
 function extractEffectiveTraits(evt) {
-  const deviceName = evt.deviceName || '';
+  const deviceName = evt.deviceName || '';               // enterprises/.../devices/DEVICE_ID
   const deviceId = deviceName.split('/devices/')[1] || deviceName;
   const t = evt.traits || {};
 
   const thermostatMode = pick(
     t['sdm.devices.traits.ThermostatMode']?.mode,
     t['ThermostatMode']?.mode
-  );
+  ); // OFF/HEAT/COOL/HEATCOOL
 
   const hvacStatusRaw = pick(
     t['sdm.devices.traits.ThermostatHvac']?.status,
     t['ThermostatHvac']?.status
-  );
+  ); // OFF/HEATING/COOLING (optional, not in every event)
 
   const hasFanTrait = Boolean(t['sdm.devices.traits.Fan'] || t['Fan']);
   const fanTimerMode = pick(
     t['sdm.devices.traits.Fan']?.timerMode,
     t['Fan']?.timerMode
-  );
+  ); // ON/OFF
   const fanTimerOn = pick(
     t['sdm.devices.traits.Fan']?.timerMode === 'ON',
     t['Fan']?.timerMode === 'ON'
@@ -117,7 +97,7 @@ function extractEffectiveTraits(evt) {
   const connectivity = pick(
     t['sdm.devices.traits.Connectivity']?.status,
     t['Connectivity']?.status
-  );
+  ); // ONLINE/OFFLINE/UNKNOWN
 
   const roomDisplayName = pick(
     t['sdm.devices.traits.Room']?.name,
@@ -126,7 +106,7 @@ function extractEffectiveTraits(evt) {
 
   const timestamp = evt.timestamp || new Date().toISOString();
 
-  const extracted = {
+  return {
     deviceId,
     deviceName,
     thermostatMode,
@@ -141,18 +121,6 @@ function extractEffectiveTraits(evt) {
     roomDisplayName,
     timestamp,
   };
-
-  log(`Extracted traits for ${deviceId}:`, {
-    mode: thermostatMode,
-    hvacStatus: hvacStatusRaw,
-    temp: extracted.currentTempC,
-    cool: extracted.coolSetpointC,
-    heat: extracted.heatSetpointC,
-    fan: fanTimerMode,
-    connectivity
-  });
-
-  return extracted;
 }
 
 /* ============================== SESSIONS =============================== */
@@ -164,32 +132,36 @@ class SessionManager {
 
   getPrev(deviceId) {
     if (!this.byDevice.has(deviceId)) {
-      log(`Initializing state for device: ${deviceId}`);
       this.byDevice.set(deviceId, {
         isRunning: false,
         startedAt: null,
-        startStatus: 'off',
+        startStatus: 'off', // 'cool' | 'heat' | 'fan' | 'off'
         lastTempC: null,
         lastAt: null,
         lastEquipmentStatus: 'off',
         lastMode: 'OFF',
         lastReachable: true,
         lastRoom: '',
-        tailUntil: 0,
       });
     }
     return this.byDevice.get(deviceId);
   }
 
-  computeActiveAndStatus(input, prev, nowMs) {
+  computeActiveAndStatus(input, prev) {
+    const now = new Date(input.when).getTime();
+
+    // Reachability
     const isReachable = input.connectivity !== 'OFFLINE';
+
+    // Fan explicitly running?
     const isFanRunning = !!(input.hasFanTrait && (input.fanTimerMode === 'ON' || input.fanTimerOn === true));
 
-    let hvacStatus = input.hvacStatusRaw || 'UNKNOWN';
+    // Explicit HVAC status wins when present
+    let hvacStatus = input.hvacStatusRaw || 'UNKNOWN'; // HEATING/COOLING/OFF/UNKNOWN
     let isHeating = hvacStatus === 'HEATING';
     let isCooling = hvacStatus === 'COOLING';
 
-    // Infer from mode + setpoints + temp trend if status unknown
+    // Otherwise infer from mode + setpoints + temp trend
     if (hvacStatus === 'UNKNOWN' || hvacStatus == null) {
       const inferred = inferHvacFromTemps(
         input.thermostatMode,
@@ -202,30 +174,26 @@ class SessionManager {
         hvacStatus = inferred;
         isHeating = inferred === 'HEATING';
         isCooling = inferred === 'COOLING';
-        log(`Inferred HVAC status: ${inferred}`);
       } else {
         hvacStatus = 'OFF';
       }
     }
 
-    // Determine if air is moving
-    let isActive = Boolean(isHeating || isCooling || isFanRunning);
+    // Air moving if heating or cooling or fan running
+    const isActive = Boolean(isHeating || isCooling || isFanRunning);
 
-    // Determine equipment status
+    // Status string + fanOnly
     let equipmentStatus = 'off';
     let isFanOnly = false;
-    if (isHeating) {
-      equipmentStatus = 'heat';
-    } else if (isCooling) {
-      equipmentStatus = 'cool';
-    } else if (isFanRunning) {
+    if (isHeating) equipmentStatus = 'heat';
+    if (isCooling) equipmentStatus = 'cool';
+    if (!isHeating && !isCooling && isFanRunning) {
       equipmentStatus = 'fan';
       isFanOnly = true;
     }
 
-    // Short memory window to avoid flapping when traits are sparse
-    if (!isActive && prev.isRunning && prev.lastAt && nowMs - prev.lastAt < RECENT_WINDOW_MS) {
-      log(`Within recent window (${nowMs - prev.lastAt}ms), maintaining previous state: ${prev.lastEquipmentStatus}`);
+    // Short memory to avoid flapping to OFF when traits are sparse
+    if (!isActive && prev.isRunning && prev.lastAt && now - prev.lastAt < RECENT_WINDOW_MS) {
       return {
         isReachable,
         isHvacActive: true,
@@ -234,114 +202,68 @@ class SessionManager {
       };
     }
 
-    log(`Computed state: active=${isActive}, equipment=${equipmentStatus}, heating=${isHeating}, cooling=${isCooling}, fan=${isFanRunning}`);
-
     return { isReachable, isHvacActive: isActive, equipmentStatus, isFanOnly };
   }
 
   process(input) {
     const prev = this.getPrev(input.deviceId);
-    const nowMs = new Date(input.when).getTime();
+       const now = new Date(input.when).getTime();
 
-    log(`\n=== Processing event for ${input.deviceId} at ${new Date(nowMs).toISOString()} ===`);
-    log(`Previous state: running=${prev.isRunning}, status=${prev.lastEquipmentStatus}, tailUntil=${prev.tailUntil}`);
+    const { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
+      this.computeActiveAndStatus(input, prev);
 
-    // Compute base active state (without tail logic)
-    let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
-      this.computeActiveAndStatus(input, prev, nowMs);
+    const becameActive = !prev.isRunning && isHvacActive;
+    const becameIdle   =  prev.isRunning && !isHvacActive;
 
-    // ═══ Fan tail logic (post-run blower purge) ═══
-    if (!isHvacActive) {
-      const justStoppedHeatOrCool = prev.isRunning && 
-        (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
-      const fanExplicitlyRunning = (equipmentStatus === 'fan' || isFanOnly);
-
-      // Schedule tail if we just ended heat/cool and fan isn't explicitly running
-      if (justStoppedHeatOrCool && !fanExplicitlyRunning && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
-        prev.tailUntil = nowMs + FAN_TAIL_MS;
-        log(`Scheduled fan tail until ${new Date(prev.tailUntil).toISOString()} (+${FAN_TAIL_MS}ms)`);
-      }
-
-      // If within tail window, stay active as 'fan'
-      if (prev.tailUntil && nowMs < prev.tailUntil) {
-        const remaining = prev.tailUntil - nowMs;
-        log(`Within fan tail window (${remaining}ms remaining), staying active as 'fan'`);
-        isHvacActive = true;
-        equipmentStatus = 'fan';
-        isFanOnly = true;
-      } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
-        // Tail expired
-        log('Fan tail expired');
-        prev.tailUntil = 0;
-      }
-    } else {
-      // We are active; cancel any scheduled tail
-      if (prev.tailUntil) {
-        log('Active equipment detected, canceling fan tail');
-        prev.tailUntil = 0;
-      }
+    // Start session
+    if (becameActive) {
+      prev.isRunning = true;
+      prev.startedAt = now;
+      prev.startStatus = equipmentStatus; // 'heat'|'cool'|'fan'
     }
 
-    // ═══ Session transitions ═══
-    const becameActive = !prev.isRunning && isHvacActive;
-    const becameIdle = prev.isRunning && !isHvacActive;
-
+    // End session
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
-
-    if (becameActive) {
-      log(`🟢 Session STARTED: ${equipmentStatus}`);
-      prev.isRunning = true;
-      prev.startedAt = nowMs;
-      prev.startStatus = equipmentStatus || 'fan';
-      prev.tailUntil = 0;
-    }
-
     if (becameIdle && prev.startedAt) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
+      const ms = Math.max(0, now - prev.startedAt);
       runtimeSeconds = Math.round(ms / 1000);
       isRuntimeEvent = true;
-      log(`🔴 Session ENDED: ${prev.startStatus} ran for ${runtimeSeconds}s`);
 
       prev.isRunning = false;
       prev.startedAt = null;
       prev.startStatus = 'off';
-      prev.tailUntil = 0;
     }
 
     // Persist last snapshot
     prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
-    prev.lastAt = nowMs;
+    prev.lastAt = now;
     prev.lastEquipmentStatus = equipmentStatus || prev.lastEquipmentStatus;
     prev.lastMode = input.thermostatMode || prev.lastMode;
     prev.lastReachable = isReachable;
     prev.lastRoom = input.roomDisplayName || prev.lastRoom;
 
-    const hvacMode = hvacModeFromEquipment(equipmentStatus);
-
-    const result = {
+    const hvacMode = hvacModeFromEquipment(equipmentStatus); // 'HEATING'|'COOLING'|'FAN'|'OFF'
+    return {
       userId: input.userId || null,
       thermostatId: input.deviceId,
       deviceName: input.deviceName,
       roomDisplayName: input.roomDisplayName || '',
-      timestampISO: new Date(nowMs).toISOString(),
-      thermostatMode: input.thermostatMode || 'OFF',
-      hvacMode,
-      equipmentStatus,
+      timestampISO: new Date(now).toISOString(),
+      thermostatMode: input.thermostatMode || 'OFF', // Nest set mode
+      hvacMode,                                      // derived every event
+      equipmentStatus,                               // 'off'|'heat'|'cool'|'fan'
       isHvacActive,
       isFanOnly,
       isReachable,
       currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
       coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
       heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
-      runtimeSeconds,
+      runtimeSeconds, // null while running; set on session end
       isRuntimeEvent,
-      startTempC: null,
+      startTempC: prev.isRunning && prev.startedAt ? prev.lastTempC : null,
       endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
     };
-
-    log(`Result: active=${isHvacActive}, equipment=${equipmentStatus}, runtime=${runtimeSeconds}s`);
-    return result;
   }
 
   toBubblePayload(result) {
@@ -351,10 +273,10 @@ class SessionManager {
       thermostatId: result.thermostatId,
       deviceName: result.deviceName || '',
       roomDisplayName: result.roomDisplayName || '',
-      runtimeSeconds: result.runtimeSeconds,
+      runtimeSeconds: result.runtimeSeconds, // null while running; number on session end
       runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
       isRuntimeEvent: Boolean(result.isRuntimeEvent),
-      hvacMode: result.hvacMode,
+      hvacMode: result.hvacMode, // 'HEATING'|'COOLING'|'FAN'|'OFF'
       operatingState: result.equipmentStatus,
       isHvacActive: Boolean(result.isHvacActive),
       thermostatMode: result.thermostatMode,
@@ -362,12 +284,12 @@ class SessionManager {
       currentTempF: c2f(result.currentTempC),
       coolSetpointF: c2f(result.coolSetpointC),
       heatSetpointF: c2f(result.heatSetpointC),
-      startTempF: null,
+      startTempF: c2f(result.startTempC) || 0,
       endTempF: c2f(result.endTempC),
       currentTempC: result.currentTempC,
       coolSetpointC: result.coolSetpointC,
       heatSetpointC: result.heatSetpointC,
-      startTempC: null,
+      startTempC: result.startTempC || 0,
       endTempC: result.endTempC,
       lastIsCooling: result.equipmentStatus === 'cool',
       lastIsHeating: result.equipmentStatus === 'heat',
@@ -386,10 +308,12 @@ class SessionManager {
 
 function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
   const hasCurrent = isNum(currentC);
-  const hasPrev = isNum(prevTempC);
+  const hasPrev    = isNum(prevTempC);
   const trendingDown = hasPrev && hasCurrent ? (prevTempC - currentC > TREND_DELTA) : false;
-  const trendingUp = hasPrev && hasCurrent ? (currentC - prevTempC > TREND_DELTA) : false;
+  const trendingUp   = hasPrev && hasCurrent ? (currentC - prevTempC > TREND_DELTA) : false;
 
+  // If we don't have current temp but do have a trendable previous sample, allow trend to infer
+  // (this helps right after re-link when Temperature trait is sparse)
   const canUseTrendOnly = !hasCurrent && hasPrev;
 
   if (mode === 'COOL' || mode === 'HEATCOOL') {
@@ -413,33 +337,25 @@ function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
   return 'OFF';
 }
 
+
 /* ============================== UTILITIES ============================== */
 
 function hvacModeFromEquipment(equipmentStatus) {
   switch ((equipmentStatus || 'off').toLowerCase()) {
     case 'heat': return 'HEATING';
     case 'cool': return 'COOLING';
-    case 'fan': return 'FAN';
-    default: return 'OFF';
+    case 'fan':  return 'FAN';
+    default:     return 'OFF';
   }
 }
 
-function pick(...vals) {
-  for (const v of vals) if (v !== undefined && v !== null) return v;
-  return undefined;
-}
-
-function isNum(v) {
-  return typeof v === 'number' && Number.isFinite(v);
-}
-
-function round2(n) {
-  return Math.round(n * 100) / 100;
-}
+function pick(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; return undefined; }
+function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
+function round2(n) { return Math.round(n * 100) / 100; }
 
 function genUuid() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = (Math.random() * 16) | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+    const r = (Math.random()*16)|0, v = c === 'x' ? r : (r&0x3|0x8);
     return v.toString(16);
   });
 }
