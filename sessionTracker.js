@@ -243,15 +243,16 @@ class SessionManager {
     prev.lastReachable = isReachable;
     prev.lastRoom = input.roomDisplayName || prev.lastRoom;
 
+    const hvacMode = hvacModeFromEquipment(equipmentStatus); // 'HEATING'|'COOLING'|'FAN'|'OFF'
     return {
       userId: input.userId || null,
       thermostatId: input.deviceId,
       deviceName: input.deviceName,
       roomDisplayName: input.roomDisplayName || '',
       timestampISO: new Date(now).toISOString(),
-      thermostatMode: input.thermostatMode || 'OFF',      // OFF/HEAT/COOL/HEATCOOL
-      hvacMode: hvacModeFromEquipment(equipmentStatus),   // OFF/HEATING/COOLING/FAN
-      equipmentStatus,                                     // 'off'|'heat'|'cool'|'fan'
+      thermostatMode: input.thermostatMode || 'OFF', // Nest set mode
+      hvacMode,                                      // derived every event
+      equipmentStatus,                               // 'off'|'heat'|'cool'|'fan'
       isHvacActive,
       isFanOnly,
       isReachable,
@@ -275,7 +276,8 @@ class SessionManager {
       runtimeSeconds: result.runtimeSeconds, // null while running; number on session end
       runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
       isRuntimeEvent: Boolean(result.isRuntimeEvent),
-      hvacMode: result.hvacMode || 'OFF', // 'HEATING'|'COOLING'|'FAN'|'OFF'
+      hvacMode: result.hvacMode, // 'HEATING'|'COOLING'|'FAN'|'OFF'
+      operatingState: result.equipmentStatus,
       isHvacActive: Boolean(result.isHvacActive),
       thermostatMode: result.thermostatMode,
       isReachable: Boolean(result.isReachable),
