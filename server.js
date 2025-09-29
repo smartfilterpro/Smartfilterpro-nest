@@ -33,6 +33,7 @@ if (ENABLE_DATABASE && DATABASE_URL) {
     ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
     max: 5,
   });
+  console.log('[CONFIG] Database enabled');
 }
 
 app.use(express.json({ limit: '2mb' }));
@@ -56,33 +57,35 @@ async function postToBubble(payload) {
     const { data, status } = await axios.post(BUBBLE_THERMOSTAT_UPDATES_URL, payload, {
       timeout: 10_000,
     });
+    console.log(`[BUBBLE] ✓ Posted (${status}): active=${payload.isHvacActive} mode=${payload.hvacMode} runtime=${payload.runtimeSeconds ?? '—'}`);
     return { ok: true, status, data };
   } catch (e) {
     console.error('[ERROR] Post to Bubble failed:', e?.response?.status, e?.message);
+    if (e?.response?.data) {
+      console.error('[ERROR] Bubble response:', e.response.data);
+    }
     return { ok: false, error: e?.message, status: e?.response?.status };
   }
 }
 
 /* ================================ ROUTES =============================== */
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ ok: true, timestamp: new Date().toISOString() }));
 
 // Accept both historical and new endpoints to avoid Pub/Sub misconfig issues
 app.post(['/webhook', '/nest/events'], async (req, res) => {
-  // Clear ingress log so you can confirm pushes are arriving
+  const startTime = Date.now();
   try {
-    console.log(
-      '[INGRESS]',
-      req.get('x-cloud-trace-context') || req.get('x-forwarded-for') || 'push',
-      '→',
-      req.originalUrl
-    );
+    const source = req.get('x-cloud-trace-context') || req.get('x-forwarded-for') || 'unknown';
+    console.log(`\n[INGRESS] ${new Date().toISOString()} | ${source} → ${req.originalUrl}`);
 
     const decoded = parseSdmPushMessage(req.body);
     if (!decoded) {
-      console.warn('[WARN] Could not parse SDM push body; 204');
+      console.warn('[WARN] Could not parse SDM push body; returning 204');
       return res.status(204).end();
     }
+
+    console.log(`[PARSED] ${decoded.events.length} event(s) in message`);
 
     for (const evt of decoded.events) {
       const traits = extractEffectiveTraits(evt);
@@ -95,19 +98,20 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
         deviceName: traits.deviceName,
         roomDisplayName: traits.roomDisplayName || '',
         when: traits.timestamp,
-        thermostatMode: traits.thermostatMode,   // OFF/HEAT/COOL/HEATCOOL
-        hvacStatusRaw: traits.hvacStatusRaw,     // HEATING/COOLING/OFF (optional)
+        thermostatMode: traits.thermostatMode,
+        hvacStatusRaw: traits.hvacStatusRaw,
         hasFanTrait: traits.hasFanTrait,
         fanTimerMode: traits.fanTimerMode,
         fanTimerOn: traits.fanTimerOn,
         currentTempC: traits.currentTempC,
         coolSetpointC: traits.coolSetpointC,
         heatSetpointC: traits.heatSetpointC,
-        connectivity: traits.connectivity,       // ONLINE/OFFLINE/UNKNOWN
+        connectivity: traits.connectivity,
       };
 
       const result = sessions.process(input);
 
+      // Database insert
       if (ENABLE_DATABASE && pool) {
         try {
           await pool.query(
@@ -128,34 +132,35 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
             ]
           );
         } catch (dbErr) {
-          console.warn('[WARN] DB insert failed (ok to ignore if no table):', dbErr.message);
+          console.warn('[WARN] DB insert failed:', dbErr.message);
         }
       }
 
+      // Post to Bubble
       const bubblePayload = sessions.toBubblePayload(result);
       const postResp = await postToBubble(bubblePayload);
 
-      console.log('[BUBBLE]', {
-      isHvacActive: bubblePayload.isHvacActive,
-      hvacMode: bubblePayload.hvacMode,
-      runtimeSeconds: bubblePayload.runtimeSeconds
-      });
-
-
+      // Summary log
       console.log(
-        `[POST] device=${short(input.deviceId)} active=${result.isHvacActive} ` +
-        `mode=${result.thermostatMode} status=${result.equipmentStatus} ` +
-        `fanOnly=${result.isFanOnly} runtime=${bubblePayload.runtimeSeconds ?? '—'}`
+        `[SUMMARY] device=${short(input.deviceId)} room="${input.roomDisplayName}" ` +
+        `active=${result.isHvacActive} mode=${result.thermostatMode} ` +
+        `equipment=${result.equipmentStatus} fanOnly=${result.isFanOnly} ` +
+        `temp=${result.currentTempC}°C ` +
+        `runtime=${bubblePayload.runtimeSeconds ?? '—'}s`
       );
 
       if (!postResp?.ok && !postResp?.skipped) {
-        console.error('[ERROR] Bubble post failed for device:', input.deviceId);
+        console.error('[ERROR] ✗ Bubble post failed for device:', input.deviceId);
       }
     }
 
+    const elapsed = Date.now() - startTime;
+    console.log(`[DONE] Processed in ${elapsed}ms\n`);
+
     return res.status(204).end();
   } catch (err) {
-    console.error('[ERROR] /webhook|/nest/events:', err?.message);
+    console.error('[ERROR] Webhook handler exception:', err?.message);
+    console.error(err?.stack);
     return res.status(204).end(); // ack to avoid redelivery storms
   }
 });
@@ -163,6 +168,15 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
 /* ================================ START ================================ */
 
 app.listen(PORT, () => {
-  console.log(`Nest runtime server listening on :${PORT}`);
-  console.log('Ready to receive Nest SDM pushes at /webhook and /nest/events');
+  console.log(`\n${'='.repeat(60)}`);
+  console.log('Nest SDM Runtime Tracker Server');
+  console.log(`${'='.repeat(60)}`);
+  console.log(`Port: ${PORT}`);
+  console.log(`Endpoints: /webhook, /nest/events, /health`);
+  console.log(`Bubble URL: ${BUBBLE_THERMOSTAT_UPDATES_URL ? '✓ configured' : '✗ not set'}`);
+  console.log(`Database: ${ENABLE_DATABASE ? '✓ enabled' : '✗ disabled'}`);
+  console.log(`Debug logging: ${process.env.DEBUG === 'true' ? '✓ ON' : '○ off'}`);
+  console.log(`Fan tail: ${process.env.NEST_FAN_TAIL_MS || '30000'}ms`);
+  console.log(`${'='.repeat(60)}\n`);
+  console.log('Ready to receive Google SDM events...\n');
 });
