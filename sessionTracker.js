@@ -10,14 +10,6 @@ const COOL_DELTA_ON = 0.3;         // °C above cool setpoint to infer active co
 const HEAT_DELTA_ON = 0.3;         // °C below heat setpoint to infer active heating
 const TREND_DELTA = 0.05;          // °C change indicating the temperature trend
 
-/* ============================= EXPORTS ================================ */
-
-module.exports = {
-  SessionManager,
-  parseSdmPushMessage,
-  extractEffectiveTraits,
-};
-
 /* ============================== PARSING ================================ */
 
 function parseSdmPushMessage(body) {
@@ -215,7 +207,7 @@ class SessionManager {
 
   process(input) {
     const prev = this.getPrev(input.deviceId);
-    const now = new Date(input.when).getTime();
+       const now = new Date(input.when).getTime();
 
     const { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
@@ -354,3 +346,11 @@ function genUuid() {
     return v.toString(16);
   });
 }
+
+/* ============================== EXPORTS ================================ */
+
+module.exports = {
+  SessionManager,
+  parseSdmPushMessage,
+  extractEffectiveTraits,
+};
