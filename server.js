@@ -56,7 +56,7 @@ const CLEANUP_INTERVAL = 6 * 60 * 60 * 1000;
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
 // Post-run fan tail ms (default 2 min)
-const POST_RUN_TAIL_MS = parseInt(process.env.POST_RUN_TAIL_MS || '120000'); 
+const POST_RUN_TAIL_MS = parseInt(process.env.POST_RUN_TAIL_MS || '120000');
 
 /* ─────────────────────────── Utilities ─────────────────────────── */
 
@@ -74,7 +74,7 @@ function celsiusToFahrenheit(celsius) {
 function extractRoomDisplayName(eventData) {
   const parentRelations = eventData.resourceUpdate?.parentRelations;
   if (!parentRelations || !Array.isArray(parentRelations)) return null;
-  const roomRelation = parentRelations.find(relation => 
+  const roomRelation = parentRelations.find(relation =>
     relation.parent && relation.parent.includes('/rooms/')
   );
   return roomRelation?.displayName || null;
@@ -343,7 +343,7 @@ async function runDatabaseMigration() {
     console.log('- device_key: VARCHAR(300)');
     console.log('- device_name: VARCHAR(600)');
     console.log('- room_display_name: VARCHAR(200)');
-    
+
     const migrationSQL = `
       CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -475,9 +475,9 @@ async function runDatabaseMigration() {
 async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   const deviceId = deviceKey.split('-').pop();
   const lastActivityTime = deviceState.lastActivityAt || 0;
-  const hoursSinceLastActivity = lastActivityTime > 0 ? 
+  const hoursSinceLastActivity = lastActivityTime > 0 ?
     Math.floor((currentTime - lastActivityTime) / (60 * 60 * 1000)) : 0;
-  
+
   const payload = {
     thermostatId: deviceId,
     deviceName: `Device ${deviceId}`,
@@ -489,7 +489,7 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
     isHvacActive: false,
     thermostatMode: 'UNKNOWN',
     isReachable: false,
-    
+
     currentTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : 0,
     coolSetpointF: 0,
     heatSetpointF: 0,
@@ -500,23 +500,23 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
     heatSetpointC: 0,
     startTempC: 0,
     endTempC: deviceState.lastTemperature || 0,
-    
+
     lastIsCooling: false,
     lastIsHeating: false,
     lastIsFanOnly: false,
     lastEquipmentStatus: deviceState.lastEquipmentStatus || 'unknown',
     equipmentStatus: 'stale',
     isFanOnly: false,
-    
+
     hoursSinceLastActivity: hoursSinceLastActivity,
     lastActivityTime: lastActivityTime > 0 ? new Date(lastActivityTime).toISOString() : '',
     stalenessReason: hoursSinceLastActivity >= 24 ? 'extended_offline' : 'device_offline',
-    
+
     timestamp: new Date(currentTime).toISOString(),
     eventId: `stale-${Date.now()}`,
     eventTimestamp: currentTime
   };
-  
+
   if (process.env.BUBBLE_WEBHOOK_URL) {
     try {
       const cleanedPayload = cleanPayloadForBubble(payload);
@@ -527,7 +527,7 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
           'Content-Type': 'application/json'
         }
       });
-      
+
       console.log('Sent staleness notification to Bubble:', sanitizeForLogging({
         deviceId: payload.thermostatId,
         roomDisplayName: payload.roomDisplayName,
@@ -578,9 +578,9 @@ async function handleNestEvent(eventData) {
   // Connectivity trait
   const connectivityStatus = traits?.['sdm.devices.traits.Connectivity']?.status;
   const key = `${userId}-${deviceId}`;
-  
+
   const prev = await getDeviceState(key) || {};
-  
+
   const isReachable = (connectivityStatus === 'OFFLINE')
     ? false
     : (connectivityStatus === 'ONLINE')
@@ -609,26 +609,17 @@ async function handleNestEvent(eventData) {
   const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes('fan');
   const lastEquipmentStatus = prev.lastEquipmentStatus || 'unknown';
 
-  // Resolve hvac status effective
-  let hvacStatusEff;
-  if (hvacStatusRaw) {
-    hvacStatusEff = hvacStatusRaw;
-  } else if (prev.currentMode) {
-    switch (prev.currentMode) {
-      case 'cool':
-      case 'cool+fan':
-        hvacStatusEff = 'COOLING'; break;
-      case 'heat':
-      case 'heat+fan':
-        hvacStatusEff = 'HEATING'; break;
-      case 'fan':
-        hvacStatusEff = 'OFF'; break;
-      default:
-        hvacStatusEff = 'OFF';
-    }
-  } else {
+  // Resolve hvac status effective (do NOT infer from previous state)
+  let hvacStatusEff = hvacStatusRaw ?? null;
+
+  // If ThermostatHvac trait is absent, check if Mode explicitly says OFF
+  const explicitMode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
+  if (!hvacStatusEff && explicitMode === 'OFF') {
     hvacStatusEff = 'OFF';
   }
+
+  // If still unknown, treat as UNKNOWN (idle unless fan/tail says otherwise)
+  if (!hvacStatusEff) hvacStatusEff = 'UNKNOWN';
 
   console.log(`DEBUG - HVAC Status Resolution: hvacStatusRaw="${hvacStatusRaw}", prev.currentMode="${prev.currentMode}", hvacStatusEff="${hvacStatusEff}"`);
 
@@ -642,6 +633,20 @@ async function handleNestEvent(eventData) {
   const isConnectivityOnly = !!connectivityStatus && !hvacStatusRaw && currentTemp == null;
 
   console.log(`DEBUG - Event Classification: isTemperatureOnlyEvent=${isTemperatureOnlyEvent}, isConnectivityOnly=${isConnectivityOnly}`);
+
+  // Skip events with no useful signal at all
+  const noUsefulSignal =
+    !hvacStatusRaw &&
+    currentTemp == null &&
+    coolSetpoint == null &&
+    heatSetpoint == null &&
+    !connectivityStatus &&
+    !hasFanTrait;
+
+  if (noUsefulSignal) {
+    console.log('No-op Nest event (no HVAC/temperature/connectivity/fan changes). Skipping.');
+    return;
+  }
 
   /* ───────────── Temperature-only event ───────────── */
   if (isTemperatureOnlyEvent) {
@@ -710,7 +715,7 @@ async function handleNestEvent(eventData) {
         const cleanedPayload = cleanPayloadForBubble(payload);
         console.log('DEBUG - Sending temperature update payload to Bubble:');
         console.log(JSON.stringify(cleanedPayload, null, 2));
-        
+
         await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
           timeout: 10000,
           headers: {
@@ -793,7 +798,7 @@ async function handleNestEvent(eventData) {
         const cleanedPayload = cleanPayloadForBubble(payload);
         console.log('DEBUG - Sending connectivity update payload to Bubble:');
         console.log(JSON.stringify(cleanedPayload, null, 2));
-        
+
         await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
           timeout: 10000,
           headers: {
@@ -801,7 +806,7 @@ async function handleNestEvent(eventData) {
             'Content-Type': 'application/json'
           }
         });
-        console.log('Sent connectivity update to Bubble:', sanitizeForLogging({ 
+        console.log('Sent connectivity update to Bubble:', sanitizeForLogging({
           isReachable: payload.isReachable,
           roomDisplayName: payload.roomDisplayName
         }));
@@ -854,15 +859,17 @@ async function handleNestEvent(eventData) {
     );
   }
 
-  // Tail arming logic (only on real heat/cool → OFF, and not during existing tail)
-  const hvacWentToOff = (hvacStatusEff === 'OFF');
+  // Tail arming logic (tolerate UNKNOWN when no fan & no tail)
+  const hvacWentToOff = (hvacStatusEff === 'OFF') ||
+    (hvacStatusEff === 'UNKNOWN' && !fanTimerOn && !withinFanTail(prev, eventTime));
+
   const prevWasHeatOrCool = ['heat','heat+fan','cool','cool+fan'].includes(prev.currentMode);
   let nextLastFanTailUntil = prev.lastFanTailUntil || 0;
 
   if (hvacWentToOff && prevWasHeatOrCool && !withinFanTail(prev, eventTime)) {
     nextLastFanTailUntil = Math.max(nextLastFanTailUntil, eventTime + POST_RUN_TAIL_MS);
   }
-  // If Fan trait is present and explicitly OFF, kill any tail immediately
+  // If Fan trait explicitly present and OFF, kill any tail immediately
   if (hvacWentToOff && hasFanTrait && !fanTimerOn) {
     nextLastFanTailUntil = 0;
   }
@@ -942,7 +949,7 @@ async function handleNestEvent(eventData) {
   } else if (!isActive && wasActive && !withinFanTail(prev, eventTime)) {
     // Only end the session if NOT in a synthetic tail
     console.log(`🔴 HVAC/Fan turning OFF for ${key.substring(0, 16)}`);
-    
+
     let session = sessions[key];
     if (!session && prev.sessionStartedAt) {
       session = {
@@ -952,12 +959,12 @@ async function handleNestEvent(eventData) {
       };
       console.log('Using database session data for runtime calculation');
     }
-    
+
     if (session?.startTime) {
       const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
       const runtimeMinutes = Math.round(runtimeSeconds / 60);
       console.log(`⏱️  Runtime calculation: ${runtimeSeconds}s (${runtimeMinutes}m) from ${new Date(session.startTime).toLocaleTimeString()} to ${new Date(eventTime).toLocaleTimeString()}`);
-      
+
       if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
         await logRuntimeSession(key, {
           mode: session.startStatus,
@@ -1043,7 +1050,7 @@ async function handleNestEvent(eventData) {
       const cleanedPayload = cleanPayloadForBubble(payload);
       console.log('DEBUG - Sending full HVAC payload to Bubble:');
       console.log(JSON.stringify(cleanedPayload, null, 2));
-      
+
       await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
         timeout: 10000,
         headers: {
@@ -1105,22 +1112,22 @@ async function handleNestEvent(eventData) {
 setInterval(async () => {
   const now = Date.now();
   const staleThreshold = now - STALENESS_THRESHOLD;
-  
+
   console.log('Checking for stale devices...');
-  
+
   // Memory states
   for (const [key, state] of Object.entries(deviceStates)) {
     const lastActivity = state.lastActivityAt || 0;
     const lastStalenessNotification = state.lastStalenessNotification || 0;
-    
+
     if (lastActivity > 0 && lastActivity < staleThreshold) {
       const timeSinceLastNotification = now - lastStalenessNotification;
       if (lastStalenessNotification === 0 || timeSinceLastNotification >= STALENESS_THRESHOLD) {
         const hoursSinceLastActivity = Math.floor((now - lastActivity) / (60 * 60 * 1000));
         console.log(`Device ${key} is stale (${hoursSinceLastActivity} hours since last activity), sending staleness notification`);
-        
+
         await sendStalenessNotification(key, state, now);
-        
+
         state.lastStalenessNotification = now;
         deviceStates[key] = state;
       }
@@ -1129,7 +1136,7 @@ setInterval(async () => {
       deviceStates[key] = state;
     }
   }
-  
+
   // DB states
   if (pool) {
     try {
@@ -1140,23 +1147,23 @@ setInterval(async () => {
         WHERE last_activity_at < $1 
           AND last_activity_at > $2
       `, [new Date(staleThreshold), new Date(now - (7 * 24 * 60 * 60 * 1000))]);
-      
+
       for (const device of staleDevices.rows) {
-        const lastStalenessNotification = device.last_staleness_notification ? 
+        const lastStalenessNotification = device.last_staleness_notification ?
           new Date(device.last_staleness_notification).getTime() : 0;
         const timeSinceLastNotification = now - lastStalenessNotification;
-        
+
         if (lastStalenessNotification === 0 || timeSinceLastNotification >= STALENESS_THRESHOLD) {
           const hoursSinceLastActivity = Math.floor((now - new Date(device.last_activity_at).getTime()) / (60 * 60 * 1000));
           console.log(`Database device ${device.device_key} is stale (${hoursSinceLastActivity} hours), sending staleness notification`);
-          
+
           await sendStalenessNotification(device.device_key, {
             lastTemperature: device.last_temperature,
             lastEquipmentStatus: device.last_equipment_status,
             lastActivityAt: new Date(device.last_activity_at).getTime(),
             roomDisplayName: device.room_display_name
           }, now);
-          
+
           try {
             await pool.query(`
               UPDATE device_states 
@@ -1173,6 +1180,93 @@ setInterval(async () => {
     }
   }
 }, STALENESS_CHECK_INTERVAL);
+
+/* ─────────────────────── Dead-man Timeout ─────────────────────── */
+// Force-close sessions if we haven't seen activity for RUNTIME_TIMEOUT
+setInterval(async () => {
+  const now = Date.now();
+  for (const [key, session] of Object.entries(sessions)) {
+    try {
+      const prev = await getDeviceState(key) || {};
+      const last = prev.lastActivityAt || session.startTime || now;
+      if (now - last > RUNTIME_TIMEOUT) {
+        const runtimeSeconds = Math.max(0, Math.floor((last - session.startTime) / 1000));
+        if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
+          await logRuntimeSession(key, {
+            mode: session.startStatus || 'unknown',
+            equipmentStatus: 'timeout',
+            startedAt: session.startTime,
+            endedAt: last,
+            durationSeconds: runtimeSeconds,
+            startTemperature: session.startTemperature,
+            endTemperature: prev.lastTemperature,
+            heatSetpoint: prev.lastHeatSetpoint,
+            coolSetpoint: prev.lastCoolSetpoint
+          });
+
+          if (process.env.BUBBLE_WEBHOOK_URL) {
+            const [userId, deviceId] = key.split('-');
+            const payload = cleanPayloadForBubble({
+              userId,
+              thermostatId: deviceId,
+              deviceName: prev.device_name || '',
+              roomDisplayName: prev.roomDisplayName || '',
+              runtimeSeconds,
+              runtimeMinutes: Math.round(runtimeSeconds / 60),
+              isRuntimeEvent: true,
+              hvacMode: 'UNKNOWN',
+              isHvacActive: false,
+              thermostatMode: 'UNKNOWN',
+              isReachable: prev.isReachable !== false,
+
+              currentTempF: celsiusToFahrenheit(prev.lastTemperature),
+              coolSetpointF: celsiusToFahrenheit(prev.lastCoolSetpoint),
+              heatSetpointF: celsiusToFahrenheit(prev.lastHeatSetpoint),
+              startTempF: celsiusToFahrenheit(session.startTemperature),
+              endTempF: celsiusToFahrenheit(prev.lastTemperature),
+
+              currentTempC: prev.lastTemperature,
+              coolSetpointC: prev.lastCoolSetpoint,
+              heatSetpointC: prev.lastHeatSetpoint,
+              startTempC: session.startTemperature,
+              endTempC: prev.lastTemperature,
+
+              lastIsCooling: !!prev.lastEquipmentStatus?.includes('cool'),
+              lastIsHeating: !!prev.lastEquipmentStatus?.includes('heat'),
+              lastIsFanOnly: !!prev.lastEquipmentStatus?.includes('fan'),
+              lastEquipmentStatus: prev.lastEquipmentStatus || 'unknown',
+              equipmentStatus: 'timeout',
+              isFanOnly: false,
+
+              timestamp: new Date(now).toISOString(),
+              eventId: `timeout-${now}`,
+              eventTimestamp: now
+            });
+
+            try {
+              await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+                timeout: 10000,
+                headers: {
+                  'User-Agent': 'Nest-Runtime-Tracker/1.2',
+                  'Content-Type': 'application/json'
+                }
+              });
+              console.log(`Posted timeout payload for ${key.substring(0,16)}`);
+            } catch (e) {
+              console.error('Bubble timeout post failed:', e.response?.status || e.code || e.message);
+            }
+          }
+        }
+
+        delete sessions[key];
+        await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null });
+        console.log(`⏹️  Session force-closed by timeout for ${key.substring(0,16)}`);
+      }
+    } catch (err) {
+      console.error('Dead-man timeout error:', err.message);
+    }
+  }
+}, 5 * 60 * 1000); // check every 5 minutes
 
 /* ─────────────────────── Startup / Routes ─────────────────────── */
 
@@ -1197,7 +1291,7 @@ async function initializeDatabase() {
 app.get('/admin/health', requireAuth, async (req, res) => {
   let dbStatus = 'disabled';
   let dbInfo = {};
-  
+
   if (pool) {
     try {
       const dbResult = await pool.query(`
@@ -1207,13 +1301,13 @@ app.get('/admin/health', requireAuth, async (req, res) => {
           COUNT(CASE WHEN is_reachable = false THEN 1 END) as unreachable_devices
         FROM device_states
       `);
-      
+
       const sessionResult = await pool.query(`
         SELECT COUNT(*) as total_sessions
         FROM runtime_sessions 
         WHERE started_at > NOW() - INTERVAL '24 hours'
       `);
-      
+
       dbStatus = 'connected';
       dbInfo = {
         devices: parseInt(dbResult.rows[0].device_count),
