@@ -2,21 +2,28 @@
 
 /**
  * Session & inference logic for Nest SDM runtime tracking.
- * Counts runtime any time air is moving: HEATING, COOLING, HEATCOOL, or FAN-only.
+ * Counts runtime any time air is moving: HEATING, COOLING, HEATCOOL (auto), or FAN-only.
  */
 
-const BASE_FAN_TAIL_MS = 30_000;       // grace tail after explicit HVAC off if fan keeps spinning
-const RECENT_WINDOW_MS = 120_000;      // memory window to avoid collapsing to OFF immediately
-const COOL_DELTA_ON = 0.3;             // °C above cool setpoint to infer active cooling
-const HEAT_DELTA_ON = 0.3;             // °C below heat setpoint to infer active heating
-const TREND_DELTA = 0.05;              // °C change indicating heating/cooling trend
+const RECENT_WINDOW_MS = 120_000;  // memory window to avoid collapsing to OFF immediately
+const COOL_DELTA_ON = 0.3;         // °C above cool setpoint to infer active cooling
+const HEAT_DELTA_ON = 0.3;         // °C below heat setpoint to infer active heating
+const TREND_DELTA = 0.05;          // °C change indicating the temperature trend
 
-/* -------------------------- SDM Push Parsing ---------------------------- */
+/* ============================= EXPORTS ================================ */
+
+module.exports = {
+  SessionManager,
+  parseSdmPushMessage,
+  extractEffectiveTraits,
+};
+
+/* ============================== PARSING ================================ */
 
 function parseSdmPushMessage(body) {
-  // Accept either direct SDM event JSON (for local testing) or Pub/Sub format
+  // Accept either Pub/Sub push (base64) or direct SDM JSON (hand test)
   try {
-    // Pub/Sub push
+    // Pub/Sub
     if (body && body.message && body.message.data) {
       const json = Buffer.from(body.message.data, 'base64').toString('utf8');
       const parsed = JSON.parse(json);
@@ -27,24 +34,25 @@ function parseSdmPushMessage(body) {
         events.push({
           deviceName: ru.name,
           traits: ru?.traits || {},
-          // top-level timestamp may be present
           timestamp: parsed?.eventTime || new Date().toISOString(),
         });
       }
       return {
         events,
         userId: null,
-        projectId: parsed?.userId || null,     // SDM field name is confusing; keep for reference
+        projectId: parsed?.userId || null, // SDM confusingly names this sometimes
         structureId: null,
       };
     }
 
-    // Direct SDM JSON (already decoded)
+    // Direct JSON (test posts)
     if (body && body.resourceUpdate) {
-      return parseSdmPushMessage({ message: { data: Buffer.from(JSON.stringify(body)).toString('base64') } });
+      return parseSdmPushMessage({
+        message: { data: Buffer.from(JSON.stringify(body)).toString('base64') },
+      });
     }
 
-    // Already-normalized array form (power user testing)
+    // Already-normalized
     if (Array.isArray(body?.events)) {
       return { events: body.events, userId: body.userId || null, projectId: null, structureId: null };
     }
@@ -54,30 +62,26 @@ function parseSdmPushMessage(body) {
   return null;
 }
 
-/* ------------------------ Trait Extraction Layer ------------------------ */
-
 function extractEffectiveTraits(evt) {
-  const deviceName = evt.deviceName || ''; // e.g., enterprises/…/devices/DEVICE_ID
+  const deviceName = evt.deviceName || '';               // enterprises/.../devices/DEVICE_ID
   const deviceId = deviceName.split('/devices/')[1] || deviceName;
-
   const t = evt.traits || {};
 
   const thermostatMode = pick(
     t['sdm.devices.traits.ThermostatMode']?.mode,
-    // sometimes users map this earlier; keep fallback
     t['ThermostatMode']?.mode
   ); // OFF/HEAT/COOL/HEATCOOL
 
   const hvacStatusRaw = pick(
     t['sdm.devices.traits.ThermostatHvac']?.status,
     t['ThermostatHvac']?.status
-  ); // OFF/HEATING/COOLING (optional in each event)
+  ); // OFF/HEATING/COOLING (optional, not in every event)
 
   const hasFanTrait = Boolean(t['sdm.devices.traits.Fan'] || t['Fan']);
   const fanTimerMode = pick(
     t['sdm.devices.traits.Fan']?.timerMode,
     t['Fan']?.timerMode
-  ); // ON/OFF (optional)
+  ); // ON/OFF
   const fanTimerOn = pick(
     t['sdm.devices.traits.Fan']?.timerMode === 'ON',
     t['Fan']?.timerMode === 'ON'
@@ -127,7 +131,7 @@ function extractEffectiveTraits(evt) {
   };
 }
 
-/* --------------------------- Session Manager ---------------------------- */
+/* ============================== SESSIONS =============================== */
 
 class SessionManager {
   constructor() {
@@ -139,7 +143,7 @@ class SessionManager {
       this.byDevice.set(deviceId, {
         isRunning: false,
         startedAt: null,
-        startStatus: 'off',       // 'cool' | 'heat' | 'fan' | 'off'
+        startStatus: 'off', // 'cool' | 'heat' | 'fan' | 'off'
         lastTempC: null,
         lastAt: null,
         lastEquipmentStatus: 'off',
@@ -151,26 +155,22 @@ class SessionManager {
     return this.byDevice.get(deviceId);
   }
 
-  /**
-   * Decide if air is moving (active) and whether it's heat/cool/fan-only
-   * using explicit hvacStatus when available; otherwise inference.
-   */
   computeActiveAndStatus(input, prev) {
     const now = new Date(input.when).getTime();
 
     // Reachability
     const isReachable = input.connectivity !== 'OFFLINE';
 
-    // Fan running?
+    // Fan explicitly running?
     const isFanRunning = !!(input.hasFanTrait && (input.fanTimerMode === 'ON' || input.fanTimerOn === true));
 
-    // Explicit HVAC status wins
+    // Explicit HVAC status wins when present
     let hvacStatus = input.hvacStatusRaw || 'UNKNOWN'; // HEATING/COOLING/OFF/UNKNOWN
     let isHeating = hvacStatus === 'HEATING';
     let isCooling = hvacStatus === 'COOLING';
 
-    // If hvacStatus missing or unknown, infer from mode + setpoints + temperature trend
-    if (hvacStatus === 'UNKNOWN' || hvacStatus === undefined || hvacStatus === null) {
+    // Otherwise infer from mode + setpoints + temp trend
+    if (hvacStatus === 'UNKNOWN' || hvacStatus == null) {
       const inferred = inferHvacFromTemps(
         input.thermostatMode,
         input.currentTempC,
@@ -190,7 +190,7 @@ class SessionManager {
     // Air moving if heating or cooling or fan running
     const isActive = Boolean(isHeating || isCooling || isFanRunning);
 
-    // Determine overall “equipmentStatus” string and fanOnly flag
+    // Status string + fanOnly
     let equipmentStatus = 'off';
     let isFanOnly = false;
     if (isHeating) equipmentStatus = 'heat';
@@ -200,9 +200,8 @@ class SessionManager {
       isFanOnly = true;
     }
 
-    // Memory window to avoid instant collapse to OFF when traits are missing
+    // Short memory to avoid flapping to OFF when traits are sparse
     if (!isActive && prev.isRunning && prev.lastAt && now - prev.lastAt < RECENT_WINDOW_MS) {
-      // keep previous status briefly
       return {
         isReachable,
         isHvacActive: true,
@@ -211,27 +210,18 @@ class SessionManager {
       };
     }
 
-    return {
-      isReachable,
-      isHvacActive: isActive,
-      equipmentStatus,
-      isFanOnly,
-    };
+    return { isReachable, isHvacActive: isActive, equipmentStatus, isFanOnly };
   }
 
   process(input) {
     const prev = this.getPrev(input.deviceId);
     const now = new Date(input.when).getTime();
 
-    const {
-      isReachable,
-      isHvacActive,
-      equipmentStatus,
-      isFanOnly,
-    } = this.computeActiveAndStatus(input, prev);
+    const { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
+      this.computeActiveAndStatus(input, prev);
 
     const becameActive = !prev.isRunning && isHvacActive;
-    const becameIdle = prev.isRunning && !isHvacActive;
+    const becameIdle   =  prev.isRunning && !isHvacActive;
 
     // Start session
     if (becameActive) {
@@ -244,22 +234,16 @@ class SessionManager {
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
     if (becameIdle && prev.startedAt) {
-      let endAt = now;
-
-      // If we just flipped to idle but a fan tail is warranted (HVAC turned off),
-      // we still end the session now because air stopped (no fanTimer); if you want
-      // to extend tail while fan keeps running, it will be represented as 'fan' status.
-      const ms = Math.max(0, endAt - prev.startedAt);
+      const ms = Math.max(0, now - prev.startedAt);
       runtimeSeconds = Math.round(ms / 1000);
       isRuntimeEvent = true;
 
-      // Reset session
       prev.isRunning = false;
       prev.startedAt = null;
       prev.startStatus = 'off';
     }
 
-    // Persist “last” snapshot
+    // Persist last snapshot
     prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
     prev.lastAt = now;
     prev.lastEquipmentStatus = equipmentStatus || prev.lastEquipmentStatus;
@@ -267,49 +251,42 @@ class SessionManager {
     prev.lastReachable = isReachable;
     prev.lastRoom = input.roomDisplayName || prev.lastRoom;
 
-    // Return a normalized object the server can post to Bubble
     return {
       userId: input.userId || null,
       thermostatId: input.deviceId,
       deviceName: input.deviceName,
       roomDisplayName: input.roomDisplayName || '',
       timestampISO: new Date(now).toISOString(),
-      thermostatMode: input.thermostatMode || 'OFF',                 // OFF/HEAT/COOL/HEATCOOL
-      hvacMode: hvacModeFromEquipment(equipmentStatus),              // OFF/HEATING/COOLING/FAN
-      equipmentStatus,                                               // 'off' | 'heat' | 'cool' | 'fan'
+      thermostatMode: input.thermostatMode || 'OFF',      // OFF/HEAT/COOL/HEATCOOL
+      hvacMode: hvacModeFromEquipment(equipmentStatus),   // OFF/HEATING/COOLING/FAN
+      equipmentStatus,                                     // 'off'|'heat'|'cool'|'fan'
       isHvacActive,
       isFanOnly,
       isReachable,
       currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
       coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
       heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
-      // Runtime info
-      runtimeSeconds, // null while running; filled on session end
+      runtimeSeconds, // null while running; set on session end
       isRuntimeEvent,
-      // For convenience
       startTempC: prev.isRunning && prev.startedAt ? prev.lastTempC : null,
       endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
     };
   }
 
   toBubblePayload(result) {
-    // Convert °C to °F where needed
     const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
-    const payload = {
+    return {
       userId: result.userId,
       thermostatId: result.thermostatId,
       deviceName: result.deviceName || '',
       roomDisplayName: result.roomDisplayName || '',
-      // runtime
       runtimeSeconds: result.runtimeSeconds ?? 0,
       runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : 0,
       isRuntimeEvent: Boolean(result.isRuntimeEvent),
-      // modes/status
-      hvacMode: mapHvacModeForBubble(result.hvacMode), // 'HEATING'|'COOLING'|'FAN'|'OFF'
+      hvacMode: result.hvacMode || 'OFF', // 'HEATING'|'COOLING'|'FAN'|'OFF'
       isHvacActive: Boolean(result.isHvacActive),
       thermostatMode: result.thermostatMode,
       isReachable: Boolean(result.isReachable),
-      // temps
       currentTempF: c2f(result.currentTempC),
       coolSetpointF: c2f(result.coolSetpointC),
       heatSetpointF: c2f(result.heatSetpointC),
@@ -320,30 +297,26 @@ class SessionManager {
       heatSetpointC: result.heatSetpointC,
       startTempC: result.startTempC || 0,
       endTempC: result.endTempC,
-      // last flags (for parity with your logs)
       lastIsCooling: result.equipmentStatus === 'cool',
       lastIsHeating: result.equipmentStatus === 'heat',
       lastIsFanOnly: result.equipmentStatus === 'fan',
       lastEquipmentStatus: result.equipmentStatus,
       equipmentStatus: result.equipmentStatus,
       isFanOnly: result.isFanOnly,
-      // timestamps
       timestamp: result.timestampISO,
       eventId: genUuid(),
       eventTimestamp: Date.parse(result.timestampISO),
     };
-    return payload;
   }
 }
 
-/* --------------------------- Inference Logic ---------------------------- */
+/* ============================== INFERENCE ============================== */
 
 function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
   if (!isNum(currentC)) return 'OFF';
 
-  // Trend (previous -> current)
   const trendingDown = isNum(prevTempC) ? (prevTempC - currentC > TREND_DELTA) : false;
-  const trendingUp = isNum(prevTempC) ? (currentC - prevTempC > TREND_DELTA) : false;
+  const trendingUp   = isNum(prevTempC) ? (currentC - prevTempC > TREND_DELTA) : false;
 
   if (mode === 'COOL' || mode === 'HEATCOOL') {
     if (isNum(coolC)) {
@@ -360,7 +333,7 @@ function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
   return 'OFF';
 }
 
-/* ------------------------------ Utilities ------------------------------- */
+/* ============================== UTILITIES ============================== */
 
 function hvacModeFromEquipment(equipmentStatus) {
   switch ((equipmentStatus || 'off').toLowerCase()) {
@@ -371,30 +344,13 @@ function hvacModeFromEquipment(equipmentStatus) {
   }
 }
 
-function mapHvacModeForBubble(mode) {
-  // Already normalized above; keep as-is for Bubble logs compatibility
-  return mode || 'OFF';
-}
-
-function pick(...vals) {
-  for (const v of vals) {
-    if (v !== undefined && v !== null) return v;
-  }
-  return undefined;
-}
+function pick(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; return undefined; }
 function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
 function round2(n) { return Math.round(n * 100) / 100; }
 
 function genUuid() {
-  // simple RFC4122v4-ish; fine for event correlation
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
     const r = (Math.random()*16)|0, v = c === 'x' ? r : (r&0x3|0x8);
     return v.toString(16);
   });
 }
-
-module.exports = {
-  SessionManager,
-  parseSdmPushMessage,
-  extractEffectiveTraits,
-};
