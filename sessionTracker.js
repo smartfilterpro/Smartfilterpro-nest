@@ -5,10 +5,10 @@
  * Counts runtime any time air is moving: HEATING, COOLING, HEATCOOL (auto), or FAN-only.
  */
 
-const RECENT_WINDOW_MS = 120_000;  // memory window to avoid collapsing to OFF immediately
-const COOL_DELTA_ON = 0.3;         // °C above cool setpoint to infer active cooling
-const HEAT_DELTA_ON = 0.3;         // °C below heat setpoint to infer active heating
-const TREND_DELTA = 0.05;          // °C change indicating the temperature trend
+const RECENT_WINDOW_MS = 120_000;
+const COOL_DELTA_ON = 0.0;   // was 0.3
+const HEAT_DELTA_ON = 0.0;   // was 0.3
+const TREND_DELTA   = 0.03;  // was 0.05 (be a bit more sensitive to trend)
 
 /* ============================== PARSING ================================ */
 
@@ -272,8 +272,8 @@ class SessionManager {
       thermostatId: result.thermostatId,
       deviceName: result.deviceName || '',
       roomDisplayName: result.roomDisplayName || '',
-      runtimeSeconds: result.runtimeSeconds ?? 0,
-      runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : 0,
+      runtimeSeconds: result.runtimeSeconds, // null while running; number on session end
+      runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
       isRuntimeEvent: Boolean(result.isRuntimeEvent),
       hvacMode: result.hvacMode || 'OFF', // 'HEATING'|'COOLING'|'FAN'|'OFF'
       isHvacActive: Boolean(result.isHvacActive),
@@ -305,25 +305,36 @@ class SessionManager {
 /* ============================== INFERENCE ============================== */
 
 function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
-  if (!isNum(currentC)) return 'OFF';
+  const hasCurrent = isNum(currentC);
+  const hasPrev    = isNum(prevTempC);
+  const trendingDown = hasPrev && hasCurrent ? (prevTempC - currentC > TREND_DELTA) : false;
+  const trendingUp   = hasPrev && hasCurrent ? (currentC - prevTempC > TREND_DELTA) : false;
 
-  const trendingDown = isNum(prevTempC) ? (prevTempC - currentC > TREND_DELTA) : false;
-  const trendingUp   = isNum(prevTempC) ? (currentC - prevTempC > TREND_DELTA) : false;
+  // If we don't have current temp but do have a trendable previous sample, allow trend to infer
+  // (this helps right after re-link when Temperature trait is sparse)
+  const canUseTrendOnly = !hasCurrent && hasPrev;
 
   if (mode === 'COOL' || mode === 'HEATCOOL') {
-    if (isNum(coolC)) {
-      const above = currentC >= (coolC + COOL_DELTA_ON);
-      if (above || trendingDown) return 'COOLING';
+    if (isNum(coolC) && hasCurrent) {
+      const aboveOrAt = currentC >= (coolC + COOL_DELTA_ON);
+      if (aboveOrAt || trendingDown) return 'COOLING';
+    } else if (canUseTrendOnly && trendingDown) {
+      return 'COOLING';
     }
   }
+
   if (mode === 'HEAT' || mode === 'HEATCOOL') {
-    if (isNum(heatC)) {
-      const below = currentC <= (heatC - HEAT_DELTA_ON);
-      if (below || trendingUp) return 'HEATING';
+    if (isNum(heatC) && hasCurrent) {
+      const belowOrAt = currentC <= (heatC - HEAT_DELTA_ON);
+      if (belowOrAt || trendingUp) return 'HEATING';
+    } else if (canUseTrendOnly && trendingUp) {
+      return 'HEATING';
     }
   }
+
   return 'OFF';
 }
+
 
 /* ============================== UTILITIES ============================== */
 
