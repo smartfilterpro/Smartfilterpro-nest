@@ -1,327 +1,334 @@
-'use strict';
+const axios = require(‘axios’);
 
-/**
- * Session & inference logic for Nest SDM runtime tracking.
- * Counts runtime any time air is moving: HEATING, COOLING, HEATCOOL (auto), or FAN-only.
- */
+// —————– Config knobs —————–
+const MIN_POST_INTERVAL_MS = 60_000;  
+const TEMP_CHANGE_C_THRESHOLD = 0.1;  
+const SETPOINT_CHANGE_C_THRESHOLD = 0.1;  
+const HEARTBEAT_INTERVAL_MS = 10_000;  
+const MAX_RUNTIME_HOURS = 24;  
+const MIN_RUNTIME_SECONDS = 5;
 
-const RECENT_WINDOW_MS = 120_000;
-const COOL_DELTA_ON = 0.0;
-const HEAT_DELTA_ON = 0.0;
-const TREND_DELTA = 0.03;
-const FAN_TAIL_MS = Number(process.env.NEST_FAN_TAIL_MS || 30000);
+// Session storage
+const sessions = {};
+const deviceStates = {};
 
-const DEBUG = process.env.DEBUG === 'true' || process.env.NODE_ENV !== 'production';
-function log(...args) { if (DEBUG) console.log('[SessionTracker]', ...args); }
-function logWarn(...args) { console.warn('[SessionTracker WARN]', ...args); }
+function validateConfiguration() {
+const required = [‘BUBBLE_WEBHOOK_URL’];
+const missing = required.filter(key => !process.env[key]);
 
-/* ============================== PARSING ================================ */
+if (missing.length > 0) {
+throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+}
 
-function parseSdmPushMessage(body) {
-  try {
-    if (body && body.message && body.message.data) {
-      const json = Buffer.from(body.message.data, 'base64').toString('utf8');
-      log('Decoded Pub/Sub message:', json.substring(0, 200));
-      const parsed = JSON.parse(json);
+console.log(‘✅ Nest configuration validated’);
+}
 
-      const events = [];
-      const ru = parsed?.resourceUpdate;
-      if (ru && ru.name) {
-        events.push({
-          deviceName: ru.name,
-          traits: ru?.traits || {},
-          timestamp: parsed?.eventTime || new Date().toISOString(),
-        });
-        log(`Parsed event for device: ${ru.name}`);
-      } else {
-        logWarn('No resourceUpdate found in message');
-      }
-      return { events, userId: null, projectId: parsed?.userId || null, structureId: null };
-    }
+validateConfiguration();
 
-    if (body && body.resourceUpdate) {
-      log('Direct JSON format detected');
-      return parseSdmPushMessage({ message: { data: Buffer.from(JSON.stringify(body)).toString('base64') } });
-    }
+function toTimestamp(dateStr) {
+if (!dateStr || typeof dateStr !== ‘string’) {
+console.warn(‘⚠️ Invalid timestamp string:’, dateStr);
+return Date.now();
+}
 
-    if (Array.isArray(body?.events)) {
-      log(`Already-normalized format with ${body.events.length} events`);
-      return { events: body.events, userId: body.userId || null, projectId: null, structureId: null };
-    }
+const timestamp = new Date(dateStr).getTime();
+if (isNaN(timestamp)) {
+console.warn(‘⚠️ Could not parse timestamp:’, dateStr);
+return Date.now();
+}
 
-    logWarn('Unrecognized message format');
-  } catch (e) {
-    logWarn('parseSdmPushMessage failed:', e.message);
+return timestamp;
+}
+
+function celsiusToFahrenheit(celsius) {
+if (celsius == null || !Number.isFinite(celsius)) {
+return null;
+}
+return Math.round((celsius * 9/5) + 32);
+}
+
+async function sendToBubble(payload, retryCount = 0) {
+const maxRetries = 3;
+const retryDelay = Math.min(1000 * Math.pow(2, retryCount), 10000);
+
+try {
+if (!payload || typeof payload !== ‘object’) {
+console.error(‘❌ Invalid payload for Bubble:’, payload);
+return false;
+}
+
+```
+const response = await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+  timeout: 15000,
+  headers: {
+    'Content-Type': 'application/json',
+    ...(process.env.BUBBLE_API_KEY ? { 'Authorization': `Bearer ${process.env.BUBBLE_API_KEY}` } : {})
   }
-  return null;
+});
+
+console.log('✅ Sent to Bubble:', {
+  deviceId: payload.thermostatId,
+  isRuntimeEvent: payload.isRuntimeEvent,
+  currentTempF: payload.currentTempF,
+  hvacMode: payload.hvacMode,
+  runtimeSeconds: payload.runtimeSeconds
+});
+return true;
+```
+
+} catch (err) {
+console.error(‘❌ Failed to send to Bubble:’, {
+deviceId: payload.thermostatId,
+error: err.response?.data || err.message,
+status: err.response?.status,
+code: err.code
+});
+
+```
+if (retryCount < maxRetries) {
+  console.log(`🔄 Retrying in ${retryDelay}ms...`);
+  await new Promise(r => setTimeout(r, retryDelay));
+  return sendToBubble(payload, retryCount + 1);
 }
 
-function extractEffectiveTraits(evt) {
-  const deviceName = evt.deviceName || '';
-  const deviceId = deviceName.split('/devices/')[1] || deviceName;
-  const t = evt.traits || {};
+return false;
+```
 
-  const thermostatMode = pick(t['sdm.devices.traits.ThermostatMode']?.mode, t['ThermostatMode']?.mode);
-  const hvacStatusRaw = pick(t['sdm.devices.traits.ThermostatHvac']?.status, t['ThermostatHvac']?.status);
-
-  const hasFanTrait = Boolean(t['sdm.devices.traits.Fan'] || t['Fan']);
-  const fanTimerMode = pick(t['sdm.devices.traits.Fan']?.timerMode, t['Fan']?.timerMode);
-  const fanTimerOn = pick(t['sdm.devices.traits.Fan']?.timerMode === 'ON', t['Fan']?.timerMode === 'ON');
-
-  const currentTempC = pick(t['sdm.devices.traits.Temperature']?.ambientTemperatureCelsius, t['Temperature']?.ambientTemperatureCelsius);
-  const coolSetpointC = pick(t['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius, t['ThermostatTemperatureSetpoint']?.coolCelsius);
-  const heatSetpointC = pick(t['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius, t['ThermostatTemperatureSetpoint']?.heatCelsius);
-
-  const connectivity = pick(t['sdm.devices.traits.Connectivity']?.status, t['Connectivity']?.status);
-  const roomDisplayName = pick(t['sdm.devices.traits.Room']?.name, t['Room']?.name);
-  const timestamp = evt.timestamp || new Date().toISOString();
-
-  const extracted = {
-    deviceId, deviceName, thermostatMode, hvacStatusRaw,
-    hasFanTrait, fanTimerMode, fanTimerOn,
-    currentTempC: isNum(currentTempC) ? round2(currentTempC) : null,
-    coolSetpointC: isNum(coolSetpointC) ? round2(coolSetpointC) : null,
-    heatSetpointC: isNum(heatSetpointC) ? round2(heatSetpointC) : null,
-    connectivity, roomDisplayName, timestamp,
-  };
-
-  log(`Traits for ${deviceId}: mode=${thermostatMode} hvac=${hvacStatusRaw} temp=${extracted.currentTempC}°C fan=${fanTimerMode}`);
-  return extracted;
+}
 }
 
-/* ============================== SESSIONS =============================== */
+function makeKey(userId, deviceId) {
+return `${userId}-${deviceId}`;
+}
 
-class SessionManager {
-  constructor() { this.byDevice = new Map(); }
+// DEEP OBJECT EXPLORER
+function exploreObject(obj, path = ‘’, maxDepth = 5, currentDepth = 0) {
+if (currentDepth >= maxDepth || obj === null || obj === undefined) {
+return;
+}
 
-  getPrev(deviceId) {
-    if (!this.byDevice.has(deviceId)) {
-      log(`Initializing state for device: ${deviceId}`);
-      this.byDevice.set(deviceId, {
-        isRunning: false, startedAt: null, startStatus: 'off',
-        lastTempC: null, lastAt: null, lastEquipmentStatus: 'off',
-        lastMode: 'OFF', lastReachable: true, lastRoom: '', tailUntil: 0,
+if (typeof obj === ‘object’ && !Array.isArray(obj)) {
+for (const [key, value] of Object.entries(obj)) {
+const newPath = path ? `${path}.${key}` : key;
+console.log(`  ${' '.repeat(currentDepth * 2)}${newPath}: ${typeof value} = ${JSON.stringify(value)}`);
+
+```
+  if (typeof value === 'object' && value !== null) {
+    exploreObject(value, newPath, maxDepth, currentDepth + 1);
+  }
+}
+```
+
+} else if (Array.isArray(obj)) {
+console.log(`  ${' '.repeat(currentDepth * 2)}${path}: Array[${obj.length}]`);
+obj.forEach((item, index) => {
+const newPath = `${path}[${index}]`;
+console.log(`  ${' '.repeat((currentDepth + 1) * 2)}${newPath}: ${typeof item} = ${JSON.stringify(item)}`);
+if (typeof item === ‘object’ && item !== null) {
+exploreObject(item, newPath, maxDepth, currentDepth + 2);
+}
+});
+}
+}
+
+// FIND ALL TEMPERATURE-RELATED FIELDS
+function findTemperatureFields(obj, path = ‘’) {
+const tempFields = [];
+
+function search(current, currentPath) {
+if (current === null || current === undefined) return;
+
+```
+if (typeof current === 'object') {
+  for (const [key, value] of Object.entries(current)) {
+    const newPath = currentPath ? `${currentPath}.${key}` : key;
+    
+    // Check if this could be a temperature field
+    if (key.toLowerCase().includes('temp') || 
+        key.toLowerCase().includes('celsius') || 
+        key.toLowerCase().includes('fahrenheit') ||
+        (typeof value === 'number' && value > -50 && value < 50)) {
+      tempFields.push({
+        path: newPath,
+        key: key,
+        value: value,
+        type: typeof value
       });
     }
-    return this.byDevice.get(deviceId);
+    
+    if (typeof value === 'object' && value !== null) {
+      search(value, newPath);
+    }
   }
+}
+```
 
-  getDebugState(deviceId) {
-    if (deviceId) return this.byDevice.get(deviceId) || null;
-    const out = {}; for (const [k,v] of this.byDevice.entries()) out[k]=v; return out;
-  }
+}
 
-  computeActiveAndStatus(input, prev, now) {
-    log('RAW INPUT', JSON.stringify({
-      deviceId: input.deviceId, when: input.when, thermostatMode: input.thermostatMode,
-      hvacStatusRaw: input.hvacStatusRaw, hasFanTrait: input.hasFanTrait,
-      fanTimerMode: input.fanTimerMode, fanTimerOn: input.fanTimerOn,
-      currentTempC: input.currentTempC, coolSetpointC: input.coolSetpointC,
-      heatSetpointC: input.heatSetpointC, connectivity: input.connectivity
-    }, null, 2));
+search(obj, path);
+return tempFields;
+}
 
-    const isReachable = input.connectivity !== 'OFFLINE';
-    const isFanRunning = !!(input.hasFanTrait && (input.fanTimerMode === 'ON' || input.fanTimerOn === true));
+// MAIN EVENT HANDLER WITH COMPREHENSIVE LOGGING
+async function handleEvent(eventData) {
+console.log(’\n’ + ‘═’.repeat(100));
+console.log(`🔵 Processing Nest event: ${eventData.eventId || 'no-event-id'}`);
+console.log(‘═’.repeat(100));
 
-    let hvacStatus = input.hvacStatusRaw || 'UNKNOWN';
-    let isHeating = hvacStatus === 'HEATING';
-    let isCooling = hvacStatus === 'COOLING';
+// STEP 1: LOG THE COMPLETE RAW EVENT
+console.log(‘📥 COMPLETE RAW EVENT DATA:’);
+console.log(‘─’.repeat(80));
+try {
+console.log(JSON.stringify(eventData, null, 2));
+} catch (e) {
+console.log(‘❌ Could not stringify event data:’, e.message);
+console.log(‘Direct log:’);
+console.log(eventData);
+}
 
-    if (hvacStatus === 'UNKNOWN' || hvacStatus == null) {
-      const inferred = inferHvacFromTemps(input.thermostatMode, input.currentTempC, input.coolSetpointC, input.heatSetpointC, prev.lastTempC);
-      log(`INFER: mode=${input.thermostatMode} current=${input.currentTempC}C cool=${input.coolSetpointC}C heat=${input.heatSetpointC}C prev=${prev.lastTempC}C → ${inferred}`);
-      if (inferred === 'HEATING' || inferred === 'COOLING') {
-        hvacStatus = inferred; isHeating = inferred === 'HEATING'; isCooling = inferred === 'COOLING';
-      } else { hvacStatus = 'OFF'; }
-    }
+// STEP 2: EXPLORE THE OBJECT STRUCTURE
+console.log(’\n🔍 OBJECT STRUCTURE EXPLORATION:’);
+console.log(‘─’.repeat(80));
+exploreObject(eventData);
 
-    const isActive = Boolean(isHeating || isCooling || isFanRunning);
+// STEP 3: FIND ALL TEMPERATURE-LIKE FIELDS
+console.log(’\n🌡️ TEMPERATURE FIELD SEARCH:’);
+console.log(‘─’.repeat(80));
+const tempFields = findTemperatureFields(eventData);
+if (tempFields.length > 0) {
+console.log(‘Found potential temperature fields:’);
+tempFields.forEach(field => {
+console.log(`  - ${field.path}: ${field.value} (${field.type})`);
+});
+} else {
+console.log(‘❌ No temperature-like fields found!’);
+}
 
-    let equipmentStatus = 'off', isFanOnly = false;
-    if (isHeating) equipmentStatus = 'heat';
-    if (isCooling) equipmentStatus = 'cool';
-    if (!isHeating && !isCooling && isFanRunning) { equipmentStatus = 'fan'; isFanOnly = true; }
+// STEP 4: CHECK ALL POSSIBLE TRAIT LOCATIONS
+console.log(’\n🔍 TRAIT LOCATION CHECK:’);
+console.log(‘─’.repeat(80));
 
-    const hasExplicitOff = input.hvacStatusRaw === 'OFF';
-    const hasExplicitMode = input.thermostatMode != null && input.thermostatMode !== undefined;
+const traitPaths = [
+‘resourceUpdate.traits’,
+‘traits’,
+‘data.traits’,
+‘resourceUpdate.data.traits’,
+‘device.traits’,
+‘update.traits’
+];
 
-    if (!isActive && !hasExplicitOff && prev.isRunning && prev.lastAt && now - prev.lastAt < RECENT_WINDOW_MS) {
-      if (hasExplicitMode && input.thermostatMode === 'OFF') {
-        log('SMOOTHING: explicit mode OFF → not maintaining');
-      } else {
-        log(`SMOOTHING: within ${RECENT_WINDOW_MS}ms window, maintain previous status=${prev.lastEquipmentStatus}`);
-        return { isReachable, isHvacActive: true, equipmentStatus: prev.lastEquipmentStatus, isFanOnly: prev.lastEquipmentStatus === 'fan' };
-      }
-    }
+let foundTraits = null;
+let traitsPath = null;
 
-    log(`DECISION: reachable=${isReachable} active=${isActive} hvac=${hvacStatus} equip=${equipmentStatus} fanOnly=${isFanOnly} fanTimer=${input.fanTimerMode}`);
-    return { isReachable, isHvacActive: isActive, equipmentStatus, isFanOnly };
-  }
+for (const path of traitPaths) {
+const parts = path.split(’.’);
+let current = eventData;
 
-  process(input) {
-    const prev = this.getPrev(input.deviceId);
-    const now = new Date(input.when).toISOString();
-    const nowMs = Date.parse(now);
-
-    log(`\n=== PROCESS ${input.deviceId} @ ${now} ===`);
-    log(`PREV: running=${prev.isRunning} startedAt=${prev.startedAt ? new Date(prev.startedAt).toISOString() : '—'} last=${prev.lastEquipmentStatus} tailUntil=${prev.tailUntil > 0 ? new Date(prev.tailUntil).toISOString() : '—'}`);
-
-    let { isReachable, isHvacActive, equipmentStatus, isFanOnly } = this.computeActiveAndStatus(input, prev, nowMs);
-
-    const baseActive = isHvacActive;
-    const becameIdle = prev.isRunning && !baseActive;
-
-    let runtimeSeconds = null, isRuntimeEvent = false, endedStatus = null;
-
-    if (becameIdle && prev.startedAt) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      runtimeSeconds = Math.round(ms / 1000); isRuntimeEvent = true; endedStatus = prev.startStatus;
-      log(`🔴 END: ${prev.startStatus} ran ${runtimeSeconds}s`);
-      prev.isRunning = false; prev.startedAt = null; prev.startStatus = 'off';
-    }
-
-    let tailActive = false;
-    if (!baseActive) {
-      const justEndedHeatOrCool = isRuntimeEvent && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
-      const fanExplicit = (equipmentStatus === 'fan' || isFanOnly);
-
-      if (justEndedHeatOrCool && !fanExplicit && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
-        prev.tailUntil = nowMs + FAN_TAIL_MS; log(`⏱️ TAIL scheduled → ${new Date(prev.tailUntil).toISOString()} (+${FAN_TAIL_MS}ms)`);
-      }
-
-      if (prev.tailUntil > 0 && nowMs < prev.tailUntil) {
-        log(`🌀 TAIL active: remain 'fan' (${prev.tailUntil - nowMs}ms left)`);
-        isHvacActive = true; equipmentStatus = 'fan'; isFanOnly = true; tailActive = true;
-      } else if (prev.tailUntil > 0 && nowMs >= prev.tailUntil) {
-        log('✓ TAIL expired'); prev.tailUntil = 0;
-      }
-    } else if (prev.tailUntil > 0) {
-      log('✓ Cancel TAIL (equipment became active)'); prev.tailUntil = 0;
-    }
-
-    const fanExplicit = (equipmentStatus === 'fan' || isFanOnly) && input.hasFanTrait && (input.fanTimerMode === 'ON' || input.fanTimerOn === true);
-    const becameActive = !prev.isRunning && isHvacActive && !(tailActive && !fanExplicit);
-
-    if (becameActive) {
-      log(`🟢 START: ${equipmentStatus}`);
-      prev.isRunning = true; prev.startedAt = nowMs; prev.startStatus = equipmentStatus;
-    }
-
-    prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
-    prev.lastAt = nowMs;
-    prev.lastEquipmentStatus = equipmentStatus || prev.lastEquipmentStatus;
-    prev.lastMode = input.thermostatMode || prev.lastMode;
-    prev.lastReachable = isReachable;
-    prev.lastRoom = input.roomDisplayName || prev.lastRoom;
-
-    const hvacMode = hvacModeFromEquipment(equipmentStatus);
-    const exportedActive = isHvacActive && !(tailActive && !fanExplicit);
-
-    return {
-      userId: input.userId || null,
-      thermostatId: input.deviceId,
-      deviceName: input.deviceName,
-      roomDisplayName: input.roomDisplayName || '',
-      timestampISO: now,
-      thermostatMode: input.thermostatMode || 'OFF',
-      hvacMode, equipmentStatus,
-      isHvacActive: exportedActive,
-      isFanOnly, isReachable,
-      currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-      coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
-      heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
-      runtimeSeconds, isRuntimeEvent, endedStatus,
-      startTempC: prev.isRunning && prev.startedAt ? prev.lastTempC : null,
-      endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-    };
-  }
-
-  toBubblePayload(result) {
-    const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
-    const reportEquip = result.isRuntimeEvent && result.endedStatus ? result.endedStatus : result.equipmentStatus;
-    const reportMode = hvacModeFromEquipment(reportEquip);
-
-    return {
-      userId: result.userId,
-      thermostatId: result.thermostatId,
-      deviceName: result.deviceName || '',
-      roomDisplayName: result.roomDisplayName || '',
-      runtimeSeconds: result.runtimeSeconds,
-      runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
-      isRuntimeEvent: Boolean(result.isRuntimeEvent),
-      hvacMode: reportMode,
-      operatingState: reportEquip,
-      isHvacActive: Boolean(result.isHvacActive),
-      thermostatMode: result.thermostatMode,
-      isReachable: Boolean(result.isReachable),
-      currentTempF: c2f(result.currentTempC),
-      coolSetpointF: c2f(result.coolSetpointC),
-      heatSetpointF: c2f(result.heatSetpointC),
-      startTempF: c2f(result.startTempC) || 0,
-      endTempF: c2f(result.endTempC),
-      currentTempC: result.currentTempC,
-      coolSetpointC: result.coolSetpointC,
-      heatSetpointC: result.heatSetpointC,
-      startTempC: result.startTempC || 0,
-      endTempC: result.endTempC,
-      lastIsCooling: reportEquip === 'cool',
-      lastIsHeating: reportEquip === 'heat',
-      lastIsFanOnly: reportEquip === 'fan',
-      lastEquipmentStatus: reportEquip,
-      equipmentStatus: reportEquip,
-      isFanOnly: result.isFanOnly,
-      timestamp: result.timestampISO,
-      eventId: genUuid(),
-      eventTimestamp: Date.parse(result.timestampISO),
-    };
+```
+for (const part of parts) {
+  if (current && typeof current === 'object' && part in current) {
+    current = current[part];
+  } else {
+    current = null;
+    break;
   }
 }
 
-/* ============================== INFERENCE ============================== */
+if (current && typeof current === 'object') {
+  console.log(`✅ Found traits at: ${path}`);
+  console.log('Available trait keys:', Object.keys(current));
+  foundTraits = current;
+  traitsPath = path;
+  break;
+} else {
+  console.log(`❌ No traits found at: ${path}`);
+}
+```
 
-function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
-  const hasCurrent = isNum(currentC);
-  const hasPrev = isNum(prevTempC);
-  const trendingDown = hasPrev && hasCurrent ? (prevTempC - currentC > TREND_DELTA) : false;
-  const trendingUp = hasPrev && hasCurrent ? (currentC - prevTempC > TREND_DELTA) : false;
-
-  const canUseTrendOnly = !hasCurrent && hasPrev;
-
-  if (mode === 'COOL' || mode === 'HEATCOOL') {
-    if (isNum(coolC) && hasCurrent) {
-      const aboveOrAt = currentC >= (coolC + COOL_DELTA_ON);
-      if (aboveOrAt || trendingDown) return 'COOLING';
-    } else if (canUseTrendOnly && trendingDown) {
-      return 'COOLING';
-    }
-  }
-
-  if (mode === 'HEAT' || mode === 'HEATCOOL') {
-    if (isNum(heatC) && hasCurrent) {
-      const belowOrAt = currentC <= (heatC - HEAT_DELTA_ON);
-      if (belowOrAt || trendingUp) return 'HEATING';
-    } else if (canUseTrendOnly && trendingUp) {
-      return 'HEATING';
-    }
-  }
-
-  return 'OFF';
 }
 
-/* ============================== UTILITIES ============================== */
+// STEP 5: EXAMINE TRAITS IN DETAIL
+if (foundTraits) {
+console.log(`\n🔍 DETAILED TRAITS ANALYSIS (from ${traitsPath}):`);
+console.log(‘─’.repeat(80));
 
-function hvacModeFromEquipment(equipmentStatus) {
-  switch ((equipmentStatus || 'off').toLowerCase()) {
-    case 'heat': return 'HEATING';
-    case 'cool': return 'COOLING';
-    case 'fan': return 'FAN';
-    default: return 'OFF';
+```
+for (const [traitName, traitData] of Object.entries(foundTraits)) {
+  console.log(`\nTrait: ${traitName}`);
+  console.log(`Data:`, JSON.stringify(traitData, null, 2));
+  
+  // Look for temperature data in this trait
+  if (traitData && typeof traitData === 'object') {
+    const traitTempFields = findTemperatureFields(traitData, traitName);
+    if (traitTempFields.length > 0) {
+      console.log('🌡️ Temperature fields in this trait:');
+      traitTempFields.forEach(field => {
+        console.log(`  - ${field.path}: ${field.value}`);
+      });
+    }
   }
 }
-function pick(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; }
-function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
-function round2(n) { return Math.round(n * 100) / 100; }
-function genUuid() { return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => ((c==='x')? (Math.random()*16|0) : ((Math.random()*16|0)&0x3|0x8)).toString(16)); }
+```
 
-/* ============================== EXPORTS ================================ */
-module.exports = { SessionManager, parseSdmPushMessage, extractEffectiveTraits };
+}
+
+// STEP 6: TRY STANDARD EXTRACTION (ORIGINAL CODE)
+console.log(’\n🔍 STANDARD EXTRACTION ATTEMPT:’);
+console.log(‘─’.repeat(80));
+
+const userId = eventData.userId;
+const resourceUpdate = eventData.resourceUpdate;
+const deviceName = resourceUpdate?.name;
+const traits = resourceUpdate?.traits;
+const timestampIso = eventData.timestamp;
+
+console.log(‘Basic fields:’);
+console.log(`- userId: ${userId}`);
+console.log(`- deviceName: ${deviceName}`);
+console.log(`- timestamp: ${timestampIso}`);
+console.log(`- has resourceUpdate: ${!!resourceUpdate}`);
+console.log(`- has traits: ${!!traits}`);
+
+if (traits) {
+const hvacTrait = traits[‘sdm.devices.traits.ThermostatHvac’];
+const tempTrait = traits[‘sdm.devices.traits.Temperature’];
+const setpointTrait = traits[‘sdm.devices.traits.ThermostatTemperatureSetpoint’];
+const modeTrait = traits[‘sdm.devices.traits.ThermostatMode’];
+
+```
+console.log('\nTrait extraction:');
+console.log(`- ThermostatHvac: ${JSON.stringify(hvacTrait)}`);
+console.log(`- Temperature: ${JSON.stringify(tempTrait)}`);
+console.log(`- ThermostatTemperatureSetpoint: ${JSON.stringify(setpointTrait)}`);
+console.log(`- ThermostatMode: ${JSON.stringify(modeTrait)}`);
+
+const hvacStatus = hvacTrait?.status;
+const currentTemp = tempTrait?.ambientTemperatureCelsius;
+const coolSetpoint = setpointTrait?.coolCelsius;
+const heatSetpoint = setpointTrait?.heatCelsius;
+const mode = modeTrait?.mode;
+
+console.log('\nExtracted values:');
+console.log(`- hvacStatus: ${hvacStatus}`);
+console.log(`- currentTemp: ${currentTemp}`);
+console.log(`- coolSetpoint: ${coolSetpoint}`);
+console.log(`- heatSetpoint: ${heatSetpoint}`);
+console.log(`- mode: ${mode}`);
+
+// CONTINUE WITH THE REST OF YOUR LOGIC HERE...
+// For now, let's just focus on getting the raw data
+```
+
+}
+
+console.log(‘═’.repeat(100));
+console.log(‘🔵 END OF RAW EVENT ANALYSIS’);
+console.log(‘═’.repeat(100) + ‘\n’);
+
+// Don’t actually process the event yet - just log everything
+console.log(‘⏸️ Event processing paused for analysis’);
+}
+
+module.exports = {
+handleEvent
+};
