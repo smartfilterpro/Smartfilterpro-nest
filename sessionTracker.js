@@ -211,17 +211,28 @@ class SessionManager {
       isFanOnly = true;
     }
 
-    // Short memory to avoid flapping to OFF when traits are sparse
-    if (!isActive && prev.isRunning && prev.lastAt && now - prev.lastAt < RECENT_WINDOW_MS) {
-      log(`Within recent window (${now - prev.lastAt}ms), maintaining: ${prev.lastEquipmentStatus}`);
-      return {
-        isReachable,
-        isHvacActive: true,
-        equipmentStatus: prev.lastEquipmentStatus,
-        isFanOnly: prev.lastEquipmentStatus === 'fan',
-      };
+    // CRITICAL: Only use recent window if we have truly ambiguous/missing data
+    // If we have explicit OFF status from Google, always trust it
+    const hasExplicitOff = input.hvacStatusRaw === 'OFF';
+    const hasExplicitMode = input.thermostatMode != null && input.thermostatMode !== undefined;
+    
+    // Only maintain previous state if data is truly sparse AND not explicitly off
+    if (!isActive && !hasExplicitOff && prev.isRunning && prev.lastAt && now - prev.lastAt < RECENT_WINDOW_MS) {
+      // But don't maintain if mode switched to OFF
+      if (hasExplicitMode && input.thermostatMode === 'OFF') {
+        log(`Mode explicitly OFF, ending session despite recent window`);
+      } else {
+        log(`Within recent window (${now - prev.lastAt}ms), maintaining: ${prev.lastEquipmentStatus}`);
+        return {
+          isReachable,
+          isHvacActive: true,
+          equipmentStatus: prev.lastEquipmentStatus,
+          isFanOnly: prev.lastEquipmentStatus === 'fan',
+        };
+      }
     }
 
+    log(`State: active=${isActive} status=${equipmentStatus} hvacStatus=${hvacStatus} mode=${input.thermostatMode}`);
     return { isReachable, isHvacActive: isActive, equipmentStatus, isFanOnly };
   }
 
