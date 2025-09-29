@@ -1,10 +1,9 @@
 'use strict';
 
 /**
- * Nest SDM runtime tracker server
- * - Counts runtime whenever air is moving (heating, cooling, heatcool, or fan-only)
- * - Inference when ThermostatHvac.status is missing (mode + setpoints + temp trend, or explicit Fan trait)
- * - Posts to Bubble on each event; runtimeSeconds=null while running; non-zero on session end
+ * Nest SDM runtime tracker (server/controller)
+ * - Accepts Google SDM Pub/Sub pushes at /webhook and /nest/events
+ * - Uses SessionManager for state/inference and posts normalized payloads to Bubble
  */
 
 const express = require('express');
@@ -18,15 +17,13 @@ const {
   extractEffectiveTraits,
 } = require('./sessionTracker');
 
-/* ---------------------------- Config & Setup ---------------------------- */
+/* ============================== CONFIG ================================= */
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// Bubble endpoint (required)
 const BUBBLE_THERMOSTAT_UPDATES_URL = (process.env.BUBBLE_THERMOSTAT_UPDATES_URL || '').trim();
 
-// Optional Postgres (enable with ENABLE_DATABASE=1 and set DATABASE_URL)
 const ENABLE_DATABASE = process.env.ENABLE_DATABASE === '1';
 const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
 let pool = null;
@@ -43,7 +40,12 @@ app.use(express.json({ limit: '2mb' }));
 // Single in-memory session manager
 const sessions = new SessionManager();
 
-/* -------------------------- Helpers: Bubble Post ------------------------ */
+/* ============================== HELPERS ================================ */
+
+function short(id = '') {
+  if (typeof id !== 'string') return '';
+  return id.length <= 8 ? id : `${id.slice(0, 4)}…${id.slice(-4)}`;
+}
 
 async function postToBubble(payload) {
   if (!BUBBLE_THERMOSTAT_UPDATES_URL) {
@@ -61,55 +63,51 @@ async function postToBubble(payload) {
   }
 }
 
-/* ------------------------------ Routes --------------------------------- */
+/* ================================ ROUTES =============================== */
 
-/**
- * Health
- */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-/**
- * Google SDM Pub/Sub push endpoint
- * - Google Pub/Sub pushes JSON: { message: { data: base64, messageId, attributes }, subscription }
- * - The base64 decodes to SDM event JSON containing resourceUpdate(s)
- */
-app.post('/nest/events', async (req, res) => {
+// Accept both historical and new endpoints to avoid Pub/Sub misconfig issues
+app.post(['/webhook', '/nest/events'], async (req, res) => {
+  // Clear ingress log so you can confirm pushes are arriving
   try {
+    console.log(
+      '[INGRESS]',
+      req.get('x-cloud-trace-context') || req.get('x-forwarded-for') || 'push',
+      '→',
+      req.originalUrl
+    );
+
     const decoded = parseSdmPushMessage(req.body);
     if (!decoded) {
-      console.warn('[WARN] Could not parse SDM push body; echoing 204');
+      console.warn('[WARN] Could not parse SDM push body; 204');
       return res.status(204).end();
     }
 
-    // Handle each resourceUpdate (most pushes have 1)
     for (const evt of decoded.events) {
       const traits = extractEffectiveTraits(evt);
 
-      // Build a normalized input for the session layer
       const input = {
-        userId: decoded.userId || null, // optional; set via env/project mapping if needed
+        userId: decoded.userId || null,
         projectId: decoded.projectId || null,
         structureId: decoded.structureId || null,
-        deviceId: traits.deviceId, // stable Nest SDM device id
-        deviceName: traits.deviceName, // full resource path
+        deviceId: traits.deviceId,
+        deviceName: traits.deviceName,
         roomDisplayName: traits.roomDisplayName || '',
-        when: traits.timestamp, // Date ISO
-        // raw traits we use
-        thermostatMode: traits.thermostatMode,           // HEAT/COOL/HEATCOOL/OFF
-        hvacStatusRaw: traits.hvacStatusRaw,             // HEATING/COOLING/OFF (if provided)
+        when: traits.timestamp,
+        thermostatMode: traits.thermostatMode,   // OFF/HEAT/COOL/HEATCOOL
+        hvacStatusRaw: traits.hvacStatusRaw,     // HEATING/COOLING/OFF (optional)
         hasFanTrait: traits.hasFanTrait,
-        fanTimerMode: traits.fanTimerMode,               // ON/OFF (if provided)
-        fanTimerOn: traits.fanTimerOn,                   // boolean, if provided
+        fanTimerMode: traits.fanTimerMode,
+        fanTimerOn: traits.fanTimerOn,
         currentTempC: traits.currentTempC,
         coolSetpointC: traits.coolSetpointC,
         heatSetpointC: traits.heatSetpointC,
-        connectivity: traits.connectivity,               // ONLINE/OFFLINE/UNKNOWN
+        connectivity: traits.connectivity,       // ONLINE/OFFLINE/UNKNOWN
       };
 
-      // Process through the session manager (this decides active vs idle and session transitions)
       const result = sessions.process(input);
 
-      // Persist (optional)
       if (ENABLE_DATABASE && pool) {
         try {
           await pool.query(
@@ -134,11 +132,9 @@ app.post('/nest/events', async (req, res) => {
         }
       }
 
-      // Format Bubble payload, post
       const bubblePayload = sessions.toBubblePayload(result);
       const postResp = await postToBubble(bubblePayload);
 
-      // Log concise summary
       console.log(
         `[POST] device=${short(input.deviceId)} active=${result.isHvacActive} ` +
         `mode=${result.thermostatMode} status=${result.equipmentStatus} ` +
@@ -150,23 +146,16 @@ app.post('/nest/events', async (req, res) => {
       }
     }
 
-    // ACK to Pub/Sub quickly
     return res.status(204).end();
   } catch (err) {
-    console.error('[ERROR] /nest/events handler:', err?.message);
-    return res.status(204).end(); // Pub/Sub expects 2xx to ack; avoid redelivery storms
+    console.error('[ERROR] /webhook|/nest/events:', err?.message);
+    return res.status(204).end(); // ack to avoid redelivery storms
   }
 });
 
-/* ------------------------------- Start ---------------------------------- */
+/* ================================ START ================================ */
 
 app.listen(PORT, () => {
   console.log(`Nest runtime server listening on :${PORT}`);
+  console.log('Ready to receive Nest SDM pushes at /webhook and /nest/events');
 });
-
-/* ----------------------------- Utilities -------------------------------- */
-
-function short(id = '') {
-  if (typeof id !== 'string') return '';
-  return id.length <= 8 ? id : `${id.slice(0, 4)}…${id.slice(-4)}`;
-}
