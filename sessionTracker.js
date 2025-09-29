@@ -247,15 +247,35 @@ class SessionManager {
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev, now);
 
-    // ═══ FAN TAIL LOGIC ═══
-    // If we appear idle but recently stopped heating/cooling, add a fan purge tail
-    if (!isHvacActive) {
-      const justStoppedHeatOrCool = prev.isRunning &&
-        (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
+    // ═══ SESSION TRANSITIONS (before fan tail logic) ═══
+    // Check if session should end based on base state (before tail modifies it)
+    const baseActive = isHvacActive; // save the base state
+    const becameIdle = prev.isRunning && !baseActive;
+    
+    let runtimeSeconds = null;
+    let isRuntimeEvent = false;
+
+    // End session FIRST if equipment stopped
+    if (becameIdle && prev.startedAt) {
+      const ms = Math.max(0, now - prev.startedAt);
+      runtimeSeconds = Math.round(ms / 1000);
+      isRuntimeEvent = true;
+      log(`🔴 Session ENDED: ${prev.startStatus} ran for ${runtimeSeconds}s (${Math.round(runtimeSeconds / 60)}min)`);
+
+      prev.isRunning = false;
+      prev.startedAt = null;
+      prev.startStatus = 'off';
+      // Don't clear tailUntil yet - we're about to schedule it
+    }
+
+    // ═══ FAN TAIL LOGIC (after session end) ═══
+    // If we just ended a heat/cool session, add a fan purge tail
+    if (!baseActive) {
+      const justEndedHeatOrCool = isRuntimeEvent && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       const fanExplicitlyRunning = (equipmentStatus === 'fan' || isFanOnly);
 
       // Schedule tail if we just ended heat/cool and fan trait isn't explicitly running
-      if (justStoppedHeatOrCool && !fanExplicitlyRunning && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
+      if (justEndedHeatOrCool && !fanExplicitlyRunning && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = now + FAN_TAIL_MS;
         log(`⏱️ Scheduled fan tail until ${new Date(prev.tailUntil).toISOString()} (+${FAN_TAIL_MS}ms)`);
       }
@@ -280,31 +300,13 @@ class SessionManager {
       }
     }
 
-    // ═══ SESSION TRANSITIONS ═══
+    // Check for new session start (after tail logic)
     const becameActive = !prev.isRunning && isHvacActive;
-    const becameIdle = prev.isRunning && !isHvacActive;
-
-    let runtimeSeconds = null;
-    let isRuntimeEvent = false;
-
     if (becameActive) {
       log(`🟢 Session STARTED: ${equipmentStatus}`);
       prev.isRunning = true;
       prev.startedAt = now;
       prev.startStatus = equipmentStatus;
-      prev.tailUntil = 0;
-    }
-
-    if (becameIdle && prev.startedAt) {
-      const ms = Math.max(0, now - prev.startedAt);
-      runtimeSeconds = Math.round(ms / 1000);
-      isRuntimeEvent = true;
-      log(`🔴 Session ENDED: ${prev.startStatus} ran for ${runtimeSeconds}s (${Math.round(runtimeSeconds / 60)}min)`);
-
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
-      prev.tailUntil = 0;
     }
 
     // Persist last snapshot
