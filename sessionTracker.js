@@ -9,6 +9,8 @@ const RECENT_WINDOW_MS = 120_000;
 const COOL_DELTA_ON = 0.0;   // was 0.3
 const HEAT_DELTA_ON = 0.0;   // was 0.3
 const TREND_DELTA   = 0.03;  // was 0.05 (be a bit more sensitive to trend)
+const FAN_TAIL_MS = Number(process.env.NEST_FAN_TAIL_MS || 30000); // 30s default
+
 
 /* ============================== PARSING ================================ */
 
@@ -142,6 +144,7 @@ class SessionManager {
         lastMode: 'OFF',
         lastReachable: true,
         lastRoom: '',
+        tailUntil: 0, // epoch ms until which we keep session active as a purge tail
       });
     }
     return this.byDevice.get(deviceId);
@@ -160,6 +163,22 @@ class SessionManager {
     let hvacStatus = input.hvacStatusRaw || 'UNKNOWN'; // HEATING/COOLING/OFF/UNKNOWN
     let isHeating = hvacStatus === 'HEATING';
     let isCooling = hvacStatus === 'COOLING';
+
+    // ── Fan tail logic: if we appear idle but we're within tail window, keep active as 'fan'
+    if (!isActive && prev.tailUntil && now < prev.tailUntil) {
+    return {
+    isReachable,
+    isHvacActive: true,
+    equipmentStatus: 'fan',
+    isFanOnly: true,
+      };
+    }
+
+// If fan trait is explicitly running, clear any pending tail (we're already active)
+if (isActive && prev.tailUntil) {
+  prev.tailUntil = 0;
+}
+
 
     // Otherwise infer from mode + setpoints + temp trend
     if (hvacStatus === 'UNKNOWN' || hvacStatus == null) {
@@ -234,6 +253,44 @@ class SessionManager {
       prev.startedAt = null;
       prev.startStatus = 'off';
     }
+
+    let runtimeSeconds = null;
+let isRuntimeEvent = false;
+
+// If we were running and now appear idle, consider starting a tail instead of ending immediately
+if (prev.isRunning && !isHvacActive) {
+  const nowMs = now;
+  const justStoppedHeatingOrCooling =
+    prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool';
+
+  // If no explicit Fan trait is running, schedule a purge tail
+  if (justStoppedHeatingOrCooling && !prev.tailUntil && FAN_TAIL_MS > 0) {
+    prev.tailUntil = nowMs + FAN_TAIL_MS;
+    // Treat as still active; do NOT close session yet
+  } else if (prev.tailUntil && nowMs < prev.tailUntil) {
+    // Still in tail window → keep active; do NOT close
+  } else {
+    // Truly idle (no tail or tail expired) → close session
+    if (prev.startedAt) {
+      const ms = Math.max(0, nowMs - prev.startedAt);
+      runtimeSeconds = Math.round(ms / 1000);
+      isRuntimeEvent = true;
+    }
+    prev.isRunning = false;
+    prev.startedAt = null;
+    prev.startStatus = 'off';
+    prev.tailUntil = 0;
+  }
+}
+
+// If we weren’t running and are now active → start session
+if (!prev.isRunning && isHvacActive) {
+  prev.isRunning = true;
+  prev.startedAt = now;
+  prev.startStatus = (equipmentStatus || 'fan'); // could be 'fan' if tail/trait
+  prev.tailUntil = 0; // clear any stale tail
+}
+
 
     // Persist last snapshot
     prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
