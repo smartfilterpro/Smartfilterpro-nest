@@ -54,7 +54,7 @@ const STALENESS_CHECK_INTERVAL = 60 * 60 * 1000;
 const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 12) * 60 * 60 * 1000;
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
-/* âââââââââââââââââââââââââââ Utilities âââââââââââââââââââââââââââ */
+/* ─────────────────────────── Utilities ─────────────────────────── */
 
 function toTimestamp(dateStr) {
   return new Date(dateStr).getTime();
@@ -77,12 +77,12 @@ function extractRoomDisplayName(eventData) {
 function sanitizeForLogging(data) {
   if (!data) return data;
   const sanitized = { ...data };
-  if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + 'â¦';
+  if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + '…';
   if (sanitized.deviceName) {
     const tail = sanitized.deviceName.split('/').pop() || '';
-    sanitized.deviceName = 'device-' + tail.substring(0, 8) + 'â¦';
+    sanitized.deviceName = 'device-' + tail.substring(0, 8) + '…';
   }
-  if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + 'â¦';
+  if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + '…';
   return sanitized;
 }
 
@@ -117,19 +117,17 @@ function deriveCurrentFlags(hvacStatus, fanTimerOn) {
   const isCooling = hvacStatus === 'COOLING';
   const isFanOnly = Boolean(fanTimerOn) && !isHeating && !isCooling;
 
-  const isActive = Boolean(isHeating || isCooling || isFanOnly);
+  const isActive = isHeating || isCooling || isFanOnly;
 
   let equipmentStatus = 'off';
-  if (isHeating && isFanOnly) equipmentStatus = 'heat+fan';
-  else if (isCooling && isFanOnly) equipmentStatus = 'cool+fan';
-  else if (isHeating) equipmentStatus = 'heat';
+  if (isHeating) equipmentStatus = 'heat';
   else if (isCooling) equipmentStatus = 'cool';
   else if (isFanOnly) equipmentStatus = 'fan';
 
   return { isHeating, isCooling, isFanOnly, isActive, equipmentStatus };
 }
 
-/* âââââââââââââââââââââââââââ Database âââââââââââââââââââââââââââ */
+/* ─────────────────────────── Database ─────────────────────────── */
 
 async function ensureDeviceExists(deviceKey) {
   if (!pool) return;
@@ -193,7 +191,7 @@ async function updateDeviceState(deviceKey, state) {
         last_seen_at = $10,
         last_activity_at = $11,
         room_display_name = $12,
-        last_fan_tail_until = $13,
+        last_fan_tail_until = $13,  // NULL when no tail
         updated_at = NOW()
       WHERE device_key = $1
       `,
@@ -210,7 +208,7 @@ async function updateDeviceState(deviceKey, state) {
         state.lastSeenAt ? new Date(state.lastSeenAt) : new Date(),
         state.lastActivityAt ? new Date(state.lastActivityAt) : new Date(),
         state.roomDisplayName,
-        0
+        (state.lastFanTailUntil ? new Date(state.lastFanTailUntil) : null)
       ]
     );
   } catch (error) {
@@ -280,7 +278,7 @@ async function logEquipmentEvent(deviceKey, eventType, equipmentStatus, previous
   }
 }
 
-/* âââââââââââââââââââââââ Migration / Schema âââââââââââââââââââââââ */
+/* ─────────────────────── Migration / Schema ─────────────────────── */
 
 async function runDatabaseMigration() {
   if (!ENABLE_DATABASE || !pool) {
@@ -451,7 +449,7 @@ async function runDatabaseMigration() {
   }
 }
 
-/* âââââââââââââââââââââââ Notifications âââââââââââââââââââââââ */
+/* ─────────────────────── Notifications ─────────────────────── */
 
 async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   const deviceId = deviceKey.split('-').pop();
@@ -523,11 +521,11 @@ async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
   }
 }
 
-/* âââââââââââââââââââââââ Event Handling âââââââââââââââââââââââ */
+/* ─────────────────────── Event Handling ─────────────────────── */
 
 async function handleNestEvent(eventData) {
   console.log('DEBUG: Starting event processing');
-  if (!IS_PRODUCTION) console.log('Processing Nest eventâ¦');
+  if (!IS_PRODUCTION) console.log('Processing Nest event…');
 
   const userId = eventData.userId;
   const deviceName = eventData.resourceUpdate?.name;
@@ -625,7 +623,10 @@ async function handleNestEvent(eventData) {
     return;
   }
 
-  /* âââââââââââââ Temperature-only event âââââââââââââ */
+  // Helper for strict active rule
+  const isHvacActiveStrict = (hvacStatus) => (hvacStatus === 'HEATING' || hvacStatus === 'COOLING' || fanTimerOn === true);
+
+  /* ───────────── Temperature-only event ───────────── */
   if (isTemperatureOnlyEvent) {
     console.log('Temperature-only event detected');
 
@@ -645,7 +646,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: 0,
       isRuntimeEvent: false,
       hvacMode: effectiveHvacMode,
-      isHvacActive: Boolean(isCurrentlyRunning),
+      isHvacActive: isHvacActiveStrict(hvacStatusEff),
       thermostatMode: mode || 'OFF',
       isReachable,
 
@@ -715,12 +716,9 @@ async function handleNestEvent(eventData) {
     return;
   }
 
-  /* âââââââââââââ Connectivity-only event âââââââââââââ */
+  /* ───────────── Connectivity-only event ───────────── */
   if (isConnectivityOnly) {
     console.log('Connectivity-only event detected');
-
-    const isHvacActiveStrict =
-      (hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING') || Boolean(fanTimerOn);
 
     const payload = {
       userId,
@@ -731,7 +729,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: 0,
       isRuntimeEvent: false,
       hvacMode: hvacStatusEff,
-      isHvacActive: isHvacActiveStrict,
+      isHvacActive: isHvacActiveStrict(hvacStatusEff),
       thermostatMode: mode || prev.currentMode || 'OFF',
       isReachable,
 
@@ -800,7 +798,7 @@ async function handleNestEvent(eventData) {
   const { isHeating, isCooling, isFanOnly, isActive, equipmentStatus } =
     deriveCurrentFlags(hvacStatusEff, fanTimerOn);
 
-  const wasActive = Boolean(prev.isRunning);
+  const wasActive = Boolean(prev.isRunning || sessions[key]);
 
   console.log(`DEBUG - State Analysis: isActive=${isActive} (heating:${isHeating}, cooling:${isCooling}, fanOnly:${isFanOnly}), wasActive=${wasActive}, equipmentStatus="${equipmentStatus}", prev.isRunning=${prev.isRunning}`);
   console.log(`DEBUG - Session Check: sessions[key]=${!!sessions[key]}, sessionStartTime=${sessions[key]?.startTime}`);
@@ -825,6 +823,8 @@ async function handleNestEvent(eventData) {
   }
 
   function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
+    const isHvacActive = (hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING' || fanTimerOn === true);
+
     return {
       userId,
       thermostatId: deviceId,
@@ -834,7 +834,7 @@ async function handleNestEvent(eventData) {
       runtimeMinutes: Math.round(runtimeSeconds / 60),
       isRuntimeEvent,
       hvacMode: hvacStatusEff,
-      isHvacActive: Boolean(isActive),
+      isHvacActive,
       thermostatMode: mode || 'OFF',
       isReachable,
 
@@ -867,7 +867,7 @@ async function handleNestEvent(eventData) {
 
   // Runtime calc (STRICT: only when isActive true)
   if (isActive && !wasActive) {
-    console.log(`ð¢ HVAC/Fan turning ON: ${equipmentStatus} for ${key.substring(0, 16)}`);
+    console.log(`🟢 HVAC/Fan turning ON: ${equipmentStatus} for ${key.substring(0, 16)}`);
     if (sessions[key] || prev.isRunning) {
       console.warn('Warning: Starting new session while previous session still active - closing previous session');
       if (sessions[key]?.startTime) {
@@ -894,10 +894,10 @@ async function handleNestEvent(eventData) {
     };
     sessions[key] = sessionData;
     payload = createBubblePayload(0, false);
-    console.log(`â Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
+    console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
 
-  } else if (!isActive && wasActive) {
-    console.log(`ð´ HVAC/Fan turning OFF for ${key.substring(0, 16)}`);
+  } else if (!isActive && (wasActive || sessions[key])) {
+    console.log(`🔴 HVAC/Fan turning OFF for ${key.substring(0, 16)}`);
     
     let session = sessions[key];
     if (!session && prev.sessionStartedAt) {
@@ -912,7 +912,7 @@ async function handleNestEvent(eventData) {
     if (session?.startTime) {
       const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
       const runtimeMinutes = Math.round(runtimeSeconds / 60);
-      console.log(`â±ï¸  Runtime calculation: ${runtimeSeconds}s (${runtimeMinutes}m) from ${new Date(session.startTime).toLocaleTimeString()} to ${new Date(eventTime).toLocaleTimeString()}`);
+      console.log(`⏱️  Runtime calculation: ${runtimeSeconds}s (${runtimeMinutes}m) from ${new Date(session.startTime).toLocaleTimeString()} to ${new Date(eventTime).toLocaleTimeString()}`);
       
       if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
         await logRuntimeSession(key, {
@@ -927,13 +927,13 @@ async function handleNestEvent(eventData) {
           coolSetpoint: effectiveCoolSetpoint
         });
         payload = createBubblePayload(runtimeSeconds, true, session);
-        console.log(`â Ended session: ${runtimeSeconds}s runtime (${session.startStatus})`);
+        console.log(`✅ Ended session: ${runtimeSeconds}s runtime (${session.startStatus})`);
       } else {
-        console.warn(`â Invalid runtime ${runtimeSeconds}s (${runtimeMinutes}m), sending zero runtime`);
+        console.warn(`❌ Invalid runtime ${runtimeSeconds}s (${runtimeMinutes}m), sending zero runtime`);
         payload = createBubblePayload(0, false);
       }
     } else {
-      console.warn('â No session data found for runtime calculation');
+      console.warn('❌ No session data found for runtime calculation');
       payload = createBubblePayload(0, false);
     }
     delete sessions[key];
@@ -942,9 +942,9 @@ async function handleNestEvent(eventData) {
     const session = sessions[key];
     const currentRuntimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
     const runtimeMinutes = Math.round(currentRuntimeSeconds / 60);
-    const shouldSendRuntimeUpdate = currentRuntimeSeconds > (10 * 60); // > 1 min and > 10 min spacing previously
+    const shouldSendRuntimeUpdate = currentRuntimeSeconds > (10 * 60); // ~10 min cadence
     if (shouldSendRuntimeUpdate) {
-      console.log(`ð Runtime update: ${currentRuntimeSeconds}s (${runtimeMinutes}m) - ${equipmentStatus}`);
+      console.log(`🔄 Runtime update: ${currentRuntimeSeconds}s (${runtimeMinutes}m) - ${equipmentStatus}`);
       payload = createBubblePayload(currentRuntimeSeconds, false, session);
     } else {
       payload = createBubblePayload(0, false);
@@ -953,7 +953,7 @@ async function handleNestEvent(eventData) {
   } else {
     payload = createBubblePayload(0, false);
     if (effectiveCurrentTemp && !IS_PRODUCTION) {
-      console.log(`ð¡ï¸  State update: ${effectiveCurrentTemp}Â°C (${celsiusToFahrenheit(effectiveCurrentTemp)}Â°F)`);
+      console.log(`🌡️  State update: ${effectiveCurrentTemp}°C (${celsiusToFahrenheit(effectiveCurrentTemp)}°F)`);
     }
   }
 
@@ -1037,7 +1037,7 @@ async function handleNestEvent(eventData) {
   console.log('DEBUG: Event processing complete');
 }
 
-/* âââââââââââââââââââââââ Staleness Monitor âââââââââââââââââââââââ */
+/* ─────────────────────── Staleness Monitor ─────────────────────── */
 
 setInterval(async () => {
   const now = Date.now();
@@ -1111,7 +1111,7 @@ setInterval(async () => {
   }
 }, STALENESS_CHECK_INTERVAL);
 
-/* âââââââââââââââââââââââ Dead-man Timeout âââââââââââââââââââââââ */
+/* ─────────────────────── Dead-man Timeout ─────────────────────── */
 // Force-close sessions if we haven't seen activity for RUNTIME_TIMEOUT
 setInterval(async () => {
   const now = Date.now();
@@ -1190,7 +1190,7 @@ setInterval(async () => {
 
         delete sessions[key];
         await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null });
-        console.log(`â¹ï¸  Session force-closed by timeout for ${key.substring(0,16)}`);
+        console.log(`⏹️  Session force-closed by timeout for ${key.substring(0,16)}`);
       }
     } catch (err) {
       console.error('Dead-man timeout error:', err.message);
@@ -1198,7 +1198,7 @@ setInterval(async () => {
   }
 }, 5 * 60 * 1000); // check every 5 minutes
 
-/* âââââââââââââââââââââââ Startup / Routes âââââââââââââââââââââââ */
+/* ─────────────────────── Startup / Routes ─────────────────────── */
 
 async function initializeDatabase() {
   if (!ENABLE_DATABASE || !pool) {
@@ -1319,7 +1319,7 @@ app.post('/webhook', async (req, res) => {
   try {
     const pubsubMessage = req.body.message;
     if (!pubsubMessage || !pubsubMessage.data) {
-      console.error('Invalid Pub/Sub message structure');
+    console.error('Invalid Pub/Sub message structure');
       return res.status(400).send('Invalid Pub/Sub message');
     }
     let eventData;
