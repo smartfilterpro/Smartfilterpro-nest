@@ -592,8 +592,14 @@ async function handleNestEvent(eventData) {
   const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes('fan');
   const lastEquipmentStatus = prev.lastEquipmentStatus || 'unknown';
 
-  // Resolve hvac status effective (no inference from previous state)
-  let hvacStatusEff = hvacStatusRaw ?? null;
+  // CHANGE 1: Improved HVAC status inference - preserve previous state if still in active session
+  let hvacStatusEff = hvacStatusRaw;
+  if (!hvacStatusEff && prev.isRunning && prev.currentMode) {
+    // Preserve previous state if still in a session
+    hvacStatusEff = prev.currentMode === 'heat' ? 'HEATING' : 
+                    prev.currentMode === 'cool' ? 'COOLING' : null;
+    console.log(`DEBUG - Preserving previous HVAC state: ${hvacStatusEff} (was in active session)`);
+  }
   const explicitMode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
   if (!hvacStatusEff && explicitMode === 'OFF') {
     hvacStatusEff = 'OFF';
@@ -631,9 +637,9 @@ async function handleNestEvent(eventData) {
   const isHvacActiveStrict = (hvacStatus) => (hvacStatus === 'HEATING' || hvacStatus === 'COOLING' || fanTimerOn === true);
 
   /* ───────────── Temperature-only event ───────────── */
-  // Only use the temperature-only fast path if there is NO fan timer running
-  if (isTemperatureOnlyEvent && !fanTimerOn) {
-    console.log('Temperature-only event detected');
+  // CHANGE 2: Only use temperature-only fast path if there's NO active session
+  if (isTemperatureOnlyEvent && !fanTimerOn && !sessions[key] && !prev.isRunning) {
+    console.log('Temperature-only event detected (no active session)');
 
     await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
@@ -720,7 +726,7 @@ async function handleNestEvent(eventData) {
     console.log('DEBUG: Temperature-only event processing complete');
     return;
   }
-  // If fanTimerOn === true, fall through to the main runtime logic below
+  // If fanTimerOn === true or there's an active session, fall through to the main runtime logic below
 
   /* ───────────── Connectivity-only event ───────────── */
   if (isConnectivityOnly) {
@@ -808,6 +814,7 @@ async function handleNestEvent(eventData) {
 
   console.log(`DEBUG - State Analysis: isActive=${isActive} (heating:${isHeating}, cooling:${isCooling}, fanOnly:${isFanOnly}), wasActive=${wasActive}, equipmentStatus="${equipmentStatus}", prev.isRunning=${prev.isRunning}`);
   console.log(`DEBUG - Session Check: sessions[key]=${!!sessions[key]}, sessionStartTime=${sessions[key]?.startTime}`);
+  console.log(`DEBUG - Key decisions: hvacStatusEff="${hvacStatusEff}", isActive=${isActive}, wasActive=${wasActive}, sessions[key]=${!!sessions[key]}`);
 
   // Log equipment status change
   if (equipmentStatus !== prev.lastEquipmentStatus) {
@@ -915,6 +922,8 @@ async function handleNestEvent(eventData) {
       console.log('Using database session data for runtime calculation');
     }
     
+    // CHANGE 3: Set FAN_TAIL_SECONDS to 0 to disable tail feature for initial debugging
+    // This simplifies the logic and makes runtime tracking easier to debug
     if (session?.startTime && FAN_TAIL_MS > 0) {
       const tailEnd = Math.max(prev.lastFanTailUntil || 0, eventTime + FAN_TAIL_MS);
       await updateDeviceState(key, {
@@ -1255,81 +1264,6 @@ setInterval(async () => {
         }
         delete sessions[key];
         await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null, lastFanTailUntil: 0 });
-        continue; // move to next session after tail close
-      }
-
-      // Dead-man: no activity beyond timeout
-      if (now - last > RUNTIME_TIMEOUT) {
-        const runtimeSeconds = Math.max(0, Math.floor((last - session.startTime) / 1000));
-        if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
-          await logRuntimeSession(key, {
-            mode: session.startStatus || 'unknown',
-            equipmentStatus: 'timeout',
-            startedAt: session.startTime,
-            endedAt: last,
-            durationSeconds: runtimeSeconds,
-            startTemperature: session.startTemperature,
-            endTemperature: prev.lastTemperature,
-            heatSetpoint: prev.lastHeatSetpoint,
-            coolSetpoint: prev.lastCoolSetpoint
-          });
-
-          if (process.env.BUBBLE_WEBHOOK_URL) {
-            const [userId, deviceId] = key.split('-');
-            const payload = cleanPayloadForBubble({
-              userId,
-              thermostatId: deviceId,
-              deviceName: prev.device_name || '',
-              roomDisplayName: prev.roomDisplayName || '',
-              runtimeSeconds,
-              runtimeMinutes: Math.round(runtimeSeconds / 60),
-              isRuntimeEvent: true,
-              hvacMode: 'UNKNOWN',
-              isHvacActive: false,
-              thermostatMode: 'UNKNOWN',
-              isReachable: prev.isReachable !== false,
-
-              currentTempF: celsiusToFahrenheit(prev.lastTemperature),
-              coolSetpointF: celsiusToFahrenheit(prev.lastCoolSetpoint),
-              heatSetpointF: celsiusToFahrenheit(prev.lastHeatSetpoint),
-              startTempF: celsiusToFahrenheit(session.startTemperature),
-              endTempF: celsiusToFahrenheit(prev.lastTemperature),
-
-              currentTempC: prev.lastTemperature,
-              coolSetpointC: prev.lastCoolSetpoint,
-              heatSetpointC: prev.lastHeatSetpoint,
-              startTempC: session.startTemperature,
-              endTempC: prev.lastTemperature,
-
-              lastIsCooling: !!prev.lastEquipmentStatus?.includes('cool'),
-              lastIsHeating: !!prev.lastEquipmentStatus?.includes('heat'),
-              lastIsFanOnly: !!prev.lastEquipmentStatus?.includes('fan'),
-              lastEquipmentStatus: prev.lastEquipmentStatus || 'unknown',
-              equipmentStatus: 'timeout',
-              isFanOnly: false,
-
-              timestamp: new Date(now).toISOString(),
-              eventId: `timeout-${now}`,
-              eventTimestamp: now
-            });
-
-            try {
-              await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
-                timeout: 10000,
-                headers: {
-                  'User-Agent': 'Nest-Runtime-Tracker/1.2',
-                  'Content-Type': 'application/json'
-                }
-              });
-              console.log(`Posted timeout payload for ${key.substring(0,16)}`);
-            } catch (e) {
-              console.error('Bubble timeout post failed:', e.response?.status || e.code || e.message);
-            }
-          }
-        }
-
-        delete sessions[key];
-        await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null, lastFanTailUntil: 0 });
         console.log(`⏹️  Session force-closed by timeout for ${key.substring(0,16)}`);
       }
     } catch (err) {
@@ -1523,4 +1457,79 @@ async function startServer() {
 startServer().catch(error => {
   console.error('Failed to start server:', error.message);
   process.exit(1);
-});
+});: null, lastFanTailUntil: 0 });
+        continue; // move to next session after tail close
+      }
+
+      // Dead-man: no activity beyond timeout
+      if (now - last > RUNTIME_TIMEOUT) {
+        const runtimeSeconds = Math.max(0, Math.floor((last - session.startTime) / 1000));
+        if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
+          await logRuntimeSession(key, {
+            mode: session.startStatus || 'unknown',
+            equipmentStatus: 'timeout',
+            startedAt: session.startTime,
+            endedAt: last,
+            durationSeconds: runtimeSeconds,
+            startTemperature: session.startTemperature,
+            endTemperature: prev.lastTemperature,
+            heatSetpoint: prev.lastHeatSetpoint,
+            coolSetpoint: prev.lastCoolSetpoint
+          });
+
+          if (process.env.BUBBLE_WEBHOOK_URL) {
+            const [userId, deviceId] = key.split('-');
+            const payload = cleanPayloadForBubble({
+              userId,
+              thermostatId: deviceId,
+              deviceName: prev.device_name || '',
+              roomDisplayName: prev.roomDisplayName || '',
+              runtimeSeconds,
+              runtimeMinutes: Math.round(runtimeSeconds / 60),
+              isRuntimeEvent: true,
+              hvacMode: 'UNKNOWN',
+              isHvacActive: false,
+              thermostatMode: 'UNKNOWN',
+              isReachable: prev.isReachable !== false,
+
+              currentTempF: celsiusToFahrenheit(prev.lastTemperature),
+              coolSetpointF: celsiusToFahrenheit(prev.lastCoolSetpoint),
+              heatSetpointF: celsiusToFahrenheit(prev.lastHeatSetpoint),
+              startTempF: celsiusToFahrenheit(session.startTemperature),
+              endTempF: celsiusToFahrenheit(prev.lastTemperature),
+
+              currentTempC: prev.lastTemperature,
+              coolSetpointC: prev.lastCoolSetpoint,
+              heatSetpointC: prev.lastHeatSetpoint,
+              startTempC: session.startTemperature,
+              endTempC: prev.lastTemperature,
+
+              lastIsCooling: !!prev.lastEquipmentStatus?.includes('cool'),
+              lastIsHeating: !!prev.lastEquipmentStatus?.includes('heat'),
+              lastIsFanOnly: !!prev.lastEquipmentStatus?.includes('fan'),
+              lastEquipmentStatus: prev.lastEquipmentStatus || 'unknown',
+              equipmentStatus: 'timeout',
+              isFanOnly: false,
+
+              timestamp: new Date(now).toISOString(),
+              eventId: `timeout-${now}`,
+              eventTimestamp: now
+            });
+
+            try {
+              await axios.post(process.env.BUBBLE_WEBHOOK_URL, payload, {
+                timeout: 10000,
+                headers: {
+                  'User-Agent': 'Nest-Runtime-Tracker/1.2',
+                  'Content-Type': 'application/json'
+                }
+              });
+              console.log(`Posted timeout payload for ${key.substring(0,16)}`);
+            } catch (e) {
+              console.error('Bubble timeout post failed:', e.response?.status || e.code || e.message);
+            }
+          }
+        }
+
+        delete sessions[key];
+        await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt
