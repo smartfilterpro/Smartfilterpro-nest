@@ -209,7 +209,6 @@ class SessionManager {
   toBubblePayload(result) {
     const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
     return {
-      // Always identifiers
       userId: result.userId || null,
       thermostatId: result.thermostatId || null,
       deviceName: result.deviceName || null,
@@ -282,3 +281,23 @@ function hvacModeFromEquipment(equipmentStatus) {
     case 'fan':  return 'FAN';
     default:     return 'OFF';
   }
+}
+
+function pick(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; return undefined; }
+function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
+function round2(n) { return Math.round(n * 100) / 100; }
+
+function genUuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = (Math.random()*16)|0, v = c === 'x' ? r : (r&0x3|0x8);
+    return v.toString(16);
+  });
+}
+
+/* ---------------- Exports ---------------- */
+
+module.exports = {
+  SessionManager,
+  parseSdmPushMessage,
+  extractEffectiveTraits,
+};
