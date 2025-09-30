@@ -54,6 +54,10 @@ const STALENESS_CHECK_INTERVAL = 60 * 60 * 1000;
 const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 12) * 60 * 60 * 1000;
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
+// Tail after OFF (in seconds). Example: 120 = 2 minutes of blower run after HVAC-off.
+const FAN_TAIL_SECONDS = parseInt(process.env.LAST_FAN_TAIL_SECONDS || process.env.LAST_FAN_TAIL_UNTIL || '0');
+const FAN_TAIL_MS = Math.max(0, FAN_TAIL_SECONDS) * 1000;
+
 /* ─────────────────────────── Utilities ─────────────────────────── */
 
 function toTimestamp(dateStr) {
@@ -163,7 +167,7 @@ async function getDeviceState(deviceKey) {
       lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).getTime() : Date.now(),
       lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).getTime() : Date.now(),
       roomDisplayName: row.room_display_name,
-      lastFanTailUntil: 0,
+      lastFanTailUntil: row.last_fan_tail_until ? new Date(row.last_fan_tail_until).getTime() : 0,
     };
   } catch (error) {
     console.error('Failed to get device state:', error.message);
@@ -191,7 +195,7 @@ async function updateDeviceState(deviceKey, state) {
         last_seen_at = $10,
         last_activity_at = $11,
         room_display_name = $12,
-        last_fan_tail_until = $13,  // NULL when no tail
+        last_fan_tail_until = $13,
         updated_at = NOW()
       WHERE device_key = $1
       `,
@@ -627,15 +631,16 @@ async function handleNestEvent(eventData) {
   const isHvacActiveStrict = (hvacStatus) => (hvacStatus === 'HEATING' || hvacStatus === 'COOLING' || fanTimerOn === true);
 
   /* ───────────── Temperature-only event ───────────── */
-  if (isTemperatureOnlyEvent) {
+  // Only use the temperature-only fast path if there is NO fan timer running
+  if (isTemperatureOnlyEvent && !fanTimerOn) {
     console.log('Temperature-only event detected');
 
     await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
     // Strict rule: Only fan timer ON can mark active when no ThermostatHvac.status
-    const isCurrentlyRunning = Boolean(fanTimerOn);
-    const effectiveHvacMode = isCurrentlyRunning ? 'FAN_ONLY' : 'OFF';
-    const currentEquipmentStatus = isCurrentlyRunning ? 'fan' : 'off';
+    const isCurrentlyRunning = false;
+    const effectiveHvacMode = 'OFF';
+    const currentEquipmentStatus = 'off';
 
     const payload = {
       userId,
@@ -666,7 +671,7 @@ async function handleNestEvent(eventData) {
       lastIsFanOnly,
       lastEquipmentStatus,
       equipmentStatus: currentEquipmentStatus,
-      isFanOnly: Boolean(currentEquipmentStatus === 'fan'),
+      isFanOnly: false,
 
       timestamp,
       eventId: eventData.eventId,
@@ -715,6 +720,7 @@ async function handleNestEvent(eventData) {
     console.log('DEBUG: Temperature-only event processing complete');
     return;
   }
+  // If fanTimerOn === true, fall through to the main runtime logic below
 
   /* ───────────── Connectivity-only event ───────────── */
   if (isConnectivityOnly) {
@@ -897,7 +903,7 @@ async function handleNestEvent(eventData) {
     console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
 
   } else if (!isActive && (wasActive || sessions[key])) {
-    console.log(`🔴 HVAC/Fan turning OFF for ${key.substring(0, 16)}`);
+    console.log(`🔴 HVAC/Fan transitioning OFF for ${key.substring(0, 16)}`);
     
     let session = sessions[key];
     if (!session && prev.sessionStartedAt) {
@@ -909,34 +915,53 @@ async function handleNestEvent(eventData) {
       console.log('Using database session data for runtime calculation');
     }
     
-    if (session?.startTime) {
-      const runtimeSeconds = Math.floor((eventTime - session.startTime) / 1000);
-      const runtimeMinutes = Math.round(runtimeSeconds / 60);
-      console.log(`⏱️  Runtime calculation: ${runtimeSeconds}s (${runtimeMinutes}m) from ${new Date(session.startTime).toLocaleTimeString()} to ${new Date(eventTime).toLocaleTimeString()}`);
-      
-      if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
-        await logRuntimeSession(key, {
-          mode: session.startStatus,
-          equipmentStatus: equipmentStatus,
-          startedAt: session.startTime,
-          endedAt: eventTime,
-          durationSeconds: runtimeSeconds,
-          startTemperature: session.startTemperature,
-          endTemperature: effectiveCurrentTemp,
-          heatSetpoint: effectiveHeatSetpoint,
-          coolSetpoint: effectiveCoolSetpoint
-        });
-        payload = createBubblePayload(runtimeSeconds, true, session);
-        console.log(`✅ Ended session: ${runtimeSeconds}s runtime (${session.startStatus})`);
+    if (session?.startTime && FAN_TAIL_MS > 0) {
+      const tailEnd = Math.max(prev.lastFanTailUntil || 0, eventTime + FAN_TAIL_MS);
+      await updateDeviceState(key, {
+        ...prev,
+        isRunning: true, // keep "running" during tail window
+        sessionStartedAt: session.startTime,
+        currentMode: session.startStatus,
+        lastTemperature: currentTemp ?? prev.lastTemperature,
+        lastHeatSetpoint: heatSetpoint !== undefined ? heatSetpoint : prev.lastHeatSetpoint,
+        lastCoolSetpoint: coolSetpoint !== undefined ? coolSetpoint : prev.lastCoolSetpoint,
+        lastEquipmentStatus: 'off_tail',
+        isReachable,
+        lastSeenAt: eventTime,
+        lastActivityAt: eventTime,
+        roomDisplayName: roomDisplayName || prev.roomDisplayName,
+        lastFanTailUntil: tailEnd
+      });
+      console.log(`🕒 Deferring session close until tail ends at ${new Date(tailEnd).toLocaleTimeString()}`);
+      payload = createBubblePayload(0, false, session);
+    } else {
+      if (session?.startTime) {
+        const endedAt = eventTime;
+        const runtimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
+        if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
+          await logRuntimeSession(key, {
+            mode: session.startStatus,
+            equipmentStatus: equipmentStatus,
+            startedAt: session.startTime,
+            endedAt,
+            durationSeconds: runtimeSeconds,
+            startTemperature: session.startTemperature,
+            endTemperature: effectiveCurrentTemp,
+            heatSetpoint: effectiveHeatSetpoint,
+            coolSetpoint: effectiveCoolSetpoint
+          });
+          payload = createBubblePayload(runtimeSeconds, true, session);
+          console.log(`✅ Ended session (no tail): ${runtimeSeconds}s runtime`);
+        } else {
+          console.warn(`❌ Invalid runtime ${runtimeSeconds}s, sending zero`);
+          payload = createBubblePayload(0, false);
+        }
       } else {
-        console.warn(`❌ Invalid runtime ${runtimeSeconds}s (${runtimeMinutes}m), sending zero runtime`);
+        console.warn('❌ No session data found for runtime calculation');
         payload = createBubblePayload(0, false);
       }
-    } else {
-      console.warn('❌ No session data found for runtime calculation');
-      payload = createBubblePayload(0, false);
+      delete sessions[key];
     }
-    delete sessions[key];
 
   } else if (isActive && sessions[key]) {
     const session = sessions[key];
@@ -957,10 +982,56 @@ async function handleNestEvent(eventData) {
     }
   }
 
+  // Late tail close if elapsed
+  if ((!isActive) && (prev.lastFanTailUntil && eventTime >= prev.lastFanTailUntil) && (sessions[key] || prev.sessionStartedAt)) {
+    const session = sessions[key] || {
+      startTime: prev.sessionStartedAt,
+      startStatus: prev.currentMode || 'unknown',
+      startTemperature: prev.lastTemperature || effectiveCurrentTemp
+    };
+
+    const endedAt = prev.lastFanTailUntil; // close exactly at OFF + tail
+    const runtimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
+
+    if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
+      await logRuntimeSession(key, {
+        mode: session.startStatus,
+        equipmentStatus: 'off_tail_closed',
+        startedAt: session.startTime,
+        endedAt,
+        durationSeconds: runtimeSeconds,
+        startTemperature: session.startTemperature,
+        endTemperature: effectiveCurrentTemp,
+        heatSetpoint: effectiveHeatSetpoint,
+        coolSetpoint: effectiveCoolSetpoint
+      });
+
+      const tailPayload = createBubblePayload(runtimeSeconds, true, session);
+      try {
+        const cleaned = cleanPayloadForBubble(tailPayload);
+        await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleaned, {
+          timeout: 10000,
+          headers: { 'User-Agent': 'Nest-Runtime-Tracker/1.2', 'Content-Type': 'application/json' }
+        });
+        console.log(`✅ Posted tail-closed runtime: ${runtimeSeconds}s`);
+      } catch (e) {
+        console.error('Failed to post tail-closed runtime:', e.response?.status || e.code || e.message);
+      }
+    } else {
+      console.warn(`❌ Invalid tail-closed runtime ${runtimeSeconds}s (start:${session.startTime}, end:${endedAt})`);
+    }
+
+    // Clear session after tail closure
+    delete sessions[key];
+    prev.lastFanTailUntil = 0;
+  }
+
   const newState = {
     ...prev,
-    isRunning: Boolean(isActive),
-    sessionStartedAt: isActive ? (sessions[key]?.startTime || prev.sessionStartedAt) : null,
+    isRunning: Boolean(isActive || (prev.lastFanTailUntil && eventTime < prev.lastFanTailUntil)),
+    sessionStartedAt: (isActive || (prev.lastFanTailUntil && eventTime < prev.lastFanTailUntil))
+      ? (sessions[key]?.startTime || prev.sessionStartedAt)
+      : null,
     currentMode: equipmentStatus,
     lastTemperature: currentTemp ?? prev.lastTemperature,
     lastHeatSetpoint: heatSetpoint !== undefined ? heatSetpoint : prev.lastHeatSetpoint,
@@ -970,7 +1041,7 @@ async function handleNestEvent(eventData) {
     lastSeenAt: eventTime,
     lastActivityAt: eventTime,
     roomDisplayName: roomDisplayName || prev.roomDisplayName,
-    lastFanTailUntil: 0
+    lastFanTailUntil: (prev.lastFanTailUntil && eventTime < prev.lastFanTailUntil) ? prev.lastFanTailUntil : 0
   };
 
   await updateDeviceState(key, newState);
@@ -1119,6 +1190,75 @@ setInterval(async () => {
     try {
       const prev = await getDeviceState(key) || {};
       const last = prev.lastActivityAt || session.startTime || now;
+
+      // Tail closer: if tail has expired, close at tail end
+      if (prev.lastFanTailUntil && now >= prev.lastFanTailUntil) {
+        const endedAt = prev.lastFanTailUntil;
+        const runtimeSeconds = Math.max(0, Math.floor((endedAt - session.startTime) / 1000));
+        if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
+          await logRuntimeSession(key, {
+            mode: session.startStatus || 'unknown',
+            equipmentStatus: 'off_tail_closed',
+            startedAt: session.startTime,
+            endedAt,
+            durationSeconds: runtimeSeconds,
+            startTemperature: session.startTemperature,
+            endTemperature: prev.lastTemperature,
+            heatSetpoint: prev.lastHeatSetpoint,
+            coolSetpoint: prev.lastCoolSetpoint
+          });
+
+          if (process.env.BUBBLE_WEBHOOK_URL) {
+            const [userId, deviceId] = key.split('-');
+            const tailPayload = cleanPayloadForBubble({
+              userId,
+              thermostatId: deviceId,
+              deviceName: prev.device_name || '',
+              roomDisplayName: prev.roomDisplayName || '',
+              runtimeSeconds,
+              runtimeMinutes: Math.round(runtimeSeconds / 60),
+              isRuntimeEvent: true,
+              hvacMode: 'UNKNOWN',
+              isHvacActive: false,
+              thermostatMode: 'UNKNOWN',
+              isReachable: prev.isReachable !== false,
+              currentTempF: celsiusToFahrenheit(prev.lastTemperature),
+              coolSetpointF: celsiusToFahrenheit(prev.lastCoolSetpoint),
+              heatSetpointF: celsiusToFahrenheit(prev.lastHeatSetpoint),
+              startTempF: celsiusToFahrenheit(session.startTemperature),
+              endTempF: celsiusToFahrenheit(prev.lastTemperature),
+              currentTempC: prev.lastTemperature,
+              coolSetpointC: prev.lastCoolSetpoint,
+              heatSetpointC: prev.lastHeatSetpoint,
+              startTempC: session.startTemperature,
+              endTempC: prev.lastTemperature,
+              lastIsCooling: !!prev.lastEquipmentStatus?.includes('cool'),
+              lastIsHeating: !!prev.lastEquipmentStatus?.includes('heat'),
+              lastIsFanOnly: !!prev.lastEquipmentStatus?.includes('fan'),
+              lastEquipmentStatus: prev.lastEquipmentStatus || 'unknown',
+              equipmentStatus: 'off_tail_closed',
+              isFanOnly: false,
+              timestamp: new Date(endedAt).toISOString(),
+              eventId: `tailclose-${endedAt}`,
+              eventTimestamp: endedAt
+            });
+            try {
+              await axios.post(process.env.BUBBLE_WEBHOOK_URL, tailPayload, {
+                timeout: 10000,
+                headers: { 'User-Agent': 'Nest-Runtime-Tracker/1.2', 'Content-Type': 'application/json' }
+              });
+              console.log(`✅ Posted tail-closed runtime via periodic closer: ${runtimeSeconds}s`);
+            } catch (e) {
+              console.error('Bubble post (tail closer) failed:', e.response?.status || e.code || e.message);
+            }
+          }
+        }
+        delete sessions[key];
+        await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null, lastFanTailUntil: 0 });
+        continue; // move to next session after tail close
+      }
+
+      // Dead-man: no activity beyond timeout
       if (now - last > RUNTIME_TIMEOUT) {
         const runtimeSeconds = Math.max(0, Math.floor((last - session.startTime) / 1000));
         if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
@@ -1189,14 +1329,14 @@ setInterval(async () => {
         }
 
         delete sessions[key];
-        await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null });
+        await updateDeviceState(key, { ...prev, isRunning: false, sessionStartedAt: null, lastFanTailUntil: 0 });
         console.log(`⏹️  Session force-closed by timeout for ${key.substring(0,16)}`);
       }
     } catch (err) {
       console.error('Dead-man timeout error:', err.message);
     }
   }
-}, 5 * 60 * 1000); // check every 5 minutes
+}, 60 * 1000); // check every minute
 
 /* ─────────────────────── Startup / Routes ─────────────────────── */
 
@@ -1265,7 +1405,8 @@ app.get('/admin/health', requireAuth, async (req, res) => {
       stalenessThresholdHours: STALENESS_THRESHOLD / (60 * 60 * 1000),
       runtimeTimeoutHours: RUNTIME_TIMEOUT / (60 * 60 * 1000),
       databaseEnabled: ENABLE_DATABASE,
-      bubbleConfigured: !!process.env.BUBBLE_WEBHOOK_URL
+      bubbleConfigured: !!process.env.BUBBLE_WEBHOOK_URL,
+      fanTailSeconds: FAN_TAIL_SECONDS
     },
     memoryUsage: process.memoryUsage()
   });
@@ -1319,7 +1460,7 @@ app.post('/webhook', async (req, res) => {
   try {
     const pubsubMessage = req.body.message;
     if (!pubsubMessage || !pubsubMessage.data) {
-    console.error('Invalid Pub/Sub message structure');
+      console.error('Invalid Pub/Sub message structure');
       return res.status(400).send('Invalid Pub/Sub message');
     }
     let eventData;
@@ -1374,6 +1515,7 @@ async function startServer() {
     console.log(`- Database: ${ENABLE_DATABASE && DATABASE_URL ? 'Enabled' : 'Disabled (memory-only)'}`);
     console.log(`- Staleness threshold: ${STALENESS_THRESHOLD / (60 * 60 * 1000)} hours`);
     console.log(`- Runtime timeout: ${RUNTIME_TIMEOUT / (60 * 60 * 1000)} hours`);
+    console.log(`- Fan tail seconds: ${FAN_TAIL_SECONDS} seconds`);
     console.log(`Ready to receive Nest events at /webhook`);
   });
 }
