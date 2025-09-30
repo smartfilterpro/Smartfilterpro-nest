@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 8080;
 
 app.use(express.json({ limit: '1mb' }));
 
+// --- Database connection ---
 const pool = createPool();
 
 // --- Ensure schema at startup ---
@@ -29,11 +30,26 @@ if (pool) {
   }
 }
 
-// --- Handlers ---
+// --- Handler function ---
 async function nestHandler(req, res) {
   try {
+    let body = req.body || {};
+
+    // Pub/Sub push wrapper → decode base64 JSON
+    if (body.message && body.message.data) {
+      try {
+        const decoded = Buffer.from(body.message.data, 'base64').toString('utf8');
+        body = JSON.parse(decoded);
+        console.log('[PUBSUB] Decoded event:', body);
+      } catch (err) {
+        console.error('[PUBSUB] Failed to decode base64 message.data:', err);
+        return res.status(400).json({ ok: false, error: 'Invalid Pub/Sub payload' });
+      }
+    }
+
     if (!pool) throw new Error('Database not configured');
-    await handleEvent(pool, req.body || {});
+
+    await handleEvent(pool, body);
     res.json({ ok: true });
   } catch (e) {
     console.error('Error handling Nest event:', e);
@@ -46,12 +62,12 @@ app.get('/health', async (req, res) => {
   res.json({ ok: true, tailSeconds: parseInt(process.env.LAST_FAN_TAIL_SECONDS || '30', 10) });
 });
 
-// Ingest events
-app.post('/nest/event', nestHandler);   // singular
-app.post('/nest/events', nestHandler);  // plural
-app.post('/webhook', nestHandler);      // generic webhook
+// Event ingestion (all use same handler)
+app.post('/nest/event', nestHandler);
+app.post('/nest/events', nestHandler);
+app.post('/webhook', nestHandler);
 
-// Hard delete a user and all their devices
+// Hard delete user + thermostats
 app.delete('/users/:userId', async (req, res) => {
   const userId = req.params.userId;
   try {
@@ -61,12 +77,41 @@ app.delete('/users/:userId', async (req, res) => {
     const location = req.query.location_id || null;
 
     if (workspace || location) {
-      await pool.query(`DELETE FROM temp_readings WHERE device_key IN (SELECT device_key FROM device_status WHERE workspace_id = COALESCE($1, workspace_id) AND location_id = COALESCE($2, location_id))`, [workspace, location]);
-      await pool.query(`DELETE FROM equipment_events WHERE device_key IN (SELECT device_key FROM device_status WHERE workspace_id = COALESCE($1, workspace_id) AND location_id = COALESCE($2, location_id))`, [workspace, location]);
-      await pool.query(`DELETE FROM runtime_session WHERE device_key IN (SELECT device_key FROM device_status WHERE workspace_id = COALESCE($1, workspace_id) AND location_id = COALESCE($2, location_id))`, [workspace, location]);
-      await pool.query(`DELETE FROM device_status WHERE workspace_id = COALESCE($1, workspace_id) AND location_id = COALESCE($2, location_id)`, [workspace, location]);
+      await pool.query(
+        `DELETE FROM temp_readings 
+         WHERE device_key IN (
+           SELECT device_key FROM device_status 
+           WHERE workspace_id = COALESCE($1, workspace_id) 
+             AND location_id = COALESCE($2, location_id)
+         )`, [workspace, location]
+      );
+      await pool.query(
+        `DELETE FROM equipment_events 
+         WHERE device_key IN (
+           SELECT device_key FROM device_status 
+           WHERE workspace_id = COALESCE($1, workspace_id) 
+             AND location_id = COALESCE($2, location_id)
+         )`, [workspace, location]
+      );
+      await pool.query(
+        `DELETE FROM runtime_session 
+         WHERE device_key IN (
+           SELECT device_key FROM device_status 
+           WHERE workspace_id = COALESCE($1, workspace_id) 
+             AND location_id = COALESCE($2, location_id)
+         )`, [workspace, location]
+      );
+      await pool.query(
+        `DELETE FROM device_status 
+         WHERE workspace_id = COALESCE($1, workspace_id) 
+           AND location_id = COALESCE($2, location_id)`,
+        [workspace, location]
+      );
     } else {
-      return res.status(400).json({ ok: false, error: "Provide workspace_id or location_id as query params to scope deletion." });
+      return res.status(400).json({
+        ok: false,
+        error: "Provide workspace_id or location_id as query params to scope deletion."
+      });
     }
 
     res.json({ ok: true, deleted: true, userId, workspace_id: workspace, location_id: location });
@@ -82,7 +127,7 @@ app.listen(PORT, () => {
   console.log('   Routes ready:');
   console.log('   - POST /nest/event');
   console.log('   - POST /nest/events');
-  console.log('   - POST /webhook');
+  console.log('   - POST /webhook (Google Pub/Sub push)');
   console.log('   - GET  /health');
   console.log('   - DELETE /users/:userId');
 });
