@@ -47,16 +47,20 @@ async function getOpenSession(pool, device_key) {
 async function startSession(pool, device_key, mode, equipment_status, temperature, heat_sp, cool_sp) {
   const id = uuidv4();
   const started_at = now();
+  console.log(`[SESSION START] device=${device_key} mode=${mode} at=${started_at.toISOString()} temp=${temperature}`);
+
   const q = await pool.query(
     `INSERT INTO runtime_session (id, device_key, mode, equipment_status, started_at, start_temperature, heat_setpoint, cool_setpoint, created_at, updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),now()) RETURNING *`,
     [id, device_key, mode, equipment_status, started_at, temperature, heat_sp, cool_sp]
   );
+
   await pool.query(
     `UPDATE device_status SET is_running=true, session_started_at=$2, current_mode=$3, current_equipment_status=$4, last_activity_at=now(), updated_at=now()
      WHERE device_key=$1`,
     [device_key, started_at, mode, equipment_status]
   );
+
   return q.rows[0];
 }
 
@@ -66,6 +70,8 @@ async function closeSessionWithTail(pool, deviceStatusRow, sessionRow, latestTem
   // Delay post by TAIL_SECONDS and add it to runtime duration
   const ended_at = new Date(endTime.getTime() + TAIL_SECONDS * 1000);
   const duration_seconds = secondsBetween(new Date(sessionRow.started_at), ended_at);
+
+  console.log(`[SESSION END] device=${device_key} mode=${sessionRow.mode} duration=${duration_seconds}s (tail=${TAIL_SECONDS}s)`);
 
   const updated = await pool.query(
     `UPDATE runtime_session
@@ -101,10 +107,12 @@ async function closeSessionWithTail(pool, deviceStatusRow, sessionRow, latestTem
 
   // Delay the POST by TAIL_SECONDS
   await new Promise((resolve) => setTimeout(resolve, TAIL_SECONDS * 1000));
+  console.log(`[BUBBLE POST - RUNTIME] device=${device_key} mode=${sessionRow.mode} duration=${duration_seconds}s`);
   await postToBubble(payload);
 }
 
 async function recordTemp(pool, device_key, temp, units, session_id) {
+  console.log(`[TEMP] device=${device_key} temp=${temp}${units} session=${session_id || 'none'}`);
   await pool.query(
     `INSERT INTO temp_readings (device_key, temperature, units, event_type, session_id, recorded_at)
      VALUES ($1,$2,$3,'temperature_update',$4,now())`,
@@ -127,7 +135,9 @@ async function handleEvent(pool, evt) {
     device_key, device_name: deviceName, units, room_display_name: roomDisplayName
   });
 
-  // Reachability handling: if offline, close any open session and mark unreachable
+  console.log(`[EVENT] device=${device_key} eqStatus=${equipmentStatus} fan=${fanTimerMode} temp=${currentTemp} reachable=${isReachable}`);
+
+  // Reachability handling
   if (isReachable === false) {
     const open = await getOpenSession(pool, device_key);
     if (open) {
@@ -146,7 +156,7 @@ async function handleEvent(pool, evt) {
       `UPDATE device_status SET is_reachable=false, last_seen_at=now(), updated_at=now() WHERE device_key=$1`,
       [device_key]
     );
-    // Also log connectivity event
+    console.log(`[REACHABILITY] device=${device_key} marked unreachable`);
     await pool.query(
       `INSERT INTO equipment_events (device_key, event_type, is_active, event_data)
        VALUES ($1,'connectivity',false,$2)`,
@@ -158,16 +168,17 @@ async function handleEvent(pool, evt) {
       `UPDATE device_status SET is_reachable=true, last_seen_at=now(), updated_at=now() WHERE device_key=$1`,
       [device_key]
     );
+    console.log(`[REACHABILITY] device=${device_key} marked reachable`);
   }
 
   // Resolve active state
   const activeInfo = resolveActive(equipmentStatus, fanTimerMode);
   const open = await getOpenSession(pool, device_key);
 
-  // Always record temperature (every single reading)
+  // Always record temperature
   await recordTemp(pool, device_key, currentTemp, units, open ? open.id : null);
 
-  // Prepare base payload used for any Bubble posts
+  // Prepare base payload
   const basePayload = {
     userId,
     thermostatId,
@@ -192,7 +203,7 @@ async function handleEvent(pool, evt) {
     eventTimestamp: eventTimestamp || Date.now()
   };
 
-  // Update device_status snapshot
+  // Update device_status
   await pool.query(
     `UPDATE device_status
        SET current_mode=$2, current_equipment_status=$3,
@@ -204,33 +215,20 @@ async function handleEvent(pool, evt) {
 
   if (activeInfo.active) {
     if (!open) {
-      // Start a new session based on priority COOL > HEAT > FAN
-      const mode = activeInfo.mode;
-      await startSession(pool, device_key, mode, (equipmentStatus || 'unknown'), currentTemp, null, null);
-      await pool.query(
-        `INSERT INTO equipment_events (device_key, event_type, equipment_status, previous_status, is_active, session_id, event_data)
-         VALUES ($1,'equipment_status_change',$2,null,true,$3,$4)`,
-        [device_key, equipmentStatus || 'unknown', null, { fanTimerMode, thermostatMode }]
-      );
+      await startSession(pool, device_key, activeInfo.mode, (equipmentStatus || 'unknown'), currentTemp, null, null);
     } else if (open && open.mode !== activeInfo.mode) {
-      // Mode switch while still active: close previous, start new (Q8)
+      console.log(`[SESSION SWITCH] device=${device_key} from=${open.mode} to=${activeInfo.mode}`);
       await closeSessionWithTail(pool, deviceRow, open, currentTemp, basePayload);
       await startSession(pool, device_key, activeInfo.mode, (equipmentStatus || 'unknown'), currentTemp, null, null);
     }
   } else {
-    // Not active now
     if (open) {
-      // End the session only when *both* equipment off and fan off
       await closeSessionWithTail(pool, deviceRow, open, currentTemp, basePayload);
-      await pool.query(
-        `INSERT INTO equipment_events (device_key, event_type, equipment_status, previous_status, is_active, session_id, event_data)
-         VALUES ($1,'equipment_status_change',$2,$3,false,$4,$5)`,
-        [device_key, equipmentStatus || 'unknown', open.equipment_status || null, false, open.id, { fanTimerMode, thermostatMode }]
-      );
     }
   }
 
-  // For temperature updates (every event carries temp), also post the current temperature to Bubble
+  // Post temperature-only event to Bubble
+  console.log(`[BUBBLE POST - TEMP] device=${device_key} temp=${currentTemp}${units}`);
   await postToBubble({
     ...basePayload,
     // isRuntimeEvent remains false for temp-only posts
