@@ -12,7 +12,7 @@ console.log(‘All modules loaded successfully’);
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Database configuration
+// Database configuration 
 const DATABASE_URL = process.env.DATABASE_URL;
 const ENABLE_DATABASE = process.env.ENABLE_DATABASE !== “0”;
 let pool = null;
