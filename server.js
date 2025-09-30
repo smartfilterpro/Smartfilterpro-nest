@@ -1,42 +1,42 @@
-‘use strict’;
+'use strict';
 
-console.log(‘Starting Nest server…’);
+console.log('Starting Nest server...');
 
-const express = require(‘express’);
-const axios = require(‘axios’);
-const { Pool } = require(‘pg’);
-require(‘dotenv’).config();
+const express = require('express');
+const axios = require('axios');
+const { Pool } = require('pg');
+require('dotenv').config();
 
-console.log(‘All modules loaded successfully’);
+console.log('All modules loaded successfully');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Database configuration 
 const DATABASE_URL = process.env.DATABASE_URL;
-const ENABLE_DATABASE = process.env.ENABLE_DATABASE !== “0”;
+const ENABLE_DATABASE = process.env.ENABLE_DATABASE !== "0";
 let pool = null;
 
 if (ENABLE_DATABASE && DATABASE_URL) {
 pool = new Pool({
 connectionString: DATABASE_URL,
-ssl: DATABASE_URL.includes(‘localhost’) ? false : { rejectUnauthorized: false },
-max: parseInt(process.env.DB_MAX_CONNECTIONS || ‘10’),
+ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+max: parseInt(process.env.DB_MAX_CONNECTIONS || '10'),
 idleTimeoutMillis: 30000,
 connectionTimeoutMillis: 10000,
 });
 
-pool.on(‘error’, (err) => {
-console.error(‘Database pool error:’, err.message);
+pool.on('error', (err) => {
+console.error('Database pool error:', err.message);
 });
 }
 
 // Security headers middleware
 app.use((req, res, next) => {
-res.setHeader(‘X-Content-Type-Options’, ‘nosniff’);
-res.setHeader(‘X-Frame-Options’, ‘DENY’);
-res.setHeader(‘X-XSS-Protection’, ‘1; mode=block’);
-res.setHeader(‘Referrer-Policy’, ‘strict-origin-when-cross-origin’);
+res.setHeader('X-Content-Type-Options', 'nosniff');
+res.setHeader('X-Frame-Options', 'DENY');
+res.setHeader('X-XSS-Protection', '1; mode=block');
+res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
 next();
 });
 
@@ -47,7 +47,7 @@ const sessions = {};
 const deviceStates = {};
 
 // Environment check
-const IS_PRODUCTION = process.env.NODE_ENV === ‘production’;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 // Monitoring, cleanup, runtime handling
 const STALENESS_CHECK_INTERVAL = 60 * 60 * 1000;
@@ -55,7 +55,7 @@ const STALENESS_THRESHOLD = (parseInt(process.env.STALENESS_THRESHOLD_HOURS) || 
 const RUNTIME_TIMEOUT = (parseInt(process.env.RUNTIME_TIMEOUT_HOURS) || 4) * 60 * 60 * 1000;
 
 // Tail after OFF (in seconds). Example: 120 = 2 minutes of blower run after HVAC-off.
-const FAN_TAIL_SECONDS = parseInt(process.env.LAST_FAN_TAIL_SECONDS || process.env.LAST_FAN_TAIL_UNTIL || ‘0’);
+const FAN_TAIL_SECONDS = parseInt(process.env.LAST_FAN_TAIL_SECONDS || process.env.LAST_FAN_TAIL_UNTIL || '0');
 const FAN_TAIL_MS = Math.max(0, FAN_TAIL_SECONDS) * 1000;
 
 /* ─────────────────────────── Utilities ─────────────────────────── */
@@ -73,34 +73,34 @@ function extractRoomDisplayName(eventData) {
 const parentRelations = eventData.resourceUpdate?.parentRelations;
 if (!parentRelations || !Array.isArray(parentRelations)) return null;
 const roomRelation = parentRelations.find(relation =>
-relation.parent && relation.parent.includes(’/rooms/’)
+relation.parent && relation.parent.includes('/rooms/')
 );
 return roomRelation?.displayName || null;
 }
 
 function sanitizeForLogging(data) {
 if (!data) return data;
-const sanitized = { …data };
-if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + ‘…’;
+const sanitized = { ...data };
+if (sanitized.userId) sanitized.userId = sanitized.userId.substring(0, 8) + '...';
 if (sanitized.deviceName) {
-const tail = sanitized.deviceName.split(’/’).pop() || ‘’;
-sanitized.deviceName = ‘device-’ + tail.substring(0, 8) + ‘…’;
+const tail = sanitized.deviceName.split('/').pop() || '';
+sanitized.deviceName = 'device-' + tail.substring(0, 8) + '...';
 }
-if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + ‘…’;
+if (sanitized.thermostatId) sanitized.thermostatId = sanitized.thermostatId.substring(0, 8) + '...';
 return sanitized;
 }
 
 function cleanPayloadForBubble(payload) {
 const cleaned = {};
 for (const [key, value] of Object.entries(payload)) {
-if (value !== null && value !== undefined && value !== ‘’) {
-if (typeof value === ‘number’ && !isFinite(value)) continue;
+if (value !== null && value !== undefined && value !== '') {
+if (typeof value === 'number' && !isFinite(value)) continue;
 cleaned[key] = value;
-} else if (key.includes(‘Temp’) || key.includes(‘Setpoint’)) {
+} else if (key.includes('Temp') || key.includes('Setpoint')) {
 cleaned[key] = 0;
-} else if (key === ‘runtimeSeconds’ || key === ‘runtimeMinutes’) {
+} else if (key === 'runtimeSeconds' || key === 'runtimeMinutes') {
 cleaned[key] = 0;
-} else if (typeof payload[key] === ‘boolean’) {
+} else if (typeof payload[key] === 'boolean') {
 cleaned[key] = Boolean(value);
 }
 }
@@ -108,25 +108,25 @@ return cleaned;
 }
 
 function requireAuth(req, res, next) {
-const authToken = req.headers.authorization?.replace(’Bearer ’, ‘’);
+const authToken = req.headers.authorization?.replace('Bearer ', '');
 const expectedToken = process.env.ADMIN_API_KEY;
-if (!expectedToken) return res.status(500).json({ error: ‘Admin API key not configured’ });
-if (!authToken || authToken !== expectedToken) return res.status(401).json({ error: ‘Unauthorized’ });
+if (!expectedToken) return res.status(500).json({ error: 'Admin API key not configured' });
+if (!authToken || authToken !== expectedToken) return res.status(401).json({ error: 'Unauthorized' });
 next();
 }
 
 // Map hvac/fan flags STRICTLY (no synthetic tail, no inference from previous state)
 function deriveCurrentFlags(hvacStatus, fanTimerOn) {
-const isHeating = hvacStatus === ‘HEATING’;
-const isCooling = hvacStatus === ‘COOLING’;
+const isHeating = hvacStatus === 'HEATING';
+const isCooling = hvacStatus === 'COOLING';
 const isFanOnly = Boolean(fanTimerOn) && !isHeating && !isCooling;
 
 const isActive = isHeating || isCooling || isFanOnly;
 
-let equipmentStatus = ‘off’;
-if (isHeating) equipmentStatus = ‘heat’;
-else if (isCooling) equipmentStatus = ‘cool’;
-else if (isFanOnly) equipmentStatus = ‘fan’;
+let equipmentStatus = 'off';
+if (isHeating) equipmentStatus = 'heat';
+else if (isCooling) equipmentStatus = 'cool';
+else if (isFanOnly) equipmentStatus = 'fan';
 
 return { isHeating, isCooling, isFanOnly, isActive, equipmentStatus };
 }
@@ -158,7 +158,7 @@ const row = result.rows[0];
 return {
 isRunning: row.is_running || false,
 sessionStartedAt: row.session_started_at ? new Date(row.session_started_at).getTime() : null,
-currentMode: row.current_mode || ‘idle’,
+currentMode: row.current_mode || 'idle',
 lastTemperature: row.last_temperature != null ? Number(row.last_temperature) : null,
 lastHeatSetpoint: row.last_heat_setpoint != null ? Number(row.last_heat_setpoint) : null,
 lastCoolSetpoint: row.last_cool_setpoint != null ? Number(row.last_cool_setpoint) : null,
@@ -170,7 +170,7 @@ roomDisplayName: row.room_display_name,
 lastFanTailUntil: row.last_fan_tail_until ? new Date(row.last_fan_tail_until).getTime() : 0,
 };
 } catch (error) {
-console.error(‘Failed to get device state:’, error.message);
+console.error('Failed to get device state:', error.message);
 return deviceStates[deviceKey] || null;
 }
 }
@@ -187,7 +187,7 @@ await pool.query(
 deviceKey,
 Boolean(state.isRunning),
 state.sessionStartedAt ? new Date(state.sessionStartedAt) : null,
-state.currentMode || ‘idle’,
+state.currentMode || 'idle',
 state.lastTemperature,
 state.lastHeatSetpoint,
 state.lastCoolSetpoint,
@@ -200,7 +200,7 @@ state.roomDisplayName,
 ]
 );
 } catch (error) {
-console.error(‘Failed to update device state:’, error.message);
+console.error('Failed to update device state:', error.message);
 }
 }
 
@@ -225,12 +225,12 @@ sessionData.coolSetpoint
 );
 return result.rows[0];
 } catch (error) {
-console.error(‘Failed to log runtime session:’, error.message);
+console.error('Failed to log runtime session:', error.message);
 return null;
 }
 }
 
-async function logTemperatureReading(deviceKey, temperature, units = ‘F’, eventType = ‘reading’) {
+async function logTemperatureReading(deviceKey, temperature, units = 'F', eventType = 'reading') {
 if (!pool) return;
 try {
 await ensureDeviceExists(deviceKey);
@@ -239,7 +239,7 @@ await pool.query(
 [deviceKey, Number(temperature), String(units), String(eventType)]
 );
 } catch (error) {
-console.error(‘Failed to log temperature reading:’, error.message);
+console.error('Failed to log temperature reading:', error.message);
 }
 }
 
@@ -252,7 +252,7 @@ await pool.query(
 [deviceKey, eventType, equipmentStatus, previousStatus, Boolean(isActive), JSON.stringify(eventData)]
 );
 } catch (error) {
-console.error(‘Failed to log equipment event:’, error.message);
+console.error('Failed to log equipment event:', error.message);
 }
 }
 
@@ -260,12 +260,12 @@ console.error(‘Failed to log equipment event:’, error.message);
 
 async function runDatabaseMigration() {
 if (!ENABLE_DATABASE || !pool) {
-console.log(‘Database disabled - skipping migration’);
+console.log('Database disabled - skipping migration');
 return;
 }
 
 try {
-console.log(‘Checking database schema…’);
+console.log('Checking database schema...');
 
 ```
 const schemaExists = await pool.query(`
@@ -420,15 +420,15 @@ console.log('Database schema created successfully');
 ```
 
 } catch (error) {
-console.error(‘Database migration failed:’, error.message);
-console.warn(‘Continuing with memory-only operation…’);
+console.error('Database migration failed:', error.message);
+console.warn('Continuing with memory-only operation...');
 }
 }
 
 /* ─────────────────────── Notifications ─────────────────────── */
 
 async function sendStalenessNotification(deviceKey, deviceState, currentTime) {
-const deviceId = deviceKey.split(’-’).pop();
+const deviceId = deviceKey.split('-').pop();
 const lastActivityTime = deviceState.lastActivityAt || 0;
 const hoursSinceLastActivity = lastActivityTime > 0 ?
 Math.floor((currentTime - lastActivityTime) / (60 * 60 * 1000)) : 0;
@@ -436,13 +436,13 @@ Math.floor((currentTime - lastActivityTime) / (60 * 60 * 1000)) : 0;
 const payload = {
 thermostatId: deviceId,
 deviceName: `Device ${deviceId}`,
-roomDisplayName: deviceState.roomDisplayName || ‘’,
+roomDisplayName: deviceState.roomDisplayName || '',
 runtimeSeconds: 0,
 runtimeMinutes: 0,
 isRuntimeEvent: false,
-hvacMode: ‘UNKNOWN’,
+hvacMode: 'UNKNOWN',
 isHvacActive: false,
-thermostatMode: ‘UNKNOWN’,
+thermostatMode: 'UNKNOWN',
 isReachable: false,
 
 ```
@@ -481,8 +481,8 @@ const cleanedPayload = cleanPayloadForBubble(payload);
 await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
 timeout: 10000,
 headers: {
-‘User-Agent’: ‘Nest-Runtime-Tracker/1.2’,
-‘Content-Type’: ‘application/json’
+'User-Agent': 'Nest-Runtime-Tracker/1.2',
+'Content-Type': 'application/json'
 }
 });
 
@@ -506,8 +506,8 @@ headers: {
 /* ─────────────────────── Event Handling ─────────────────────── */
 
 async function handleNestEvent(eventData) {
-console.log(‘DEBUG: Starting event processing’);
-if (!IS_PRODUCTION) console.log(‘Processing Nest event…’);
+console.log('DEBUG: Starting event processing');
+if (!IS_PRODUCTION) console.log('Processing Nest event...');
 
 const userId = eventData.userId;
 const deviceName = eventData.resourceUpdate?.name;
@@ -516,36 +516,36 @@ const timestamp = eventData.timestamp;
 
 const roomDisplayName = extractRoomDisplayName(eventData);
 
-console.log(‘DEBUG - Basic field extraction:’);
+console.log('DEBUG - Basic field extraction:');
 console.log(`- userId: ${userId}`);
 console.log(`- deviceName: ${deviceName}`);
 console.log(`- timestamp: ${timestamp}`);
 console.log(`- roomDisplayName: ${roomDisplayName}`);
 
-const deviceId = deviceName?.split(’/’).pop();
+const deviceId = deviceName?.split('/').pop();
 
-const hvacStatusRaw = traits?.[‘sdm.devices.traits.ThermostatHvac’]?.status;
-const currentTemp = traits?.[‘sdm.devices.traits.Temperature’]?.ambientTemperatureCelsius;
-const coolSetpoint = traits?.[‘sdm.devices.traits.ThermostatTemperatureSetpoint’]?.coolCelsius;
-const heatSetpoint = traits?.[‘sdm.devices.traits.ThermostatTemperatureSetpoint’]?.heatCelsius;
-const mode = traits?.[‘sdm.devices.traits.ThermostatMode’]?.mode;
+const hvacStatusRaw = traits?.['sdm.devices.traits.ThermostatHvac']?.status;
+const currentTemp = traits?.['sdm.devices.traits.Temperature']?.ambientTemperatureCelsius;
+const coolSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius;
+const heatSetpoint = traits?.['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius;
+const mode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
 
-const hasFanTrait = Object.prototype.hasOwnProperty.call(traits || {}, ‘sdm.devices.traits.Fan’);
-const fanTimerMode = traits?.[‘sdm.devices.traits.Fan’]?.timerMode;
-const fanTimerOn = fanTimerMode === ‘ON’;
+const hasFanTrait = Object.prototype.hasOwnProperty.call(traits || {}, 'sdm.devices.traits.Fan');
+const fanTimerMode = traits?.['sdm.devices.traits.Fan']?.timerMode;
+const fanTimerOn = fanTimerMode === 'ON';
 
-const connectivityStatus = traits?.[‘sdm.devices.traits.Connectivity’]?.status;
+const connectivityStatus = traits?.['sdm.devices.traits.Connectivity']?.status;
 const key = `${userId}-${deviceId}`;
 
 const prev = await getDeviceState(key) || {};
 
-const isReachable = (connectivityStatus === ‘OFFLINE’)
+const isReachable = (connectivityStatus === 'OFFLINE')
 ? false
-: (connectivityStatus === ‘ONLINE’)
+: (connectivityStatus === 'ONLINE')
 ? true
 : (prev.isReachable ?? true);
 
-console.log(‘DEBUG - Extracted trait values:’);
+console.log('DEBUG - Extracted trait values:');
 console.log(`- hvacStatusRaw: ${hvacStatusRaw}`);
 console.log(`- currentTemp: ${currentTemp}`);
 console.log(`- coolSetpoint: ${coolSetpoint}`);
@@ -555,29 +555,29 @@ console.log(`- hasFanTrait: ${hasFanTrait}, fanTimerMode: ${fanTimerMode} (fanTi
 console.log(`- connectivityStatus: ${connectivityStatus} -> isReachable=${isReachable}`);
 
 if (!userId || !deviceId || !timestamp) {
-console.warn(‘Skipping incomplete Nest event’);
+console.warn('Skipping incomplete Nest event');
 return;
 }
 
 const eventTime = toTimestamp(timestamp);
 
-const lastIsCooling = !!prev.lastEquipmentStatus?.includes(‘cool’);
-const lastIsHeating = !!prev.lastEquipmentStatus?.includes(‘heat’);
-const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes(‘fan’);
-const lastEquipmentStatus = prev.lastEquipmentStatus || ‘unknown’;
+const lastIsCooling = !!prev.lastEquipmentStatus?.includes('cool');
+const lastIsHeating = !!prev.lastEquipmentStatus?.includes('heat');
+const lastIsFanOnly = !!prev.lastEquipmentStatus?.includes('fan');
+const lastEquipmentStatus = prev.lastEquipmentStatus || 'unknown';
 
 // CHANGE 1: Improved HVAC status inference
 let hvacStatusEff = hvacStatusRaw;
 if (!hvacStatusEff && prev.isRunning && prev.currentMode) {
-hvacStatusEff = prev.currentMode === ‘heat’ ? ‘HEATING’ :
-prev.currentMode === ‘cool’ ? ‘COOLING’ : null;
+hvacStatusEff = prev.currentMode === 'heat' ? 'HEATING' :
+prev.currentMode === 'cool' ? 'COOLING' : null;
 console.log(`DEBUG - Preserving previous HVAC state: ${hvacStatusEff} (was in active session)`);
 }
-const explicitMode = traits?.[‘sdm.devices.traits.ThermostatMode’]?.mode;
-if (!hvacStatusEff && explicitMode === ‘OFF’) {
-hvacStatusEff = ‘OFF’;
+const explicitMode = traits?.['sdm.devices.traits.ThermostatMode']?.mode;
+if (!hvacStatusEff && explicitMode === 'OFF') {
+hvacStatusEff = 'OFF';
 }
-if (!hvacStatusEff) hvacStatusEff = ‘UNKNOWN’;
+if (!hvacStatusEff) hvacStatusEff = 'UNKNOWN';
 
 console.log(`DEBUG - HVAC Status Resolution: hvacStatusRaw="${hvacStatusRaw}", prev.currentMode="${prev.currentMode}", hvacStatusEff="${hvacStatusEff}"`);
 
@@ -599,15 +599,15 @@ heatSetpoint == null &&
 !hasFanTrait;
 
 if (noUsefulSignal) {
-console.log(‘No-op Nest event (no HVAC/temperature/connectivity/fan changes). Skipping.’);
+console.log('No-op Nest event (no HVAC/temperature/connectivity/fan changes). Skipping.');
 return;
 }
 
-const isHvacActiveStrict = (hvacStatus) => (hvacStatus === ‘HEATING’ || hvacStatus === ‘COOLING’ || fanTimerOn === true);
+const isHvacActiveStrict = (hvacStatus) => (hvacStatus === 'HEATING' || hvacStatus === 'COOLING' || fanTimerOn === true);
 
 // CHANGE 2: Modified temperature-only fast path
 if (isTemperatureOnlyEvent && !fanTimerOn && !sessions[key] && !prev.isRunning) {
-console.log(‘Temperature-only event detected (no active session)’);
+console.log('Temperature-only event detected (no active session)');
 
 ```
 await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
@@ -681,7 +681,7 @@ return;
 }
 
 if (isConnectivityOnly) {
-console.log(‘Connectivity-only event detected’);
+console.log('Connectivity-only event detected');
 
 ```
 const payload = {
@@ -751,7 +751,7 @@ return;
 
 }
 
-console.log(‘DEBUG: Validation passed, proceeding with full HVAC event processing’);
+console.log('DEBUG: Validation passed, proceeding with full HVAC event processing');
 
 const { isHeating, isCooling, isFanOnly, isActive, equipmentStatus } =
 deriveCurrentFlags(hvacStatusEff, fanTimerOn);
@@ -765,7 +765,7 @@ console.log(`DEBUG - Key decisions: hvacStatusEff="${hvacStatusEff}", isActive=$
 if (equipmentStatus !== prev.lastEquipmentStatus) {
 await logEquipmentEvent(
 key,
-‘EquipmentStateChanged’,
+'EquipmentStateChanged',
 equipmentStatus,
 prev.lastEquipmentStatus,
 Boolean(isActive),
@@ -781,7 +781,7 @@ timestamp: eventTime
 }
 
 function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
-const isHvacActive = (hvacStatusEff === ‘HEATING’ || hvacStatusEff === ‘COOLING’ || fanTimerOn === true);
+const isHvacActive = (hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING' || fanTimerOn === true);
 
 ```
 return {
@@ -829,13 +829,13 @@ let payload;
 if (isActive && !wasActive) {
 console.log(`🟢 HVAC/Fan turning ON: ${equipmentStatus} for ${key.substring(0, 16)}`);
 if (sessions[key] || prev.isRunning) {
-console.warn(‘Warning: Starting new session while previous session still active’);
+console.warn('Warning: Starting new session while previous session still active');
 if (sessions[key]?.startTime) {
 const prevRuntimeSeconds = Math.floor((eventTime - sessions[key].startTime) / 1000);
 if (prevRuntimeSeconds > 0 && prevRuntimeSeconds < 24 * 3600) {
 await logRuntimeSession(key, {
-mode: sessions[key].startStatus || ‘unknown’,
-equipmentStatus: ‘interrupted’,
+mode: sessions[key].startStatus || 'unknown',
+equipmentStatus: 'interrupted',
 startedAt: sessions[key].startTime,
 endedAt: eventTime,
 durationSeconds: prevRuntimeSeconds,
@@ -857,43 +857,24 @@ payload = createBubblePayload(0, false);
 console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
 
 } else if (!isActive && (wasActive || sessions[key])) {
-console.log(`🔴 HVAC/Fan transitioning OFF for ${key.substring(0, 16)}`);
-
-```
-let session = sessions[key];
-if (!session && prev.sessionStartedAt) {
-  session = {
-    startTime: prev.sessionStartedAt,
-    startStatus: prev.currentMode || 'unknown',
-    startTemperature: prev.lastTemperature || effectiveCurrentTemp
-  };
-  console.log('Using database session data for runtime calculation');
-}
-
-// CHANGE 3: Fan tail feature - set LAST_FAN_TAIL_SECONDS=0 to disable
-if (session?.startTime && FAN_TAIL_MS > 0) {
-  const tailEnd = Math.max(prev.lastFanTailUntil || 0, eventTime + FAN_TAIL_MS);
-  await updateDeviceState(key, {
-    ...prev,
-    isRunning: true,
-    sessionStartedAt: session.startTime,
-    currentMode: session.startStatus,
-    lastTemperature: currentTemp ?? prev.lastTemperature,
-    lastHeatSetpoint: heatSetpoint !== undefined ? heatSetpoint : prev.lastHeatSetpoint,
-    lastCoolSetpoint: coolSetpoint !== undefined ? coolSetpoint : prev.lastCoolSetpoint,
-    lastEquipmentStatus: 'off_tail',
-    isReachable,
-    lastSeenAt: eventTime,
-    lastActivityAt: eventTime,
-    roomDisplayName: roomDisplayName || prev.roomDisplayName,
-    lastFanTailUntil: tailEnd
-  });
-  console.log(`🕒 Deferring session close until tail ends at ${new Date(tailEnd).toLocaleTimeString()}`);
-  payload = createBubblePayload(0, false, session);
-} else {
+  console.log(`🔴 HVAC/Fan transitioning OFF for ${key.substring(0, 16)}`);
+  
+  let session = sessions[key];
+  if (!session && prev.sessionStartedAt) {
+    session = {
+      startTime: prev.sessionStartedAt,
+      startStatus: prev.currentMode || 'unknown',
+      startTemperature: prev.lastTemperature || effectiveCurrentTemp
+    };
+    console.log('Using database session data for runtime calculation');
+  }
+  
   if (session?.startTime) {
     const endedAt = eventTime;
-    const runtimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
+    const actualRuntimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
+    // Add tail seconds to runtime
+    const runtimeSeconds = actualRuntimeSeconds + FAN_TAIL_SECONDS;
+    
     if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
       await logRuntimeSession(key, {
         mode: session.startStatus,
@@ -907,7 +888,7 @@ if (session?.startTime && FAN_TAIL_MS > 0) {
         coolSetpoint: effectiveCoolSetpoint
       });
       payload = createBubblePayload(runtimeSeconds, true, session);
-      console.log(`✅ Ended session (no tail): ${runtimeSeconds}s runtime`);
+      console.log(`✅ Ended session: ${runtimeSeconds}s runtime (actual: ${actualRuntimeSeconds}s + tail: ${FAN_TAIL_SECONDS}s)`);
     } else {
       console.warn(`❌ Invalid runtime ${runtimeSeconds}s, sending zero`);
       payload = createBubblePayload(0, false);
@@ -942,7 +923,7 @@ console.log(`🌡️  State update: ${effectiveCurrentTemp}°C (${celsiusToFahre
 if ((!isActive) && (prev.lastFanTailUntil && eventTime >= prev.lastFanTailUntil) && (sessions[key] || prev.sessionStartedAt)) {
 const session = sessions[key] || {
 startTime: prev.sessionStartedAt,
-startStatus: prev.currentMode || ‘unknown’,
+startStatus: prev.currentMode || 'unknown',
 startTemperature: prev.lastTemperature || effectiveCurrentTemp
 };
 
@@ -985,7 +966,7 @@ prev.lastFanTailUntil = 0;
 }
 
 const newState = {
-…prev,
+...prev,
 isRunning: Boolean(isActive || (prev.lastFanTailUntil && eventTime < prev.lastFanTailUntil)),
 sessionStartedAt: (isActive || (prev.lastFanTailUntil && eventTime < prev.lastFanTailUntil))
 ? (sessions[key]?.startTime || prev.sessionStartedAt)
@@ -1010,8 +991,8 @@ const cleanedPayload = cleanPayloadForBubble(payload);
 await axios.post(process.env.BUBBLE_WEBHOOK_URL, cleanedPayload, {
 timeout: 10000,
 headers: {
-‘User-Agent’: ‘Nest-Runtime-Tracker/1.2’,
-‘Content-Type’: ‘application/json’
+'User-Agent': 'Nest-Runtime-Tracker/1.2',
+'Content-Type': 'application/json'
 }
 });
 
@@ -1043,7 +1024,7 @@ headers: {
 
 }
 
-console.log(‘DEBUG: Event processing complete’);
+console.log('DEBUG: Event processing complete');
 }
 
 /* ─────────────────────── Staleness Monitor ─────────────────────── */
@@ -1052,7 +1033,7 @@ setInterval(async () => {
 const now = Date.now();
 const staleThreshold = now - STALENESS_THRESHOLD;
 
-console.log(‘Checking for stale devices…’);
+console.log('Checking for stale devices...');
 
 for (const [key, state] of Object.entries(deviceStates)) {
 const lastActivity = state.lastActivityAt || 0;
@@ -1268,23 +1249,23 @@ const last = prev.lastActivityAt || session.startTime || now;
 
 async function initializeDatabase() {
 if (!ENABLE_DATABASE || !pool) {
-console.log(‘Database disabled - using memory-only state’);
+console.log('Database disabled - using memory-only state');
 return;
 }
 try {
-const result = await pool.query(‘SELECT NOW() as now’);
-console.log(‘Database connection established:’, result.rows[0].now);
+const result = await pool.query('SELECT NOW() as now');
+console.log('Database connection established:', result.rows[0].now);
 await runDatabaseMigration();
-const stateResult = await pool.query(‘SELECT device_key FROM device_states’);
+const stateResult = await pool.query('SELECT device_key FROM device_states');
 console.log(`Loaded ${stateResult.rows.length} existing device states`);
 } catch (error) {
-console.error(‘Database initialization failed:’, error.message);
-console.warn(‘Falling back to memory-only state management’);
+console.error('Database initialization failed:', error.message);
+console.warn('Falling back to memory-only state management');
 }
 }
 
-app.get(’/admin/health’, requireAuth, async (req, res) => {
-let dbStatus = ‘disabled’;
+app.get('/admin/health', requireAuth, async (req, res) => {
+let dbStatus = 'disabled';
 let dbInfo = {};
 
 if (pool) {
@@ -1314,14 +1295,14 @@ const dbResult = await pool.query(`SELECT  COUNT(*) as device_count, COUNT(CASE 
 }
 
 res.json({
-status: ‘healthy’,
+status: 'healthy',
 timestamp: new Date().toISOString(),
 uptime: process.uptime(),
 memorySessions: Object.keys(sessions).length,
 memoryStates: Object.keys(deviceStates).length,
 database: {
 status: dbStatus,
-…dbInfo
+...dbInfo
 },
 config: {
 stalenessThresholdHours: STALENESS_THRESHOLD / (60 * 60 * 1000),
@@ -1334,7 +1315,7 @@ memoryUsage: process.memoryUsage()
 });
 });
 
-app.get(’/admin/sessions’, requireAuth, (req, res) => {
+app.get('/admin/sessions', requireAuth, (req, res) => {
 const formatted = Object.fromEntries(
 Object.entries(sessions).map(([key, s]) => [
 key,
@@ -1352,18 +1333,18 @@ sessions: formatted
 });
 });
 
-app.get(’/health’, async (req, res) => {
-let dbStatus = ‘disabled’;
+app.get('/health', async (req, res) => {
+let dbStatus = 'disabled';
 if (pool) {
 try {
-await pool.query(‘SELECT 1’);
-dbStatus = ‘connected’;
+await pool.query('SELECT 1');
+dbStatus = 'connected';
 } catch (error) {
-dbStatus = ‘error’;
+dbStatus = 'error';
 }
 }
 res.status(200).json({
-status: ‘healthy’,
+status: 'healthy',
 timestamp: new Date().toISOString(),
 sessions: Object.keys(sessions).length,
 uptime: process.uptime(),
@@ -1372,22 +1353,22 @@ memoryUsage: process.memoryUsage()
 });
 });
 
-app.get(’/’, (req, res) => {
-res.send(‘Nest Runtime Webhook server is running!’);
+app.get('/', (req, res) => {
+res.send('Nest Runtime Webhook server is running!');
 });
 
-app.post(’/webhook’, async (req, res) => {
+app.post('/webhook', async (req, res) => {
 try {
 const pubsubMessage = req.body.message;
 if (!pubsubMessage || !pubsubMessage.data) {
-console.error(‘Invalid Pub/Sub message structure’);
+console.error('Invalid Pub/Sub message structure');
 }
 let eventData;
 try {
-eventData = JSON.parse(Buffer.from(pubsubMessage.data, ‘base64’).toString());
+eventData = JSON.parse(Buffer.from(pubsubMessage.data, 'base64').toString());
 } catch (decodeError) {
-console.error(‘Failed to decode Pub/Sub message:’, decodeError.message);
-return res.status(400).send(‘Invalid message format’);
+console.error('Failed to decode Pub/Sub message:', decodeError.message);
+return res.status(400).send('Invalid message format');
 }
 
 ```
@@ -1397,28 +1378,28 @@ res.status(200).send('OK');
 ```
 
 } catch (error) {
-console.error(‘Webhook error:’, error.message);
-res.status(500).send(‘Internal Server Error’);
+console.error('Webhook error:', error.message);
+res.status(500).send('Internal Server Error');
 }
 });
 
-app.use(’*’, (req, res) => {
-res.status(404).send(‘Not Found’);
+app.use('*', (req, res) => {
+res.status(404).send('Not Found');
 });
 
 app.use((error, req, res, next) => {
-console.error(‘Unhandled error:’, error.message);
-res.status(500).send(‘Internal Server Error’);
+console.error('Unhandled error:', error.message);
+res.status(500).send('Internal Server Error');
 });
 
-process.on(‘SIGINT’, async () => {
-console.log(‘Received SIGINT, shutting down gracefully…’);
+process.on('SIGINT', async () => {
+console.log('Received SIGINT, shutting down gracefully...');
 if (pool) await pool.end();
 process.exit(0);
 });
 
-process.on(‘SIGTERM’, async () => {
-console.log(‘Received SIGTERM, shutting down gracefully…’);
+process.on('SIGTERM', async () => {
+console.log('Received SIGTERM, shutting down gracefully...');
 if (pool) await pool.end();
 process.exit(0);
 });
@@ -1440,6 +1421,6 @@ console.log(`Ready to receive Nest events at /webhook`);
 }
 
 startServer().catch(error => {
-console.error(‘Failed to start server:’, error.message);
+console.error('Failed to start server:', error.message);
 process.exit(1);
 });
