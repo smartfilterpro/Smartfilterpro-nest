@@ -267,7 +267,7 @@ return;
 try {
 console.log('Checking database schema...');
 
-```
+
 const schemaExists = await pool.query(`
   SELECT COUNT(*) as count 
   FROM information_schema.tables 
@@ -417,7 +417,7 @@ const migrationSQL = `
 
 await pool.query(migrationSQL);
 console.log('Database schema created successfully');
-```
+
 
 } catch (error) {
 console.error('Database migration failed:', error.message);
@@ -445,7 +445,7 @@ isHvacActive: false,
 thermostatMode: 'UNKNOWN',
 isReachable: false,
 
-```
+
 currentTempF: deviceState.lastTemperature ? celsiusToFahrenheit(deviceState.lastTemperature) : 0,
 coolSetpointF: 0,
 heatSetpointF: 0,
@@ -471,7 +471,7 @@ stalenessReason: hoursSinceLastActivity >= 24 ? 'extended_offline' : 'device_off
 timestamp: new Date(currentTime).toISOString(),
 eventId: `stale-${Date.now()}`,
 eventTimestamp: currentTime
-```
+
 
 };
 
@@ -486,7 +486,7 @@ headers: {
 }
 });
 
-```
+
   console.log('Sent staleness notification to Bubble:', sanitizeForLogging({
     deviceId: payload.thermostatId,
     roomDisplayName: payload.roomDisplayName,
@@ -498,7 +498,7 @@ headers: {
 } catch (err) {
   console.error('Failed to send staleness notification to Bubble:', err.response?.status || err.code || err.message);
 }
-```
+
 
 }
 }
@@ -609,7 +609,7 @@ const isHvacActiveStrict = (hvacStatus) => (hvacStatus === 'HEATING' || hvacStat
 if (isTemperatureOnlyEvent && !fanTimerOn && !sessions[key] && !prev.isRunning) {
 console.log('Temperature-only event detected (no active session)');
 
-```
+
 await logTemperatureReading(key, celsiusToFahrenheit(currentTemp), 'F', 'ThermostatIndoorTemperatureEvent');
 
 const payload = {
@@ -676,14 +676,14 @@ await updateDeviceState(key, {
 
 console.log('DEBUG: Temperature-only event processing complete');
 return;
-```
+
 
 }
 
 if (isConnectivityOnly) {
 console.log('Connectivity-only event detected');
 
-```
+
 const payload = {
   userId,
   thermostatId: deviceId,
@@ -747,7 +747,7 @@ await updateDeviceState(key, {
 
 console.log('DEBUG: Connectivity-only event processing complete');
 return;
-```
+
 
 }
 
@@ -783,7 +783,7 @@ timestamp: eventTime
 function createBubblePayload(runtimeSeconds = 0, isRuntimeEvent = false, sessionData = null) {
 const isHvacActive = (hvacStatusEff === 'HEATING' || hvacStatusEff === 'COOLING' || fanTimerOn === true);
 
-```
+
 return {
   userId,
   thermostatId: deviceId,
@@ -820,7 +820,7 @@ return {
   eventId: eventData.eventId,
   eventTimestamp: eventTime
 };
-```
+
 
 }
 
@@ -899,7 +899,7 @@ console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toL
   }
   delete sessions[key];
 }
-```
+
 
 } else if (isActive && sessions[key]) {
 const session = sessions[key];
@@ -927,7 +927,7 @@ startStatus: prev.currentMode || 'unknown',
 startTemperature: prev.lastTemperature || effectiveCurrentTemp
 };
 
-```
+
 const endedAt = prev.lastFanTailUntil;
 const runtimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
 
@@ -961,7 +961,7 @@ if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
 
 delete sessions[key];
 prev.lastFanTailUntil = 0;
-```
+
 
 }
 
@@ -996,7 +996,7 @@ headers: {
 }
 });
 
-```
+
   console.log('Sent to Bubble:', sanitizeForLogging({
     runtimeSeconds: payload.runtimeSeconds,
     isRuntimeEvent: payload.isRuntimeEvent,
@@ -1020,7 +1020,7 @@ headers: {
     }
   }, 5000);
 }
-```
+
 
 }
 
@@ -1039,7 +1039,7 @@ for (const [key, state] of Object.entries(deviceStates)) {
 const lastActivity = state.lastActivityAt || 0;
 const lastStalenessNotification = state.lastStalenessNotification || 0;
 
-```
+
 if (lastActivity > 0 && lastActivity < staleThreshold) {
   const timeSinceLastNotification = now - lastStalenessNotification;
   if (lastStalenessNotification === 0 || timeSinceLastNotification >= STALENESS_THRESHOLD) {
@@ -1055,7 +1055,7 @@ if (lastActivity > 0 && lastActivity < staleThreshold) {
   delete state.lastStalenessNotification;
   deviceStates[key] = state;
 }
-```
+
 
 }
 
@@ -1063,7 +1063,7 @@ if (pool) {
 try {
 const staleDevices = await pool.query(`SELECT device_key, last_activity_at, last_temperature, last_equipment_status,  is_reachable, last_staleness_notification, room_display_name FROM device_states  WHERE last_activity_at < $1  AND last_activity_at > $2`, [new Date(staleThreshold), new Date(now - (7 * 24 * 60 * 60 * 1000))]);
 
-```
+
   for (const device of staleDevices.rows) {
     const lastStalenessNotification = device.last_staleness_notification ? 
       new Date(device.last_staleness_notification).getTime() : 0;
@@ -1087,7 +1087,7 @@ const staleDevices = await pool.query(`SELECT device_key, last_activity_at, last
 } catch (error) {
   console.error('Error checking database for stale devices:', error.message);
 }
-```
+
 
 }
 }, STALENESS_CHECK_INTERVAL);
@@ -1101,7 +1101,7 @@ try {
 const prev = await getDeviceState(key) || {};
 const last = prev.lastActivityAt || session.startTime || now;
 
-```
+
   if (prev.lastFanTailUntil && now >= prev.lastFanTailUntil) {
     const endedAt = prev.lastFanTailUntil;
     const runtimeSeconds = Math.max(0, Math.floor((endedAt - session.startTime) / 1000));
@@ -1240,7 +1240,7 @@ const last = prev.lastActivityAt || session.startTime || now;
 } catch (err) {
   console.error('Dead-man timeout error:', err.message);
 }
-```
+
 
 }
 }, 60 * 1000);
@@ -1272,7 +1272,7 @@ if (pool) {
 try {
 const dbResult = await pool.query(`SELECT  COUNT(*) as device_count, COUNT(CASE WHEN is_running = true THEN 1 END) as running_sessions, COUNT(CASE WHEN is_reachable = false THEN 1 END) as unreachable_devices FROM device_states`);
 
-```
+
   const sessionResult = await pool.query(`
     SELECT COUNT(*) as total_sessions
     FROM runtime_sessions 
@@ -1290,7 +1290,7 @@ const dbResult = await pool.query(`SELECT  COUNT(*) as device_count, COUNT(CASE 
   dbStatus = 'error';
   dbInfo = { error: error.message };
 }
-```
+
 
 }
 
@@ -1371,11 +1371,11 @@ console.error('Failed to decode Pub/Sub message:', decodeError.message);
 return res.status(400).send('Invalid message format');
 }
 
-```
+
 console.log('Processing Nest event:', eventData.eventId || 'unknown-event');
 await handleNestEvent(eventData);
 res.status(200).send('OK');
-```
+
 
 } catch (error) {
 console.error('Webhook error:', error.message);
@@ -1424,3 +1424,4 @@ startServer().catch(error => {
 console.error('Failed to start server:', error.message);
 process.exit(1);
 });
+
