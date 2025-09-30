@@ -219,6 +219,10 @@ class SessionManager {
       prev.startedAt = null;
       prev.startStatus = 'off';
       prev.tailUntil = 0;
+
+      // 🔧 Force inactive snapshot
+      isHvacActive = false;
+      equipmentStatus = 'off';
     }
     // Normal idle transition
     else if (becameIdle && prev.startedAt) {
