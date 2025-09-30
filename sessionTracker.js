@@ -5,11 +5,11 @@
  * - Counts runtime while air is moving: HEATING, COOLING, HEATCOOL (auto), or explicit FAN-only
  * - Keeps a tail (default 30s) after heat/cool ends
  * - Sticky-state: carries forward last known values if missing
- * - Grace period: requires OFF to persist before ending a session
+ * - Explicit OFF closes sessions immediately
  * - Timeout: force-close sessions if no OFF received (default 3m)
  */
 
-const RECENT_WINDOW_MS   = 120_000; // 2 min for sticky inference
+const RECENT_WINDOW_MS   = 120_000; // 2 min sticky
 const SESSION_TIMEOUT_MS = Number(process.env.NEST_SESSION_TIMEOUT_MS || 180000); // 3 min
 const COOL_DELTA_ON   = 0.0;
 const HEAT_DELTA_ON   = 0.0;
@@ -152,7 +152,7 @@ class SessionManager {
     const prev = this.getPrev(input.deviceId);
     const nowMs = new Date(input.when).getTime();
 
-    // Sticky: only carry forward if hvacStatusRaw missing
+    // Sticky only if hvacStatusRaw missing
     if (input.currentTempC == null && prev.lastTempC != null) input.currentTempC = prev.lastTempC;
     if (!input.thermostatMode && prev.lastMode) input.thermostatMode = prev.lastMode;
     if (!input.hvacStatusRaw && prev.lastEquipmentStatus) {
@@ -166,7 +166,7 @@ class SessionManager {
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
 
-    // ── Fan tail
+    // Fan tail
     if (!isHvacActive) {
       const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
@@ -182,7 +182,7 @@ class SessionManager {
       if (prev.tailUntil) prev.tailUntil = 0;
     }
 
-    // Timeout check
+    // Timeout safeguard
     if (prev.isRunning && nowMs - prev.lastAt > SESSION_TIMEOUT_MS) {
       const ms = Math.max(0, nowMs - prev.startedAt);
       const runtimeSeconds = Math.round(ms / 1000);
@@ -191,26 +191,7 @@ class SessionManager {
       prev.startedAt = null;
       prev.startStatus = 'off';
       prev.tailUntil = 0;
-      return {
-        userId: input.userId || null,
-        thermostatId: input.deviceId,
-        deviceName: input.deviceName,
-        roomDisplayName: input.roomDisplayName || '',
-        timestampISO: new Date(nowMs).toISOString(),
-        thermostatMode: input.thermostatMode || 'OFF',
-        hvacMode: 'OFF',
-        equipmentStatus: 'off',
-        isHvacActive: false,
-        isFanOnly: false,
-        isReachable,
-        currentTempC: input.currentTempC,
-        coolSetpointC: input.coolSetpointC,
-        heatSetpointC: input.heatSetpointC,
-        runtimeSeconds,
-        isRuntimeEvent: true,
-        startTempC: null,
-        endTempC: input.currentTempC,
-      };
+      return this._buildResult(input, nowMs, 'OFF', 'off', false, false, isReachable, runtimeSeconds, true);
     }
 
     const becameActive = !prev.isRunning && isHvacActive;
@@ -225,145 +206,18 @@ class SessionManager {
 
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
-    if (becameIdle && prev.startedAt) {
+
+    // Explicit OFF closes immediately
+    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
       const ms = Math.max(0, nowMs - prev.startedAt);
       runtimeSeconds = Math.round(ms / 1000);
       isRuntimeEvent = true;
+      console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
       prev.isRunning = false;
       prev.startedAt = null;
       prev.startStatus = 'off';
       prev.tailUntil = 0;
     }
-
-    prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
-    prev.lastAt = nowMs;
-    prev.lastEquipmentStatus = equipmentStatus || prev.lastEquipmentStatus;
-    prev.lastMode = input.thermostatMode || prev.lastMode;
-    prev.lastReachable = isReachable;
-    prev.lastRoom = input.roomDisplayName || prev.lastRoom;
-
-    const hvacMode = hvacModeFromEquipment(equipmentStatus);
-
-    const result = {
-      userId: input.userId || null,
-      thermostatId: input.deviceId,
-      deviceName: input.deviceName,
-      roomDisplayName: input.roomDisplayName || '',
-      timestampISO: new Date(nowMs).toISOString(),
-      thermostatMode: input.thermostatMode || 'OFF',
-      hvacMode,
-      equipmentStatus,
-      isHvacActive,
-      isFanOnly,
-      isReachable,
-      currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-      coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
-      heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
-      runtimeSeconds,
-      isRuntimeEvent,
-      startTempC: null,
-      endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-    };
-
-    console.log('[STATE]', {
-      thermo: input.deviceId,
-      mode: input.thermostatMode,
-      hvacStatusRaw: input.hvacStatusRaw,
-      active: isHvacActive,
-      equip: equipmentStatus,
-      runtimeSeconds,
-      eventTime: input.when,
-    });
-
-    return result;
-  }
-
-  toBubblePayload(result) {
-    const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
-    return {
-      userId: result.userId || null,
-      thermostatId: result.thermostatId || null,
-      deviceName: result.deviceName || null,
-      roomDisplayName: result.roomDisplayName || '',
-      runtimeSeconds: result.runtimeSeconds,
-      runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
-      isRuntimeEvent: Boolean(result.isRuntimeEvent),
-      hvacMode: result.hvacMode,
-      operatingState: result.equipmentStatus,
-      isHvacActive: Boolean(result.isHvacActive),
-      thermostatMode: result.thermostatMode,
-      isReachable: Boolean(result.isReachable),
-      currentTempF: c2f(result.currentTempC),
-      coolSetpointF: c2f(result.coolSetpointC),
-      heatSetpointF: c2f(result.heatSetpointC),
-      startTempF: null,
-      endTempF: c2f(result.endTempC),
-      currentTempC: result.currentTempC,
-      coolSetpointC: result.coolSetpointC,
-      heatSetpointC: result.heatSetpointC,
-      startTempC: null,
-      endTempC: result.endTempC,
-      lastIsCooling: result.equipmentStatus === 'cool',
-      lastIsHeating: result.equipmentStatus === 'heat',
-      lastIsFanOnly: result.equipmentStatus === 'fan',
-      lastEquipmentStatus: result.equipmentStatus,
-      equipmentStatus: result.equipmentStatus,
-      isFanOnly: result.isFanOnly,
-      timestamp: result.timestampISO,
-      eventId: genUuid(),
-      eventTimestamp: Date.parse(result.timestampISO),
-    };
-  }
-}
-
-/* ---------------- Inference ---------------- */
-
-function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
-  const hasCurrent = isNum(currentC);
-  const hasPrev = isNum(prevTempC);
-  const trendingDown = hasPrev && hasCurrent ? (prevTempC - currentC > TREND_DELTA) : false;
-  const trendingUp   = hasPrev && hasCurrent ? (currentC - prevTempC > TREND_DELTA) : false;
-  const canUseTrendOnly = !hasCurrent && hasPrev;
-
-  if (mode === 'COOL' || mode === 'HEATCOOL') {
-    if (isNum(coolC) && hasCurrent) {
-      if (currentC >= (coolC + COOL_DELTA_ON) || trendingDown) return 'COOLING';
-    } else if (canUseTrendOnly && trendingDown) return 'COOLING';
-  }
-  if (mode === 'HEAT' || mode === 'HEATCOOL') {
-    if (isNum(heatC) && hasCurrent) {
-      if (currentC <= (heatC - HEAT_DELTA_ON) || trendingUp) return 'HEATING';
-    } else if (canUseTrendOnly && trendingUp) return 'HEATING';
-  }
-  return 'OFF';
-}
-
-/* ---------------- Utils ---------------- */
-
-function hvacModeFromEquipment(equipmentStatus) {
-  switch ((equipmentStatus || 'off').toLowerCase()) {
-    case 'heat': return 'HEATING';
-    case 'cool': return 'COOLING';
-    case 'fan':  return 'FAN';
-    default:     return 'OFF';
-  }
-}
-
-function pick(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; return undefined; }
-function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
-function round2(n) { return Math.round(n * 100) / 100; }
-
-function genUuid() {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = (Math.random()*16)|0, v = c === 'x' ? r : (r&0x3|0x8);
-    return v.toString(16);
-  });
-}
-
-/* ---------------- Exports ---------------- */
-
-module.exports = {
-  SessionManager,
-  parseSdmPushMessage,
-  extractEffectiveTraits,
-};
+    // Normal idle transition
+    else if (becameIdle && prev.startedAt) {
+      const
