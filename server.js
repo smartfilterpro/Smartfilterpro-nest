@@ -857,24 +857,43 @@ payload = createBubblePayload(0, false);
 console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toLocaleTimeString()}`);
 
 } else if (!isActive && (wasActive || sessions[key])) {
-  console.log(`🔴 HVAC/Fan transitioning OFF for ${key.substring(0, 16)}`);
-  
-  let session = sessions[key];
-  if (!session && prev.sessionStartedAt) {
-    session = {
-      startTime: prev.sessionStartedAt,
-      startStatus: prev.currentMode || 'unknown',
-      startTemperature: prev.lastTemperature || effectiveCurrentTemp
-    };
-    console.log('Using database session data for runtime calculation');
-  }
-  
+console.log(`🔴 HVAC/Fan transitioning OFF for ${key.substring(0, 16)}`);
+
+```
+let session = sessions[key];
+if (!session && prev.sessionStartedAt) {
+  session = {
+    startTime: prev.sessionStartedAt,
+    startStatus: prev.currentMode || 'unknown',
+    startTemperature: prev.lastTemperature || effectiveCurrentTemp
+  };
+  console.log('Using database session data for runtime calculation');
+}
+
+// CHANGE 3: Fan tail feature - set LAST_FAN_TAIL_SECONDS=0 to disable
+if (session?.startTime && FAN_TAIL_MS > 0) {
+  const tailEnd = Math.max(prev.lastFanTailUntil || 0, eventTime + FAN_TAIL_MS);
+  await updateDeviceState(key, {
+    ...prev,
+    isRunning: true,
+    sessionStartedAt: session.startTime,
+    currentMode: session.startStatus,
+    lastTemperature: currentTemp ?? prev.lastTemperature,
+    lastHeatSetpoint: heatSetpoint !== undefined ? heatSetpoint : prev.lastHeatSetpoint,
+    lastCoolSetpoint: coolSetpoint !== undefined ? coolSetpoint : prev.lastCoolSetpoint,
+    lastEquipmentStatus: 'off_tail',
+    isReachable,
+    lastSeenAt: eventTime,
+    lastActivityAt: eventTime,
+    roomDisplayName: roomDisplayName || prev.roomDisplayName,
+    lastFanTailUntil: tailEnd
+  });
+  console.log(`🕒 Deferring session close until tail ends at ${new Date(tailEnd).toLocaleTimeString()}`);
+  payload = createBubblePayload(0, false, session);
+} else {
   if (session?.startTime) {
     const endedAt = eventTime;
-    const actualRuntimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
-    // Add tail seconds to runtime
-    const runtimeSeconds = actualRuntimeSeconds + FAN_TAIL_SECONDS;
-    
+    const runtimeSeconds = Math.floor((endedAt - session.startTime) / 1000);
     if (runtimeSeconds > 0 && runtimeSeconds < 24 * 3600) {
       await logRuntimeSession(key, {
         mode: session.startStatus,
@@ -888,7 +907,7 @@ console.log(`✅ Started ${equipmentStatus} session at ${new Date(eventTime).toL
         coolSetpoint: effectiveCoolSetpoint
       });
       payload = createBubblePayload(runtimeSeconds, true, session);
-      console.log(`✅ Ended session: ${runtimeSeconds}s runtime (actual: ${actualRuntimeSeconds}s + tail: ${FAN_TAIL_SECONDS}s)`);
+      console.log(`✅ Ended session (no tail): ${runtimeSeconds}s runtime`);
     } else {
       console.warn(`❌ Invalid runtime ${runtimeSeconds}s, sending zero`);
       payload = createBubblePayload(0, false);
