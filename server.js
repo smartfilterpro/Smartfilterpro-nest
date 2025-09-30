@@ -25,6 +25,9 @@ const BUBBLE_URL = (
   ''
 ).trim();
 
+// Optional default user id (if SDM msg lacks one)
+const DEFAULT_USER_ID = (process.env.DEFAULT_USER_ID || '').trim() || null;
+
 // Optional DB
 const ENABLE_DATABASE = process.env.ENABLE_DATABASE === '1';
 const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
@@ -55,9 +58,14 @@ async function postToBubble(payload) {
   }
   try {
     const { data, status } = await axios.post(BUBBLE_URL, payload, { timeout: 10_000 });
+    console.log('[BUBBLE-RESP]', status, JSON.stringify(data).slice(0, 500));
     return { ok: true, status, data };
   } catch (e) {
-    console.error('[ERROR] Post to Bubble failed:', e?.response?.status, e?.message);
+    console.error('[ERROR] Post to Bubble failed:',
+      e?.response?.status,
+      e?.message,
+      e?.response?.data ? JSON.stringify(e.response.data).slice(0, 500) : ''
+    );
     return { ok: false, error: e?.message, status: e?.response?.status };
   }
 }
@@ -75,6 +83,9 @@ app.post('*', (req, res, next) => {
 app.post(['/webhook', '/nest/events'], async (req, res) => {
   console.log('[INGRESS]', req.get('x-forwarded-for') || 'push', '→', req.originalUrl);
   try {
+    // show exactly what Google sent (truncated)
+    try { console.log('[RAW-EVENT]', JSON.stringify(req.body).slice(0, 800)); } catch {}
+
     const decoded = parseSdmPushMessage(req.body);
     if (!decoded) return res.status(204).end();
 
@@ -82,15 +93,15 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
       const traits = extractEffectiveTraits(evt);
 
       const input = {
-        userId: decoded.userId || null,
+        userId: decoded.userId || DEFAULT_USER_ID,       // ensure userId always filled if desired
         projectId: decoded.projectId || null,
         structureId: decoded.structureId || null,
         deviceId: traits.deviceId,
         deviceName: traits.deviceName,
         roomDisplayName: traits.roomDisplayName || '',
         when: traits.timestamp,
-        thermostatMode: traits.thermostatMode,
-        hvacStatusRaw: traits.hvacStatusRaw,
+        thermostatMode: traits.thermostatMode,           // OFF/HEAT/COOL/HEATCOOL
+        hvacStatusRaw: traits.hvacStatusRaw,             // HEATING/COOLING/OFF (maybe absent)
         hasFanTrait: traits.hasFanTrait,
         fanTimerMode: traits.fanTimerMode,
         fanTimerOn: traits.fanTimerOn,
@@ -127,6 +138,10 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
       }
 
       const bubblePayload = sessions.toBubblePayload(result);
+
+      // log exactly what we send to Bubble (truncated)
+      console.log('[BUBBLE-PAYLOAD]', JSON.stringify(bubblePayload, null, 2).slice(0, 1000));
+
       const postResp = await postToBubble(bubblePayload);
 
       console.log(
