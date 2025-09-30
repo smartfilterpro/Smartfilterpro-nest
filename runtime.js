@@ -9,7 +9,6 @@ const TAIL_SECONDS = parseInt(process.env.LAST_FAN_TAIL_SECONDS || '30', 10);
 
 /**
  * Determine active status based on equipment + fan timer.
- * Returns { active: boolean, mode: 'COOL'|'HEAT'|'FAN'|null }
  */
 function resolveActive(equipmentStatus, fanTimerMode) {
   const eq = (equipmentStatus || '').toLowerCase();
@@ -120,27 +119,39 @@ async function recordTemp(pool, device_key, temp, units, session_id) {
 
 async function handleEvent(pool, evt) {
   const {
-    userId, thermostatId, deviceName, temperatureC, temperatureF,
-    thermostatMode, equipmentStatus, fanTimerMode,
-    isReachable, roomDisplayName, eventId, eventTimestamp
+    userId, thermostatId, deviceName, resourceUpdate,
+    temperatureC, temperatureF, thermostatMode,
+    equipmentStatus, fanTimerMode, isReachable,
+    roomDisplayName, eventId, eventTimestamp
   } = evt;
 
-  // Validate device key
-  let device_key = thermostatId || deviceName;
+  // --- Resolve device key ---
+  let device_key = thermostatId || null;
+  if (!device_key && resourceUpdate && resourceUpdate.name) {
+    const parts = resourceUpdate.name.split('/');
+    device_key = parts[parts.length - 1]; // last segment of enterprises/.../devices/<id>
+    console.log(`[KEY RESOLVED] Extracted device_key from resourceUpdate.name: ${device_key}`);
+  }
+  if (!device_key && deviceName) {
+    device_key = deviceName;
+    console.log(`[KEY RESOLVED] Falling back to deviceName: ${device_key}`);
+  }
   if (!device_key) {
-    console.error('[ERROR] Event missing thermostatId and deviceName, cannot process:', evt);
+    console.error('[ERROR] Event missing thermostatId, deviceName, and resourceUpdate.name:', evt);
     return;
   }
-  console.log(`[EVENT] device_key=${device_key} eqStatus=${equipmentStatus} fan=${fanTimerMode} temp=${temperatureF || temperatureC} reachable=${isReachable}`);
 
   const units = Number.isFinite(temperatureF) ? 'F' : 'C';
-  const currentTemp = Number.isFinite(temperatureF) ? temperatureF : (Number.isFinite(temperatureC) ? temperatureC : null);
+  const currentTemp = Number.isFinite(temperatureF) ? temperatureF :
+                     (Number.isFinite(temperatureC) ? temperatureC : null);
+
+  console.log(`[EVENT] device=${device_key} eqStatus=${equipmentStatus} fan=${fanTimerMode} temp=${currentTemp} reachable=${isReachable}`);
 
   const deviceRow = await ensureDeviceRow(pool, {
     device_key, device_name: deviceName, units, room_display_name: roomDisplayName
   });
 
-  // Reachability handling
+  // --- Reachability ---
   if (isReachable === false) {
     const open = await getOpenSession(pool, device_key);
     if (open) {
@@ -174,7 +185,7 @@ async function handleEvent(pool, evt) {
     console.log(`[REACHABILITY] device=${device_key} marked reachable`);
   }
 
-  // Resolve active state
+  // --- Resolve active state ---
   const activeInfo = resolveActive(equipmentStatus, fanTimerMode);
   const open = await getOpenSession(pool, device_key);
 
@@ -216,6 +227,7 @@ async function handleEvent(pool, evt) {
     [device_key, activeInfo.mode || 'OFF', equipmentStatus || 'unknown', currentTemp, (fanTimerMode || 'UNKNOWN')]
   );
 
+  // --- Session handling ---
   if (activeInfo.active) {
     if (!open) {
       await startSession(pool, device_key, activeInfo.mode, (equipmentStatus || 'unknown'), currentTemp, null, null);
@@ -232,9 +244,7 @@ async function handleEvent(pool, evt) {
 
   // Post temperature-only event
   console.log(`[BUBBLE POST - TEMP] device=${device_key} temp=${currentTemp}${units}`);
-  await postToBubble({
-    ...basePayload,
-  });
+  await postToBubble({ ...basePayload });
 }
 
 module.exports = {
