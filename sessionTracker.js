@@ -87,7 +87,9 @@ function extractEffectiveTraits(evt) {
 /* ---------------- Sessions ---------------- */
 
 class SessionManager {
-  constructor() { this.byDevice = new Map(); }
+  constructor() {
+    this.byDevice = new Map();
+  }
 
   getPrev(deviceId) {
     if (!this.byDevice.has(deviceId)) {
@@ -220,4 +222,169 @@ class SessionManager {
     }
     // Normal idle transition
     else if (becameIdle && prev.startedAt) {
-      const
+      const ms = Math.max(0, nowMs - prev.startedAt);
+      runtimeSeconds = Math.round(ms / 1000);
+      isRuntimeEvent = true;
+      console.log('[SESSION END - BECAME IDLE]', input.deviceId, 'runtime', runtimeSeconds);
+      prev.isRunning = false;
+      prev.startedAt = null;
+      prev.startStatus = 'off';
+      prev.tailUntil = 0;
+    }
+
+    // Save state
+    prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
+    prev.lastAt = nowMs;
+    prev.lastEquipmentStatus = equipmentStatus || prev.lastEquipmentStatus;
+    prev.lastMode = input.thermostatMode || prev.lastMode;
+    prev.lastReachable = isReachable;
+    prev.lastRoom = input.roomDisplayName || prev.lastRoom;
+
+    const hvacMode = hvacModeFromEquipment(equipmentStatus);
+
+    const result = {
+      userId: input.userId || null,
+      thermostatId: input.deviceId,
+      deviceName: input.deviceName,
+      roomDisplayName: input.roomDisplayName || '',
+      timestampISO: new Date(nowMs).toISOString(),
+      thermostatMode: input.thermostatMode || 'OFF',
+      hvacMode,
+      equipmentStatus,
+      isHvacActive,
+      isFanOnly,
+      isReachable,
+      currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
+      coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
+      heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
+      runtimeSeconds,
+      isRuntimeEvent,
+      startTempC: null,
+      endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
+    };
+
+    console.log('[STATE]', {
+      thermo: input.deviceId,
+      mode: input.thermostatMode,
+      hvacStatusRaw: input.hvacStatusRaw,
+      active: isHvacActive,
+      equip: equipmentStatus,
+      runtimeSeconds,
+      eventTime: input.when,
+    });
+
+    return result;
+  }
+
+  _buildResult(input, nowMs, hvacMode, equipmentStatus, isHvacActive, isFanOnly, isReachable, runtimeSeconds, isRuntimeEvent) {
+    return {
+      userId: input.userId || null,
+      thermostatId: input.deviceId,
+      deviceName: input.deviceName,
+      roomDisplayName: input.roomDisplayName || '',
+      timestampISO: new Date(nowMs).toISOString(),
+      thermostatMode: input.thermostatMode || 'OFF',
+      hvacMode,
+      equipmentStatus,
+      isHvacActive,
+      isFanOnly,
+      isReachable,
+      currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
+      coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
+      heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
+      runtimeSeconds,
+      isRuntimeEvent,
+      startTempC: null,
+      endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
+    };
+  }
+
+  toBubblePayload(result) {
+    const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
+    return {
+      userId: result.userId || null,
+      thermostatId: result.thermostatId || null,
+      deviceName: result.deviceName || null,
+      roomDisplayName: result.roomDisplayName || '',
+      runtimeSeconds: result.runtimeSeconds,
+      runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
+      isRuntimeEvent: Boolean(result.isRuntimeEvent),
+      hvacMode: result.hvacMode,
+      operatingState: result.equipmentStatus,
+      isHvacActive: Boolean(result.isHvacActive),
+      thermostatMode: result.thermostatMode,
+      isReachable: Boolean(result.isReachable),
+      currentTempF: c2f(result.currentTempC),
+      coolSetpointF: c2f(result.coolSetpointC),
+      heatSetpointF: c2f(result.heatSetpointC),
+      startTempF: null,
+      endTempF: c2f(result.endTempC),
+      currentTempC: result.currentTempC,
+      coolSetpointC: result.coolSetpointC,
+      heatSetpointC: result.heatSetpointC,
+      startTempC: null,
+      endTempC: result.endTempC,
+      lastIsCooling: result.equipmentStatus === 'cool',
+      lastIsHeating: result.equipmentStatus === 'heat',
+      lastIsFanOnly: result.equipmentStatus === 'fan',
+      lastEquipmentStatus: result.equipmentStatus,
+      equipmentStatus: result.equipmentStatus,
+      isFanOnly: result.isFanOnly,
+      timestamp: result.timestampISO,
+      eventId: genUuid(),
+      eventTimestamp: Date.parse(result.timestampISO),
+    };
+  }
+}
+
+/* ---------------- Inference ---------------- */
+
+function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
+  const hasCurrent = isNum(currentC);
+  const hasPrev = isNum(prevTempC);
+  const trendingDown = hasPrev && hasCurrent ? (prevTempC - currentC > TREND_DELTA) : false;
+  const trendingUp   = hasPrev && hasCurrent ? (currentC - prevTempC > TREND_DELTA) : false;
+  const canUseTrendOnly = !hasCurrent && hasPrev;
+
+  if (mode === 'COOL' || mode === 'HEATCOOL') {
+    if (isNum(coolC) && hasCurrent) {
+      if (currentC >= (coolC + COOL_DELTA_ON) || trendingDown) return 'COOLING';
+    } else if (canUseTrendOnly && trendingDown) return 'COOLING';
+  }
+  if (mode === 'HEAT' || mode === 'HEATCOOL') {
+    if (isNum(heatC) && hasCurrent) {
+      if (currentC <= (heatC - HEAT_DELTA_ON) || trendingUp) return 'HEATING';
+    } else if (canUseTrendOnly && trendingUp) return 'HEATING';
+  }
+  return 'OFF';
+}
+
+/* ---------------- Utils ---------------- */
+
+function hvacModeFromEquipment(equipmentStatus) {
+  switch ((equipmentStatus || 'off').toLowerCase()) {
+    case 'heat': return 'HEATING';
+    case 'cool': return 'COOLING';
+    case 'fan':  return 'FAN';
+    default:     return 'OFF';
+  }
+}
+
+function pick(...vals) { for (const v of vals) if (v !== undefined && v !== null) return v; return undefined; }
+function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
+function round2(n) { return Math.round(n * 100) / 100; }
+
+function genUuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = (Math.random()*16)|0, v = c === 'x' ? r : (r&0x3|0x8);
+    return v.toString(16);
+  });
+}
+
+/* ---------------- Exports ---------------- */
+
+module.exports = {
+  SessionManager,
+  parseSdmPushMessage,
+  extractEffectiveTraits,
+};
