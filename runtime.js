@@ -67,13 +67,12 @@ async function startSession(pool, device_key, mode, equipment_status, temperatur
 async function closeSessionWithTail(pool, deviceStatusRow, sessionRow, latestTemperature, bubbleBasePayload) {
   const device_key = deviceStatusRow.device_key;
   const endTime = now();
-  // Delay post by TAIL_SECONDS and add it to runtime duration
   const ended_at = new Date(endTime.getTime() + TAIL_SECONDS * 1000);
   const duration_seconds = secondsBetween(new Date(sessionRow.started_at), ended_at);
 
   console.log(`[SESSION END] device=${device_key} mode=${sessionRow.mode} duration=${duration_seconds}s (tail=${TAIL_SECONDS}s)`);
 
-  const updated = await pool.query(
+  await pool.query(
     `UPDATE runtime_session
        SET ended_at=$3, duration_seconds=$4, end_temperature=$5, updated_at=now()
      WHERE id=$1 AND device_key=$2
@@ -105,7 +104,6 @@ async function closeSessionWithTail(pool, deviceStatusRow, sessionRow, latestTem
     equipmentStatus: 'unknown'
   };
 
-  // Delay the POST by TAIL_SECONDS
   await new Promise((resolve) => setTimeout(resolve, TAIL_SECONDS * 1000));
   console.log(`[BUBBLE POST - RUNTIME] device=${device_key} mode=${sessionRow.mode} duration=${duration_seconds}s`);
   await postToBubble(payload);
@@ -127,15 +125,20 @@ async function handleEvent(pool, evt) {
     isReachable, roomDisplayName, eventId, eventTimestamp
   } = evt;
 
+  // Validate device key
+  let device_key = thermostatId || deviceName;
+  if (!device_key) {
+    console.error('[ERROR] Event missing thermostatId and deviceName, cannot process:', evt);
+    return;
+  }
+  console.log(`[EVENT] device_key=${device_key} eqStatus=${equipmentStatus} fan=${fanTimerMode} temp=${temperatureF || temperatureC} reachable=${isReachable}`);
+
   const units = Number.isFinite(temperatureF) ? 'F' : 'C';
   const currentTemp = Number.isFinite(temperatureF) ? temperatureF : (Number.isFinite(temperatureC) ? temperatureC : null);
 
-  const device_key = thermostatId;
   const deviceRow = await ensureDeviceRow(pool, {
     device_key, device_name: deviceName, units, room_display_name: roomDisplayName
   });
-
-  console.log(`[EVENT] device=${device_key} eqStatus=${equipmentStatus} fan=${fanTimerMode} temp=${currentTemp} reachable=${isReachable}`);
 
   // Reachability handling
   if (isReachable === false) {
@@ -178,7 +181,7 @@ async function handleEvent(pool, evt) {
   // Always record temperature
   await recordTemp(pool, device_key, currentTemp, units, open ? open.id : null);
 
-  // Prepare base payload
+  // Base payload
   const basePayload = {
     userId,
     thermostatId,
@@ -227,11 +230,10 @@ async function handleEvent(pool, evt) {
     }
   }
 
-  // Post temperature-only event to Bubble
+  // Post temperature-only event
   console.log(`[BUBBLE POST - TEMP] device=${device_key} temp=${currentTemp}${units}`);
   await postToBubble({
     ...basePayload,
-    // isRuntimeEvent remains false for temp-only posts
   });
 }
 
