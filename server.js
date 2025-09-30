@@ -1,133 +1,149 @@
 'use strict';
 
-console.log('Starting Nest runtime tracker server...');
+/**
+ * Nest SDM runtime tracker (server/controller)
+ */
 
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { createPool } = require('./db');
-const { handleEvent } = require('./runtime');
+const axios = require('axios');
+const { Pool } = require('pg');
 require('dotenv').config();
 
+const {
+  SessionManager,
+  parseSdmPushMessage,
+  extractEffectiveTraits,
+} = require('./sessionTracker');
+
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 8080);
 
-app.use(express.json({ limit: '1mb' }));
+// Bubble endpoint
+const BUBBLE_URL = (process.env.BUBBLE_URL || '').trim();
 
-// --- Database connection ---
-const pool = createPool();
+// Optional DB
+const ENABLE_DATABASE = process.env.ENABLE_DATABASE === '1';
+const DATABASE_URL = (process.env.DATABASE_URL || '').trim();
+let pool = null;
+if (ENABLE_DATABASE && DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
+    max: 5,
+  });
+}
 
-// --- Ensure schema at startup ---
-if (pool) {
-  const schemaPath = path.join(__dirname, 'schema.sql');
+app.use(express.json({ limit: '2mb' }));
+
+const sessions = new SessionManager();
+
+/* ---------------- Helpers ---------------- */
+
+function short(id = '') {
+  if (typeof id !== 'string') return '';
+  return id.length <= 8 ? id : `${id.slice(0, 4)}…${id.slice(-4)}`;
+}
+
+async function postToBubble(payload) {
+  if (!BUBBLE_URL) {
+    console.warn('[WARN] BUBBLE_URL not set; skipping post');
+    return { skipped: true };
+  }
   try {
-    const schema = fs.readFileSync(schemaPath, 'utf8');
-    pool.query(schema)
-      .then(() => console.log('✅ Schema ensured at startup'))
-      .catch((err) => console.error('❌ Schema init failed', err));
-  } catch (err) {
-    console.error('❌ Could not read schema.sql', err);
+    const { data, status } = await axios.post(BUBBLE_URL, payload, { timeout: 10_000 });
+    return { ok: true, status, data };
+  } catch (e) {
+    console.error('[ERROR] Post to Bubble failed:', e?.response?.status, e?.message);
+    return { ok: false, error: e?.message, status: e?.response?.status };
   }
 }
 
-// --- Handler function ---
-async function nestHandler(req, res) {
-  try {
-    let body = req.body || {};
+/* ---------------- Routes ---------------- */
 
-    // Pub/Sub push wrapper → decode base64 JSON
-    if (body.message && body.message.data) {
-      try {
-        const decoded = Buffer.from(body.message.data, 'base64').toString('utf8');
-        body = JSON.parse(decoded);
-        console.log('[PUBSUB] Decoded event:', body);
-      } catch (err) {
-        console.error('[PUBSUB] Failed to decode base64 message.data:', err);
-        return res.status(400).json({ ok: false, error: 'Invalid Pub/Sub payload' });
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// catch-all POST logger (debug)
+app.post('*', (req, res, next) => {
+  console.log('[ANY-POST]', req.originalUrl, req.get('x-forwarded-for') || req.ip || '');
+  next();
+});
+
+app.post(['/webhook', '/nest/events'], async (req, res) => {
+  console.log('[INGRESS]', req.get('x-forwarded-for') || 'push', '→', req.originalUrl);
+  try {
+    const decoded = parseSdmPushMessage(req.body);
+    if (!decoded) return res.status(204).end();
+
+    for (const evt of decoded.events) {
+      const traits = extractEffectiveTraits(evt);
+
+      const input = {
+        userId: decoded.userId || null,
+        projectId: decoded.projectId || null,
+        structureId: decoded.structureId || null,
+        deviceId: traits.deviceId,
+        deviceName: traits.deviceName,
+        roomDisplayName: traits.roomDisplayName || '',
+        when: traits.timestamp,
+        thermostatMode: traits.thermostatMode,
+        hvacStatusRaw: traits.hvacStatusRaw,
+        hasFanTrait: traits.hasFanTrait,
+        fanTimerMode: traits.fanTimerMode,
+        fanTimerOn: traits.fanTimerOn,
+        currentTempC: traits.currentTempC,
+        coolSetpointC: traits.coolSetpointC,
+        heatSetpointC: traits.heatSetpointC,
+        connectivity: traits.connectivity,
+      };
+
+      const result = sessions.process(input);
+
+      if (ENABLE_DATABASE && pool) {
+        try {
+          await pool.query(
+            `INSERT INTO nest_events (
+               device_id, at, hvac_mode, is_active, hvac_status, fan_only, temp_c, cool_sp_c, heat_sp_c, reachable
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+            [
+              input.deviceId,
+              input.when,
+              result.thermostatMode || null,
+              result.isHvacActive,
+              result.equipmentStatus,
+              result.isFanOnly,
+              result.currentTempC,
+              result.coolSetpointC,
+              result.heatSetpointC,
+              result.isReachable,
+            ]
+          );
+        } catch (dbErr) {
+          console.warn('[WARN] DB insert failed (ok if table missing):', dbErr.message);
+        }
+      }
+
+      const bubblePayload = sessions.toBubblePayload(result);
+      const postResp = await postToBubble(bubblePayload);
+
+      console.log(
+        `[POST] user=${bubblePayload.userId} thermo=${short(bubblePayload.thermostatId)} ` +
+        `active=${bubblePayload.isHvacActive} hvacMode=${bubblePayload.hvacMode} ` +
+        `status=${bubblePayload.equipmentStatus} runtime=${bubblePayload.runtimeSeconds ?? '—'}`
+      );
+
+      if (!postResp?.ok && !postResp?.skipped) {
+        console.error('[ERROR] Bubble post failed for device:', input.deviceId);
       }
     }
 
-    if (!pool) throw new Error('Database not configured');
-
-    await handleEvent(pool, body);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Error handling Nest event:', e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-}
-
-// --- Routes ---
-app.get('/health', async (req, res) => {
-  res.json({ ok: true, tailSeconds: parseInt(process.env.LAST_FAN_TAIL_SECONDS || '30', 10) });
-});
-
-// Event ingestion (all use same handler)
-app.post('/nest/event', nestHandler);
-app.post('/nest/events', nestHandler);
-app.post('/webhook', nestHandler);
-
-// Hard delete user + thermostats
-app.delete('/users/:userId', async (req, res) => {
-  const userId = req.params.userId;
-  try {
-    if (!pool) throw new Error('Database not configured');
-
-    const workspace = req.query.workspace_id || null;
-    const location = req.query.location_id || null;
-
-    if (workspace || location) {
-      await pool.query(
-        `DELETE FROM temp_readings 
-         WHERE device_key IN (
-           SELECT device_key FROM device_status 
-           WHERE workspace_id = COALESCE($1, workspace_id) 
-             AND location_id = COALESCE($2, location_id)
-         )`, [workspace, location]
-      );
-      await pool.query(
-        `DELETE FROM equipment_events 
-         WHERE device_key IN (
-           SELECT device_key FROM device_status 
-           WHERE workspace_id = COALESCE($1, workspace_id) 
-             AND location_id = COALESCE($2, location_id)
-         )`, [workspace, location]
-      );
-      await pool.query(
-        `DELETE FROM runtime_session 
-         WHERE device_key IN (
-           SELECT device_key FROM device_status 
-           WHERE workspace_id = COALESCE($1, workspace_id) 
-             AND location_id = COALESCE($2, location_id)
-         )`, [workspace, location]
-      );
-      await pool.query(
-        `DELETE FROM device_status 
-         WHERE workspace_id = COALESCE($1, workspace_id) 
-           AND location_id = COALESCE($2, location_id)`,
-        [workspace, location]
-      );
-    } else {
-      return res.status(400).json({
-        ok: false,
-        error: "Provide workspace_id or location_id as query params to scope deletion."
-      });
-    }
-
-    res.json({ ok: true, deleted: true, userId, workspace_id: workspace, location_id: location });
-  } catch (e) {
-    console.error('Error deleting user/devices:', e);
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(204).end();
+  } catch (err) {
+    console.error('[ERROR] /webhook|/nest/events:', err?.message);
+    return res.status(204).end();
   }
 });
 
-// --- Start server ---
 app.listen(PORT, () => {
-  console.log('✅ Server listening on port', PORT);
-  console.log('   Routes ready:');
-  console.log('   - POST /nest/event');
-  console.log('   - POST /nest/events');
-  console.log('   - POST /webhook (Google Pub/Sub push)');
-  console.log('   - GET  /health');
-  console.log('   - DELETE /users/:userId');
+  console.log(`Nest runtime server listening on :${PORT}`);
+  console.log('Ready to receive Nest SDM pushes at /webhook and /nest/events');
 });
