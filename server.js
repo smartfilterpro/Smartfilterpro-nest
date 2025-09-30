@@ -18,8 +18,12 @@ const {
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-// Bubble endpoint
-const BUBBLE_URL = (process.env.BUBBLE_URL || '').trim();
+// Bubble endpoint: accept either env var name
+const BUBBLE_URL = (
+  process.env.BUBBLE_URL ||
+  process.env.BUBBLE_THERMOSTAT_UPDATES_URL ||
+  ''
+).trim();
 
 // Optional DB
 const ENABLE_DATABASE = process.env.ENABLE_DATABASE === '1';
