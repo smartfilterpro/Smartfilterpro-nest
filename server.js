@@ -1270,7 +1270,7 @@ setInterval(async () => {
       console.error('Dead-man timeout error:', err.message);
     }
   }
-}, 60 * 1000); // check every minute
+}, 60 * 1000);
 
 /* ─────────────────────── Startup / Routes ─────────────────────── */
 
