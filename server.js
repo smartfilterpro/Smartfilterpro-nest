@@ -3,6 +3,8 @@
 console.log('Starting Nest runtime tracker server...');
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const { createPool } = require('./db');
 const { handleEvent } = require('./runtime');
 require('dotenv').config();
@@ -14,11 +16,20 @@ app.use(express.json({ limit: '1mb' }));
 
 const pool = createPool();
 
-app.get('/health', async (req, res) => {
-  res.json({ ok: true, tailSeconds: parseInt(process.env.LAST_FAN_TAIL_SECONDS || '30', 10) });
-});
+// --- Ensure schema at startup ---
+if (pool) {
+  const schemaPath = path.join(__dirname, 'schema.sql');
+  try {
+    const schema = fs.readFileSync(schemaPath, 'utf8');
+    pool.query(schema)
+      .then(() => console.log('✅ Schema ensured at startup'))
+      .catch((err) => console.error('❌ Schema init failed', err));
+  } catch (err) {
+    console.error('❌ Could not read schema.sql', err);
+  }
+}
 
-// Wrap handler so both routes use the same logic
+// --- Handlers ---
 async function nestHandler(req, res) {
   try {
     if (!pool) throw new Error('Database not configured');
@@ -30,8 +41,13 @@ async function nestHandler(req, res) {
   }
 }
 
-// Ingest events from multiple endpoints
-app.post('/nest/event', nestHandler);   // legacy single
+// --- Routes ---
+app.get('/health', async (req, res) => {
+  res.json({ ok: true, tailSeconds: parseInt(process.env.LAST_FAN_TAIL_SECONDS || '30', 10) });
+});
+
+// Ingest events
+app.post('/nest/event', nestHandler);   // singular
 app.post('/nest/events', nestHandler);  // plural
 app.post('/webhook', nestHandler);      // generic webhook
 
@@ -60,6 +76,7 @@ app.delete('/users/:userId', async (req, res) => {
   }
 });
 
+// --- Start server ---
 app.listen(PORT, () => {
   console.log('✅ Server listening on port', PORT);
   console.log('   Routes ready:');
