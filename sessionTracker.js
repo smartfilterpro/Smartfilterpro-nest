@@ -5,7 +5,7 @@
  * - Counts runtime while air is moving: HEATING, COOLING, HEATCOOL (auto), or explicit FAN-only
  * - Keeps a tail (default 30s) after heat/cool ends
  * - Sticky-state: carries forward last known values if missing
- * - Explicit OFF closes sessions immediately
+ * - Explicit OFF respects tail, closes immediately only if NEST_FAN_TAIL_MS=0
  * - Timeout: force-close sessions if no OFF received (default 3m)
  */
 
@@ -168,11 +168,12 @@ class SessionManager {
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
 
-    // Fan tail
+    // Fan tail logic
     if (!isHvacActive) {
       const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
+        console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
       }
       if (prev.tailUntil && nowMs < prev.tailUntil) {
         isHvacActive = true;
@@ -209,20 +210,27 @@ class SessionManager {
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
 
-    // Explicit OFF closes immediately
+    // Explicit OFF handling
     if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      runtimeSeconds = Math.round(ms / 1000);
-      isRuntimeEvent = true;
-      console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
-      prev.tailUntil = 0;
-
-      // 🔧 Force inactive snapshot
-      isHvacActive = false;
-      equipmentStatus = 'off';
+      if (FAN_TAIL_MS > 0) {
+        // Defer close: use tail window
+        if (prev.tailUntil === 0) {
+          prev.tailUntil = nowMs + FAN_TAIL_MS;
+          console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
+        }
+      } else {
+        // No tail configured → close immediately
+        const ms = Math.max(0, nowMs - prev.startedAt);
+        runtimeSeconds = Math.round(ms / 1000);
+        isRuntimeEvent = true;
+        console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
+        prev.isRunning = false;
+        prev.startedAt = null;
+        prev.startStatus = 'off';
+        prev.tailUntil = 0;
+        isHvacActive = false;
+        equipmentStatus = 'off';
+      }
     }
     // Normal idle transition
     else if (becameIdle && prev.startedAt) {
