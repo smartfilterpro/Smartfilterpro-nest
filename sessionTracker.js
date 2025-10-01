@@ -401,9 +401,6 @@ function inferHvacFromTemps(mode, currentC, coolC, heatC, prevTempC) {
 function hvacModeFromEquipment(equipmentStatus) {
   switch ((equipmentStatus || 'off').toLowerCase()) {
     case 'heat': return 'HEATING';
-    function hvacModeFromEquipment(equipmentStatus) {
-  switch ((equipmentStatus || 'off').toLowerCase()) {
-    case 'heat': return 'HEATING';
     case 'cool': return 'COOLING';
     case 'fan':  return 'FAN';
     default:     return 'OFF';
@@ -415,13 +412,18 @@ function pick(...vals) {
   return undefined;
 }
 
-function isNum(v) { return typeof v === 'number' && Number.isFinite(v); }
-function round2(n) { return Math.round(n * 100) / 100; }
+function isNum(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
 
 function genUuid() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-    const r = (Math.random() * 16) | 0,
-      v = c === 'x' ? r : (r & 0x3) | 0x8;
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
 }
@@ -433,4 +435,3 @@ module.exports = {
   parseSdmPushMessage,
   extractEffectiveTraits,
 };
-    
