@@ -1,4 +1,3 @@
-// src/services/pubsubListener.js
 const { PubSub } = require('@google-cloud/pubsub');
 const { handleDeviceEvent } = require('./runtimeTracker');
 
