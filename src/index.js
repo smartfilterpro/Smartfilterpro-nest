@@ -1,9 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const { initDatabase, getPool } = require('./database/db');
-const { startPubSubListener } = require('./services/pubsubListener');
 const { recoverActiveSessions } = require('./services/runtimeTracker');
-const authRoutes = require('./routes/auth');
+const webhookRoutes = require('./routes/webhook');
 const deleteRoutes = require('./routes/delete');
 
 const app = express();
@@ -17,7 +16,7 @@ app.get('/health', (req, res) => {
 });
 
 // Routes
-app.use('/auth', authRoutes);
+app.use('/webhooks', webhookRoutes);
 app.use('/api', deleteRoutes);
 
 // Error handler
@@ -38,13 +37,10 @@ async function startup() {
     await recoverActiveSessions();
     console.log('✓ Active sessions recovered');
     
-    // Start Pub/Sub listener
-    await startPubSubListener();
-    console.log('✓ Pub/Sub listener started');
-    
     // Start Express server
     app.listen(PORT, () => {
       console.log(`✓ Server running on port ${PORT}`);
+      console.log(`✓ Webhook endpoint: POST /webhooks`);
       console.log('Application ready!');
     });
   } catch (error) {
