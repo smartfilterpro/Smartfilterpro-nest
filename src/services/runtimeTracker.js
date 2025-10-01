@@ -45,12 +45,12 @@ async function recoverActiveSessions() {
       };
       
       activeDevices.set(row.device_key, deviceState);
-      console.log(`✓ Recovered active session for device: ${row.device_key}`);
+      console.log(`Recovered active session for device: ${row.device_key}`);
     }
     
-    console.log(`✓ Recovered ${activeDevices.size} active session(s)`);
+    console.log(`Recovered ${activeDevices.size} active session(s)`);
   } catch (error) {
-    console.error('✗ Error recovering active sessions:', error);
+    console.error('Error recovering active sessions:', error);
   }
 }
 
@@ -68,14 +68,14 @@ async function handleDeviceEvent(eventData) {
     console.log(`User ID: ${userId}`);
     
     if (!deviceKey) {
-      console.error('✗ Could not extract device key from event');
+      console.error('Could not extract device key from event');
       return;
     }
     
     await ensureDeviceExists(deviceKey, userId, deviceName);
     
     const traits = eventData.resourceUpdate?.traits || {};
-    console.log('Traits received:', Object.keys(traits));
+    console.log('ALL TRAITS RECEIVED:', JSON.stringify(traits, null, 2));
     
     // Handle connectivity
     if (traits['sdm.devices.traits.Connectivity']) {
@@ -99,18 +99,21 @@ async function handleDeviceEvent(eventData) {
       console.log(`Thermostat Mode: ${thermostatMode}`);
     }
     
-    // Handle equipment status
-    let equipmentStatus = 'OFF';
+    // Handle equipment status (HEATING, COOLING, OFF)
+    let equipmentStatus = null;
     if (traits['sdm.devices.traits.ThermostatHvac']) {
-      equipmentStatus = traits['sdm.devices.traits.ThermostatHvac'].status || 'OFF';
-      console.log(`Equipment Status: ${equipmentStatus}`);
+      equipmentStatus = traits['sdm.devices.traits.ThermostatHvac'].status;
+      console.log(`Equipment Status from trait: ${equipmentStatus || 'NOT PROVIDED'}`);
     }
     
-    // Handle fan timer
-    let isFanTimerOn = false;
+    // Handle fan timer (Fan Only mode)
+    let isFanTimerOn = null;
     if (traits['sdm.devices.traits.Fan']) {
+      console.log(`Fan trait received:`, JSON.stringify(traits['sdm.devices.traits.Fan'], null, 2));
       isFanTimerOn = traits['sdm.devices.traits.Fan'].timerMode === 'ON';
-      console.log(`Fan Timer: ${isFanTimerOn ? 'ON' : 'OFF'}`);
+      console.log(`Fan Timer Status: ${isFanTimerOn ? 'ON' : 'OFF'}`);
+    } else {
+      console.log(`No Fan trait in this event - using last known state from database`);
     }
     
     // Handle setpoints
@@ -127,6 +130,31 @@ async function handleDeviceEvent(eventData) {
       console.log(`Setpoints - Heat: ${heatSetpoint}°F, Cool: ${coolSetpoint}°F`);
     }
     
+    // If this event doesn't contain equipment status or fan info, fetch from database
+    if (equipmentStatus === null || isFanTimerOn === null) {
+      console.log('Fetching missing data from database...');
+      const currentState = await pool.query(`
+        SELECT current_equipment_status, last_fan_status 
+        FROM device_status 
+        WHERE device_key = $1
+      `, [deviceKey]);
+      
+      if (currentState.rows.length > 0) {
+        if (equipmentStatus === null) {
+          equipmentStatus = currentState.rows[0].current_equipment_status || 'OFF';
+          console.log(`Equipment Status from DB: ${equipmentStatus}`);
+        }
+        if (isFanTimerOn === null) {
+          isFanTimerOn = currentState.rows[0].last_fan_status === 'ON';
+          console.log(`Fan Timer from DB: ${isFanTimerOn ? 'ON' : 'OFF'}`);
+        }
+      } else {
+        // Defaults for new devices
+        if (equipmentStatus === null) equipmentStatus = 'OFF';
+        if (isFanTimerOn === null) isFanTimerOn = false;
+      }
+    }
+    
     await processRuntimeLogic(
       deviceKey,
       userId,
@@ -141,7 +169,7 @@ async function handleDeviceEvent(eventData) {
     console.log('========== EVENT PROCESSING COMPLETE ==========\n');
     
   } catch (error) {
-    console.error('✗ Error handling device event:', error);
+    console.error('Error handling device event:', error);
     throw error;
   }
 }
@@ -156,23 +184,31 @@ async function processRuntimeLogic(
   heatSetpoint,
   coolSetpoint
 ) {
-  console.log('\n--- RUNTIME LOGIC ---');
+  console.log('\n--- RUNTIME LOGIC EVALUATION ---');
   
   const isHeating = equipmentStatus === 'HEATING';
   const isCooling = equipmentStatus === 'COOLING';
   const isOff = equipmentStatus === 'OFF';
   
-  console.log(`Equipment State - Heating: ${isHeating}, Cooling: ${isCooling}, Off: ${isOff}`);
-  console.log(`Fan Timer: ${isFanTimerOn}`);
+  console.log(`Equipment Status: ${equipmentStatus}`);
+  console.log(`  - Heating: ${isHeating}`);
+  console.log(`  - Cooling: ${isCooling}`);
+  console.log(`  - Off: ${isOff}`);
+  console.log(`Fan Timer: ${isFanTimerOn ? 'ON' : 'OFF'}`);
   
+  // System is active if ANY of these are true
   const shouldBeActive = isHeating || isCooling || isFanTimerOn;
   const currentState = activeDevices.get(deviceKey);
   const wasActive = !!currentState;
   
-  console.log(`Should be active: ${shouldBeActive} (was active: ${wasActive})`);
+  console.log('\nACTIVITY DETERMINATION:');
+  console.log(`Should be active: ${shouldBeActive}`);
+  console.log(`  Reason: ${isHeating ? 'Heating' : isCooling ? 'Cooling' : isFanTimerOn ? 'Fan Timer ON' : 'NONE'}`);
+  console.log(`Was active: ${wasActive}`);
+  console.log(`Current in-memory state: ${currentState ? 'EXISTS' : 'NONE'}`);
   
   if (shouldBeActive && !wasActive) {
-    console.log('→ ACTION: START NEW SESSION');
+    console.log('\nACTION: START NEW RUNTIME SESSION');
     await startRuntimeSession(
       deviceKey,
       userId,
@@ -184,10 +220,13 @@ async function processRuntimeLogic(
       coolSetpoint
     );
   } else if (!shouldBeActive && wasActive) {
-    console.log('→ ACTION: END SESSION');
+    console.log('\nACTION: END RUNTIME SESSION');
+    console.log(`  Both equipment OFF (${equipmentStatus}) AND fan OFF (${!isFanTimerOn})`);
     await endRuntimeSession(deviceKey, userId, deviceName, equipmentStatus);
   } else if (shouldBeActive && wasActive) {
-    console.log('→ ACTION: UPDATE EXISTING SESSION');
+    console.log('\nACTION: UPDATE EXISTING SESSION (still active)');
+    const elapsed = Math.floor((new Date() - currentState.sessionStartedAt) / 1000);
+    console.log(`  Session has been running for ${elapsed} seconds`);
     await updateRuntimeSession(
       deviceKey,
       equipmentStatus,
@@ -196,7 +235,7 @@ async function processRuntimeLogic(
       coolSetpoint
     );
   } else {
-    console.log('→ ACTION: NO CHANGE (idle)');
+    console.log('\nACTION: NO CHANGE (system idle)');
   }
   
   await logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, currentState);
@@ -222,7 +261,11 @@ async function startRuntimeSession(
     else if (equipmentStatus === 'COOLING') mode = 'cooling';
     else if (isFanTimerOn) mode = 'fan_only';
     
-    console.log(`Starting session - Mode: ${mode}, Session ID: ${sessionId}`);
+    console.log(`Starting session:`);
+    console.log(`  Mode: ${mode}`);
+    console.log(`  Session ID: ${sessionId}`);
+    console.log(`  Equipment: ${equipmentStatus}`);
+    console.log(`  Fan Timer: ${isFanTimerOn ? 'ON' : 'OFF'}`);
     
     const tempResult = await pool.query(
       'SELECT last_temperature FROM device_status WHERE device_key = $1',
@@ -247,12 +290,13 @@ async function startRuntimeSession(
         session_started_at = $2,
         current_mode = $3,
         current_equipment_status = $4,
-        last_heat_setpoint = $5,
-        last_cool_setpoint = $6,
+        last_fan_status = $5,
+        last_heat_setpoint = $6,
+        last_cool_setpoint = $7,
         last_activity_at = $2,
         updated_at = $2
       WHERE device_key = $1
-    `, [deviceKey, now, mode, equipmentStatus, heatSetpoint, coolSetpoint]);
+    `, [deviceKey, now, mode, equipmentStatus, isFanTimerOn ? 'ON' : 'OFF', heatSetpoint, coolSetpoint]);
     
     activeDevices.set(deviceKey, {
       deviceKey,
@@ -270,10 +314,10 @@ async function startRuntimeSession(
       coolSetpoint
     });
     
-    console.log(`✓ Session started at ${now.toISOString()}`);
-    console.log(`✓ isHvacActive is now: TRUE`);
+    console.log(`Session started at ${now.toISOString()}`);
+    console.log(`isHvacActive is now: TRUE`);
   } catch (error) {
-    console.error('✗ Error starting runtime session:', error);
+    console.error('Error starting runtime session:', error);
     throw error;
   }
 }
@@ -283,7 +327,7 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
   const deviceState = activeDevices.get(deviceKey);
   
   if (!deviceState) {
-    console.log('✗ No active session found - cannot end session');
+    console.log('No active session found - cannot end session');
     return;
   }
   
@@ -346,7 +390,7 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
     );
     const isReachable = reachableResult.rows[0]?.is_reachable ?? true;
     
-    console.log(`✓ isHvacActive is now: FALSE`);
+    console.log(`isHvacActive is now: FALSE`);
     
     if (totalRuntimeSeconds > 0) {
       console.log('\n>>> POSTING RUNTIME EVENT TO BUBBLE <<<');
@@ -374,13 +418,13 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
         eventTimestamp: now.getTime()
       });
     } else {
-      console.log('⊘ Runtime was 0 seconds - skipping Bubble post');
+      console.log('Runtime was 0 seconds - skipping Bubble post');
     }
     
     activeDevices.delete(deviceKey);
-    console.log(`✓ Session ended successfully`);
+    console.log(`Session ended successfully`);
   } catch (error) {
-    console.error('✗ Error ending runtime session:', error);
+    console.error('Error ending runtime session:', error);
     throw error;
   }
 }
@@ -413,6 +457,15 @@ async function updateRuntimeSession(
       WHERE session_id = $1
     `, [deviceState.sessionId, now, heatSetpoint, coolSetpoint]);
     
+    // Update device status with latest fan status
+    await pool.query(`
+      UPDATE device_status SET
+        last_fan_status = $2,
+        current_equipment_status = $3,
+        updated_at = NOW()
+      WHERE device_key = $1
+    `, [deviceKey, isFanTimerOn ? 'ON' : 'OFF', equipmentStatus]);
+    
     deviceState.isHeating = equipmentStatus === 'HEATING';
     deviceState.isCooling = equipmentStatus === 'COOLING';
     deviceState.isFanOnly = isFanTimerOn;
@@ -420,9 +473,9 @@ async function updateRuntimeSession(
     deviceState.heatSetpoint = heatSetpoint;
     deviceState.coolSetpoint = coolSetpoint;
     
-    console.log(`✓ Session updated - isHvacActive: TRUE`);
+    console.log(`Session updated - isHvacActive: TRUE`);
   } catch (error) {
-    console.error('✗ Error updating runtime session:', error);
+    console.error('Error updating runtime session:', error);
   }
 }
 
@@ -488,7 +541,7 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     });
     
   } catch (error) {
-    console.error('✗ Error handling temperature change:', error);
+    console.error('Error handling temperature change:', error);
   }
 }
 
@@ -504,9 +557,9 @@ async function updateDeviceReachability(deviceKey, isReachable) {
       WHERE device_key = $1
     `, [deviceKey, isReachable]);
     
-    console.log(`✓ Device reachability updated`);
+    console.log(`Device reachability updated`);
   } catch (error) {
-    console.error('✗ Error updating device reachability:', error);
+    console.error('Error updating device reachability:', error);
   }
 }
 
@@ -530,7 +583,7 @@ async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previ
       JSON.stringify({ isFanTimerOn })
     ]);
   } catch (error) {
-    console.error('✗ Error logging equipment event:', error);
+    console.error('Error logging equipment event:', error);
   }
 }
 
@@ -548,7 +601,7 @@ async function ensureDeviceExists(deviceKey, userId, deviceName) {
         updated_at = NOW()
     `, [deviceKey, userId, deviceName]);
   } catch (error) {
-    console.error('✗ Error ensuring device exists:', error);
+    console.error('Error ensuring device exists:', error);
   }
 }
 
