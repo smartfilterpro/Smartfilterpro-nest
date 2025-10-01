@@ -163,10 +163,10 @@ class SessionManager {
     if (!input.thermostatMode && prev.lastMode && hasRecentState) {
       input.thermostatMode = prev.lastMode;
     }
-    if (!input.hvacStatusRaw && prev.lastEquipmentStatus && hasRecentState) {
-      input.hvacStatusRaw =
-        prev.lastEquipmentStatus === 'heat' ? 'HEATING' :
-        prev.lastEquipmentStatus === 'cool' ? 'COOLING' : 'OFF';
+    // Only apply sticky state for active equipment (heat/cool), not for 'off'
+    // This allows temperature-based inference to work when equipment is off
+    if (!input.hvacStatusRaw && hasRecentState && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool')) {
+      input.hvacStatusRaw = prev.lastEquipmentStatus === 'heat' ? 'HEATING' : 'COOLING';
       console.log('[STICKY-STATE]', input.deviceId, 'inferred', input.hvacStatusRaw, 'from previous', prev.lastEquipmentStatus);
     }
 
