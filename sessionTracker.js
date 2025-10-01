@@ -235,16 +235,23 @@ class SessionManager {
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
 
-    // Explicit OFF closes immediately
-    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      runtimeSeconds = Math.round(ms / 1000);
-      isRuntimeEvent = true;
-      console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
+    // Explicit OFF closes immediately and clears tail
+    if (input.hvacStatusRaw === 'OFF') {
+      if (prev.isRunning && prev.startedAt) {
+        const ms = Math.max(0, nowMs - prev.startedAt);
+        runtimeSeconds = Math.round(ms / 1000);
+        isRuntimeEvent = true;
+        console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
+        prev.isRunning = false;
+        prev.startedAt = null;
+        prev.startStatus = 'off';
+      }
+      // Clear tail and force inactive state when explicit OFF received
       prev.tailUntil = 0;
+      prev.lastEquipmentStatus = 'off';
+      isHvacActive = false;
+      equipmentStatus = 'off';
+      console.log('[EXPLICIT-OFF]', input.deviceId, 'forced inactive, cleared tail');
     }
     // Normal idle transition
     else if (becameIdle && prev.startedAt) {
