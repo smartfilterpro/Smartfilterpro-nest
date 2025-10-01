@@ -1,4 +1,3 @@
-/ src/services/bubblePoster.js
 const axios = require('axios');
 
 const BUBBLE_URL = process.env.BUBBLE_WEBHOOK_URL;
