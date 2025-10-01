@@ -38,7 +38,7 @@ async function startup() {
     console.log('✓ Active sessions recovered');
     
     // Start Express server
-    app.listen(PORT, '0.0.0.0', () => {
+    app.listen(PORT, () => {
       console.log(`✓ Server running on port ${PORT}`);
       console.log(`✓ Webhook endpoint: POST /webhook`);
       console.log('Application ready!');
