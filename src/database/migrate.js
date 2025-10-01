@@ -35,7 +35,7 @@ async function runMigrations() {
         last_temperature DECIMAL(5,2),
         last_heat_setpoint DECIMAL(5,2),
         last_cool_setpoint DECIMAL(5,2),
-        last_fan_status TEXT,
+        last_fan_status TEXT DEFAULT 'OFF',
         last_equipment_status TEXT,
         last_mode TEXT,
         last_was_cooling BOOLEAN DEFAULT false,
@@ -134,7 +134,7 @@ async function runMigrations() {
     `);
     
     await client.query('COMMIT');
-    console.log('✓ All migrations completed successfully');
+    console.log('All migrations completed successfully');
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Migration failed:', error);
