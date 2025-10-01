@@ -9,9 +9,6 @@ router.delete('/user/:userId', async (req, res) => {
   const pool = getPool();
   
   try {
-    // Delete OAuth tokens
-    await pool.query('DELETE FROM oauth_tokens WHERE user_id = $1', [userId]);
-    
     // Delete all devices for this user (cascades to all related tables)
     const result = await pool.query(
       'DELETE FROM device_status WHERE frontend_id = $1 RETURNING device_key',
