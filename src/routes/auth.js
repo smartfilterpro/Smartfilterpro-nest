@@ -1,4 +1,3 @@
-// src/routes/auth.js
 const express = require('express');
 const axios = require('axios');
 const { getPool } = require('../database/db');
