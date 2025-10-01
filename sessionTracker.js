@@ -234,6 +234,22 @@ class SessionManager {
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
 
+    // Timeout safeguard
+    if (prev.isRunning && nowMs - prev.lastAt > SESSION_TIMEOUT_MS) {
+      const ms = Math.max(0, nowMs - prev.startedAt);
+      const runtimeSeconds = Math.round(ms / 1000);
+      console.log('[TIMEOUT-CLOSE]', input.deviceId, 'runtime', runtimeSeconds);
+      prev.isRunning = false;
+      prev.startedAt = null;
+      prev.startStatus = 'off';
+      prev.tailUntil = 0;
+      return this._buildResult(input, nowMs, 'OFF', 'off', false, false, isReachable, runtimeSeconds, true);
+    }
+
+    // Declare these early so tail logic can modify them
+    const becameActive = !prev.isRunning && isHvacActive;
+    let becameIdle = prev.isRunning && !isHvacActive;
+
     // Fan tail: Wait for fan to finish before calculating runtime
     // Don't extend isHvacActive, just delay the session close
     if (!isHvacActive && prev.isRunning) {
@@ -262,21 +278,6 @@ class SessionManager {
       console.log('[TAIL-CLEAR]', input.deviceId, 'HVAC active again');
       prev.tailUntil = 0;
     }
-
-    // Timeout safeguard
-    if (prev.isRunning && nowMs - prev.lastAt > SESSION_TIMEOUT_MS) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      const runtimeSeconds = Math.round(ms / 1000);
-      console.log('[TIMEOUT-CLOSE]', input.deviceId, 'runtime', runtimeSeconds);
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
-      prev.tailUntil = 0;
-      return this._buildResult(input, nowMs, 'OFF', 'off', false, false, isReachable, runtimeSeconds, true);
-    }
-
-    const becameActive = !prev.isRunning && isHvacActive;
-    let becameIdle = prev.isRunning && !isHvacActive;
 
     if (becameActive) {
       console.log('[SESSION START]', input.deviceId, 'equipment:', equipmentStatus);
