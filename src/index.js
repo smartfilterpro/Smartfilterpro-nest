@@ -1,4 +1,3 @@
-// src/index.js
 require('dotenv').config();
 const express = require('express');
 const { initDatabase, getPool } = require('./database/db');
@@ -63,5 +62,3 @@ process.on('SIGTERM', async () => {
 });
 
 startup();
-
-
