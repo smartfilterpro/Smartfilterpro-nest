@@ -154,15 +154,20 @@ class SessionManager {
     const prev = this.getPrev(input.deviceId);
     const nowMs = new Date(input.when).getTime();
 
-    // Sticky only if hvacStatusRaw missing
-    if (input.currentTempC == null && prev.lastTempC != null) input.currentTempC = prev.lastTempC;
-    if (!input.thermostatMode && prev.lastMode) input.thermostatMode = prev.lastMode;
-    if (!input.hvacStatusRaw && prev.lastEquipmentStatus) {
-      if (Date.now() - prev.lastAt < RECENT_WINDOW_MS) {
-        input.hvacStatusRaw =
-          prev.lastEquipmentStatus === 'heat' ? 'HEATING' :
-          prev.lastEquipmentStatus === 'cool' ? 'COOLING' : 'OFF';
-      }
+    // Sticky only if hvacStatusRaw missing AND we have recent valid state
+    const hasRecentState = prev.lastAt > 0 && (nowMs - prev.lastAt < RECENT_WINDOW_MS);
+    
+    if (input.currentTempC == null && prev.lastTempC != null && hasRecentState) {
+      input.currentTempC = prev.lastTempC;
+    }
+    if (!input.thermostatMode && prev.lastMode && hasRecentState) {
+      input.thermostatMode = prev.lastMode;
+    }
+    if (!input.hvacStatusRaw && prev.lastEquipmentStatus && hasRecentState) {
+      input.hvacStatusRaw =
+        prev.lastEquipmentStatus === 'heat' ? 'HEATING' :
+        prev.lastEquipmentStatus === 'cool' ? 'COOLING' : 'OFF';
+      console.log('[STICKY-STATE]', input.deviceId, 'inferred', input.hvacStatusRaw, 'from previous', prev.lastEquipmentStatus);
     }
 
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
@@ -173,6 +178,7 @@ class SessionManager {
       const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
+        console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
       }
       if (prev.tailUntil && nowMs < prev.tailUntil) {
         // Validate that the tail equipment status is compatible with current mode
@@ -186,16 +192,21 @@ class SessionManager {
         if (modeCompatible) {
           isHvacActive = true;
           equipmentStatus = prev.lastEquipmentStatus;
+          console.log('[TAIL-ACTIVE]', input.deviceId, 'extending', equipmentStatus);
         } else {
           // Mode changed, cancel the tail
           console.log('[TAIL-CANCEL]', input.deviceId, 'mode changed from', prev.lastMode, 'to', input.thermostatMode);
           prev.tailUntil = 0;
         }
       } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
+        console.log('[TAIL-EXPIRED]', input.deviceId);
         prev.tailUntil = 0;
       }
     } else {
-      if (prev.tailUntil) prev.tailUntil = 0;
+      if (prev.tailUntil) {
+        console.log('[TAIL-CLEAR]', input.deviceId, 'HVAC active again');
+        prev.tailUntil = 0;
+      }
     }
 
     // Timeout safeguard
@@ -214,6 +225,7 @@ class SessionManager {
     let becameIdle = prev.isRunning && !isHvacActive;
 
     if (becameActive) {
+      console.log('[SESSION START]', input.deviceId, 'equipment:', equipmentStatus);
       prev.isRunning = true;
       prev.startedAt = nowMs;
       prev.startStatus = equipmentStatus;
