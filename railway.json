@@ -1,5 +1,4 @@
-// railway.json
-{
+
   "build": {
     "builder": "NIXPACKS"
   },
@@ -10,10 +9,4 @@
   }
 }
 
-// .dockerignore
-node_modules
-npm-debug.log
-.env
-.git
-.gitignore
-README.md
+
