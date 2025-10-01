@@ -179,36 +179,22 @@ class SessionManager {
       prev.tailUntil = 0;
       prev.isRunning = true;
       prev.startStatus = equipmentStatus;
+      // startedAt stays the same → runtime continues
     }
 
     // Fan tail logic (only if not switching)
     if (!isHvacActive && !switchedWhileActive) {
       const justStopped = prev.isRunning &&
         (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
-
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
         console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
       }
-
-      if (prev.tailUntil > 0) {
-        if (nowMs < prev.tailUntil) {
-          // still in tail window → remain active
-          isHvacActive = true;
-          equipmentStatus = prev.lastEquipmentStatus;
-        } else {
-          // tail expired → close session
-          const ms = Math.max(0, nowMs - prev.startedAt);
-          const runtimeSeconds = Math.round(ms / 1000);
-          console.log('[TAIL-END]', input.deviceId, 'runtime', runtimeSeconds);
-          prev.isRunning = false;
-          prev.startedAt = null;
-          prev.startStatus = 'off';
-          prev.tailUntil = 0;
-          return this._buildResult(
-            input, nowMs, 'OFF', 'off', false, false, isReachable, runtimeSeconds, true
-          );
-        }
+      if (prev.tailUntil && nowMs < prev.tailUntil) {
+        isHvacActive = true;
+        equipmentStatus = prev.lastEquipmentStatus;
+      } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
+        prev.tailUntil = 0;
       }
     } else if (isHvacActive) {
       if (prev.tailUntil) prev.tailUntil = 0;
@@ -241,7 +227,12 @@ class SessionManager {
 
     // Explicit OFF handling
     if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt && !switchedWhileActive) {
-      if (FAN_TAIL_MS === 0) {
+      if (FAN_TAIL_MS > 0) {
+        if (prev.tailUntil === 0) {
+          prev.tailUntil = nowMs + FAN_TAIL_MS;
+          console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
+        }
+      } else {
         const ms = Math.max(0, nowMs - prev.startedAt);
         runtimeSeconds = Math.round(ms / 1000);
         isRuntimeEvent = true;
@@ -254,7 +245,7 @@ class SessionManager {
         equipmentStatus = 'off';
       }
     }
-    // Normal idle transition (if not switching)
+    // Normal idle transition
     else if (becameIdle && prev.startedAt && !switchedWhileActive) {
       const ms = Math.max(0, nowMs - prev.startedAt);
       runtimeSeconds = Math.round(ms / 1000);
