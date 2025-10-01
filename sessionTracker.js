@@ -175,8 +175,22 @@ class SessionManager {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
       }
       if (prev.tailUntil && nowMs < prev.tailUntil) {
-        isHvacActive = true;
-        equipmentStatus = prev.lastEquipmentStatus;
+        // Validate that the tail equipment status is compatible with current mode
+        const modeCompatible = (
+          (input.thermostatMode === 'HEAT' && prev.lastEquipmentStatus === 'heat') ||
+          (input.thermostatMode === 'COOL' && prev.lastEquipmentStatus === 'cool') ||
+          (input.thermostatMode === 'HEATCOOL' && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool')) ||
+          (input.thermostatMode === 'OFF')
+        );
+        
+        if (modeCompatible) {
+          isHvacActive = true;
+          equipmentStatus = prev.lastEquipmentStatus;
+        } else {
+          // Mode changed, cancel the tail
+          console.log('[TAIL-CANCEL]', input.deviceId, 'mode changed from', prev.lastMode, 'to', input.thermostatMode);
+          prev.tailUntil = 0;
+        }
       } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
         prev.tailUntil = 0;
       }
