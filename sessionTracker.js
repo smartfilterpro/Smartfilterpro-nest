@@ -7,6 +7,7 @@
  * - Sticky-state: carries forward last known values if missing
  * - Explicit OFF closes sessions immediately
  * - Timeout: force-close sessions if no OFF received (default 3m)
+ * - Event batching: collects events within 2s window before processing
  */
 
 const RECENT_WINDOW_MS   = 120_000; // 2 min sticky
@@ -15,6 +16,7 @@ const COOL_DELTA_ON   = 0.0;
 const HEAT_DELTA_ON   = 0.0;
 const TREND_DELTA     = 0.03;
 const FAN_TAIL_MS     = Number(process.env.NEST_FAN_TAIL_MS || 30000); // default 30s
+const EVENT_BATCH_MS  = 2000; // 2 second batching window
 
 /* ---------------- Parsing ---------------- */
 
@@ -84,11 +86,61 @@ function extractEffectiveTraits(evt) {
   };
 }
 
+/* ---------------- Event Batching ---------------- */
+
+class EventBatcher {
+  constructor() {
+    this.batches = new Map(); // deviceId -> { events: [], timer: timeout }
+  }
+
+  addEvent(deviceId, event, callback) {
+    if (!this.batches.has(deviceId)) {
+      this.batches.set(deviceId, { events: [], timer: null });
+    }
+
+    const batch = this.batches.get(deviceId);
+    batch.events.push(event);
+
+    // Clear existing timer
+    if (batch.timer) {
+      clearTimeout(batch.timer);
+    }
+
+    // Set new timer to process batch after delay
+    batch.timer = setTimeout(() => {
+      const events = batch.events;
+      this.batches.delete(deviceId);
+      
+      // Merge all events into one with combined traits
+      const merged = this.mergeEvents(events);
+      console.log('[BATCH]', deviceId, 'processed', events.length, 'events');
+      callback(merged);
+    }, EVENT_BATCH_MS);
+  }
+
+  mergeEvents(events) {
+    // Use the most recent timestamp
+    const sortedByTime = events.sort((a, b) => 
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+    
+    const merged = { ...sortedByTime[sortedByTime.length - 1] };
+    
+    // Merge traits from all events, with later events overwriting earlier ones
+    for (const evt of sortedByTime) {
+      Object.assign(merged, evt);
+    }
+    
+    return merged;
+  }
+}
+
 /* ---------------- Sessions ---------------- */
 
 class SessionManager {
   constructor() {
     this.byDevice = new Map();
+    this.batcher = new EventBatcher();
   }
 
   getPrev(deviceId) {
@@ -104,6 +156,7 @@ class SessionManager {
         lastReachable: true,
         lastRoom: '',
         tailUntil: 0,
+        lastPostedState: null, // Track last posted state for deduplication
       });
     }
     return this.byDevice.get(deviceId);
@@ -150,38 +203,64 @@ class SessionManager {
     return { isReachable, isHvacActive, equipmentStatus, isFanOnly };
   }
 
+  // Public method that batches events
+  queueEvent(input, callback) {
+    this.batcher.addEvent(input.deviceId, input, (mergedInput) => {
+      const result = this.process(mergedInput);
+      callback(result);
+    });
+  }
+
+  // Internal processing method
   process(input) {
     const prev = this.getPrev(input.deviceId);
     const nowMs = new Date(input.when).getTime();
 
-    // Sticky only if hvacStatusRaw missing
-    if (input.currentTempC == null && prev.lastTempC != null) input.currentTempC = prev.lastTempC;
-    if (!input.thermostatMode && prev.lastMode) input.thermostatMode = prev.lastMode;
-    if (!input.hvacStatusRaw && prev.lastEquipmentStatus) {
-      if (Date.now() - prev.lastAt < RECENT_WINDOW_MS) {
-        input.hvacStatusRaw =
-          prev.lastEquipmentStatus === 'heat' ? 'HEATING' :
-          prev.lastEquipmentStatus === 'cool' ? 'COOLING' : 'OFF';
-      }
+    // Sticky only if hvacStatusRaw missing AND we have recent valid state
+    const hasRecentState = prev.lastAt > 0 && (nowMs - prev.lastAt < RECENT_WINDOW_MS);
+    
+    if (input.currentTempC == null && prev.lastTempC != null && hasRecentState) {
+      input.currentTempC = prev.lastTempC;
+    }
+    if (!input.thermostatMode && prev.lastMode && hasRecentState) {
+      input.thermostatMode = prev.lastMode;
+    }
+    // Only apply sticky state for active equipment (heat/cool), not for 'off'
+    if (!input.hvacStatusRaw && hasRecentState && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool')) {
+      input.hvacStatusRaw = prev.lastEquipmentStatus === 'heat' ? 'HEATING' : 'COOLING';
+      console.log('[STICKY-STATE]', input.deviceId, 'inferred', input.hvacStatusRaw, 'from previous', prev.lastEquipmentStatus);
     }
 
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
 
-    // Fan tail
-    if (!isHvacActive) {
-      const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
+    // Fan tail: Wait for fan to finish before calculating runtime
+    // Don't extend isHvacActive, just delay the session close
+    if (!isHvacActive && prev.isRunning) {
+      const justStopped = (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
+        console.log('[TAIL-START]', input.deviceId, 'fan running until', new Date(prev.tailUntil).toISOString());
       }
-      if (prev.tailUntil && nowMs < prev.tailUntil) {
-        isHvacActive = true;
-        equipmentStatus = prev.lastEquipmentStatus;
-      } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
-        prev.tailUntil = 0;
-      }
-    } else {
-      if (prev.tailUntil) prev.tailUntil = 0;
+    }
+    
+    // Check if tail expired
+    if (prev.tailUntil > 0 && nowMs >= prev.tailUntil) {
+      console.log('[TAIL-EXPIRED]', input.deviceId, 'fan stopped, ending session');
+      prev.tailUntil = 0;
+      becameIdle = true; // Trigger session end now
+    }
+    
+    // If still in tail period, don't end session yet
+    if (prev.tailUntil > 0 && nowMs < prev.tailUntil) {
+      console.log('[TAIL-WAITING]', input.deviceId, Math.round((prev.tailUntil - nowMs) / 1000), 'seconds remaining');
+      becameIdle = false; // Prevent session from ending
+    }
+    
+    // Clear tail if HVAC becomes active again
+    if (isHvacActive && prev.tailUntil > 0) {
+      console.log('[TAIL-CLEAR]', input.deviceId, 'HVAC active again');
+      prev.tailUntil = 0;
     }
 
     // Timeout safeguard
@@ -200,6 +279,7 @@ class SessionManager {
     let becameIdle = prev.isRunning && !isHvacActive;
 
     if (becameActive) {
+      console.log('[SESSION START]', input.deviceId, 'equipment:', equipmentStatus);
       prev.isRunning = true;
       prev.startedAt = nowMs;
       prev.startStatus = equipmentStatus;
@@ -209,16 +289,23 @@ class SessionManager {
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
 
-    // Explicit OFF closes immediately
-    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      runtimeSeconds = Math.round(ms / 1000);
-      isRuntimeEvent = true;
-      console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
+    // Explicit OFF closes immediately and clears tail
+    if (input.hvacStatusRaw === 'OFF') {
+      if (prev.isRunning && prev.startedAt) {
+        const ms = Math.max(0, nowMs - prev.startedAt);
+        runtimeSeconds = Math.round(ms / 1000);
+        isRuntimeEvent = true;
+        console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
+        prev.isRunning = false;
+        prev.startedAt = null;
+        prev.startStatus = 'off';
+      }
+      // Clear tail and force inactive state when explicit OFF received
       prev.tailUntil = 0;
+      prev.lastEquipmentStatus = 'off';
+      isHvacActive = false;
+      equipmentStatus = 'off';
+      console.log('[EXPLICIT-OFF]', input.deviceId, 'forced inactive, cleared tail');
     }
     // Normal idle transition
     else if (becameIdle && prev.startedAt) {
@@ -263,6 +350,9 @@ class SessionManager {
       endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
     };
 
+    // Determine if this should be posted to Bubble
+    result.shouldPost = this.shouldPostToBubble(result, prev);
+
     console.log('[STATE]', {
       thermo: input.deviceId,
       mode: input.thermostatMode,
@@ -270,10 +360,70 @@ class SessionManager {
       active: isHvacActive,
       equip: equipmentStatus,
       runtimeSeconds,
+      shouldPost: result.shouldPost,
       eventTime: input.when,
     });
 
     return result;
+  }
+
+  shouldPostToBubble(result, prev) {
+    // Always post runtime events
+    if (result.isRuntimeEvent) {
+      console.log('[POST-REASON]', result.thermostatId, 'runtime event');
+      return true;
+    }
+
+    const last = prev.lastPostedState;
+    
+    // First event for this device
+    if (!last) {
+      console.log('[POST-REASON]', result.thermostatId, 'first event');
+      prev.lastPostedState = this.captureState(result);
+      return true;
+    }
+
+    // HVAC active state changed
+    if (result.isHvacActive !== last.isHvacActive) {
+      console.log('[POST-REASON]', result.thermostatId, 'active state changed:', last.isHvacActive, '→', result.isHvacActive);
+      prev.lastPostedState = this.captureState(result);
+      return true;
+    }
+
+    // Equipment status changed (heat/cool/fan/off)
+    if (result.equipmentStatus !== last.equipmentStatus) {
+      console.log('[POST-REASON]', result.thermostatId, 'equipment changed:', last.equipmentStatus, '→', result.equipmentStatus);
+      prev.lastPostedState = this.captureState(result);
+      return true;
+    }
+
+    // Thermostat mode changed (HEAT/COOL/HEATCOOL/OFF)
+    if (result.thermostatMode !== last.thermostatMode) {
+      console.log('[POST-REASON]', result.thermostatId, 'mode changed:', last.thermostatMode, '→', result.thermostatMode);
+      prev.lastPostedState = this.captureState(result);
+      return true;
+    }
+
+    // Indoor temperature changed (rounded to 0.1°C to avoid noise)
+    const tempChanged = result.currentTempC != null && last.currentTempC != null &&
+      Math.abs(result.currentTempC - last.currentTempC) >= 0.1;
+    if (tempChanged) {
+      console.log('[POST-REASON]', result.thermostatId, 'temp changed:', last.currentTempC, '→', result.currentTempC);
+      prev.lastPostedState = this.captureState(result);
+      return true;
+    }
+
+    console.log('[POST-SKIP]', result.thermostatId, 'no significant change');
+    return false;
+  }
+
+  captureState(result) {
+    return {
+      isHvacActive: result.isHvacActive,
+      equipmentStatus: result.equipmentStatus,
+      thermostatMode: result.thermostatMode,
+      currentTempC: result.currentTempC,
+    };
   }
 
   _buildResult(input, nowMs, hvacMode, equipmentStatus, isHvacActive, isFanOnly, isReachable, runtimeSeconds, isRuntimeEvent) {
@@ -296,6 +446,7 @@ class SessionManager {
       isRuntimeEvent,
       startTempC: null,
       endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
+      shouldPost: true, // Timeout events should always post
     };
   }
 
