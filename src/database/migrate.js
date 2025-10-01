@@ -1,4 +1,3 @@
-// src/database/migrate.js
 const { getPool } = require('./db');
 
 async function runMigrations() {
