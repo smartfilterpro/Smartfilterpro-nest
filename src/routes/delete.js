@@ -1,4 +1,3 @@
-// src/routes/delete.js
 const express = require('express');
 const { getPool } = require('../database/db');
 
