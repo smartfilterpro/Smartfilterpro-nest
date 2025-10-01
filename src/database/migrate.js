@@ -122,18 +122,6 @@ async function runMigrations() {
       ON temp_readings(session_id)
     `);
     
-    // OAuth Tokens Table (for storing user tokens)
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS oauth_tokens (
-        user_id TEXT PRIMARY KEY,
-        access_token TEXT NOT NULL,
-        refresh_token TEXT,
-        expires_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `);
-    
     await client.query('COMMIT');
     console.log('✓ All migrations completed successfully');
   } catch (error) {
