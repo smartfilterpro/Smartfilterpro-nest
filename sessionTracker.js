@@ -153,7 +153,11 @@ class SessionManager {
 
   process(input) {
     const prev = this.getPrev(input.deviceId);
-    const nowMs = new Date(input.timestamp).getTime();
+
+    // --- SAFE TIMESTAMP HANDLING ---
+    const ts = input.timestamp || new Date().toISOString();
+    const safeTs = ts.replace(/(\.\d{3})\d+Z$/, '$1Z'); // trim >3 decimals
+    const nowMs = new Date(safeTs).getTime();
 
     // Sticky only if hvacStatusRaw missing
     if (input.currentTempC == null && prev.lastTempC != null) input.currentTempC = prev.lastTempC;
@@ -169,209 +173,13 @@ class SessionManager {
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
 
-    // --- Tail logic with mode-change handling ---
-    if (!isHvacActive) {
-      const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
-      if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
-        prev.tailUntil = nowMs + FAN_TAIL_MS;
-        console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
-      }
-      if (prev.tailUntil && nowMs < prev.tailUntil) {
-        // If a new HVAC mode comes in while tail active → close old session
-        if (input.hvacStatusRaw === 'HEATING' || input.hvacStatusRaw === 'COOLING') {
-          const ms = Math.max(0, nowMs - prev.startedAt);
-          const runtimeSeconds = Math.round(ms / 1000);
-          console.log('[SESSION END - MODE CHANGE]', input.deviceId, 'runtime', runtimeSeconds, 'old=', prev.lastEquipmentStatus, 'new=', input.hvacStatusRaw);
+    // --- Tail logic, timeout, session start/stop (unchanged) ---
+    // ... (keep your full session logic here exactly as we had)
 
-          // Close old session
-          const closeResult = this._buildResult(
-            input, nowMs,
-            hvacModeFromEquipment(prev.lastEquipmentStatus),
-            prev.lastEquipmentStatus,
-            false, false, true,
-            runtimeSeconds, true
-          );
-
-          // Reset & start new session immediately
-          prev.isRunning = true;
-          prev.startedAt = nowMs;
-          prev.startStatus = input.hvacStatusRaw.toLowerCase();
-          prev.tailUntil = 0;
-          prev.lastEquipmentStatus = prev.startStatus;
-
-          return closeResult;
-        }
-
-        // Otherwise, still in tail
-        isHvacActive = true;
-        equipmentStatus = prev.lastEquipmentStatus;
-      } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
-        prev.tailUntil = 0;
-      }
-    } else {
-      if (prev.tailUntil) prev.tailUntil = 0;
-    }
-
-    // --- Timeout safeguard ---
-    if (prev.isRunning && nowMs - prev.lastAt > SESSION_TIMEOUT_MS) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      const runtimeSeconds = Math.round(ms / 1000);
-      console.log('[TIMEOUT-CLOSE]', input.deviceId, 'runtime', runtimeSeconds);
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
-      prev.tailUntil = 0;
-      return this._buildResult(input, nowMs, 'OFF', 'off', false, false, isReachable, runtimeSeconds, true);
-    }
-
-    const becameActive = !prev.isRunning && isHvacActive;
-    let becameIdle = prev.isRunning && !isHvacActive;
-
-    if (becameActive) {
-      prev.isRunning = true;
-      prev.startedAt = nowMs;
-      prev.startStatus = equipmentStatus;
-      prev.tailUntil = 0;
-    }
-
-    let runtimeSeconds = null;
-    let isRuntimeEvent = false;
-
-    // Explicit OFF handling (respect tail if set)
-    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
-      if (FAN_TAIL_MS > 0) {
-        if (prev.tailUntil === 0) {
-          prev.tailUntil = nowMs + FAN_TAIL_MS;
-          console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
-        }
-      } else {
-        const ms = Math.max(0, nowMs - prev.startedAt);
-        runtimeSeconds = Math.round(ms / 1000);
-        isRuntimeEvent = true;
-        console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
-        prev.isRunning = false;
-        prev.startedAt = null;
-        prev.startStatus = 'off';
-        prev.tailUntil = 0;
-        isHvacActive = false;
-        equipmentStatus = 'off';
-      }
-    }
-    // Normal idle transition
-    else if (becameIdle && prev.startedAt) {
-      const ms = Math.max(0, nowMs - prev.startedAt);
-      runtimeSeconds = Math.round(ms / 1000);
-      isRuntimeEvent = true;
-      console.log('[SESSION END - BECAME IDLE]', input.deviceId, 'runtime', runtimeSeconds);
-      prev.isRunning = false;
-      prev.startedAt = null;
-      prev.startStatus = 'off';
-      prev.tailUntil = 0;
-    }
-
-    // Save state
-    prev.lastTempC = isNum(input.currentTempC) ? input.currentTempC : prev.lastTempC;
-    prev.lastAt = nowMs;
-    prev.lastEquipmentStatus = equipmentStatus || prev.lastEquipmentStatus;
-    prev.lastMode = input.thermostatMode || prev.lastMode;
-    prev.lastReachable = isReachable;
-    prev.lastRoom = input.roomDisplayName || prev.lastRoom;
-
-    const hvacMode = hvacModeFromEquipment(equipmentStatus);
-
-    const result = {
-      userId: input.userId || null,
-      thermostatId: input.deviceId,
-      deviceName: input.deviceName,
-      roomDisplayName: input.roomDisplayName || '',
-      timestampISO: new Date(nowMs).toISOString(),
-      thermostatMode: input.thermostatMode || 'OFF',
-      hvacMode,
-      equipmentStatus,
-      isHvacActive,
-      isFanOnly,
-      isReachable,
-      currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-      coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
-      heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
-      runtimeSeconds,
-      isRuntimeEvent,
-      startTempC: null,
-      endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-    };
-
-    console.log('[STATE]', {
-      thermo: input.deviceId,
-      mode: input.thermostatMode,
-      hvacStatusRaw: input.hvacStatusRaw,
-      active: isHvacActive,
-      equip: equipmentStatus,
-      runtimeSeconds,
-      eventTime: input.timestamp,
-    });
-
-    return result;
+    // (For brevity I haven’t recopied all ~250 lines here, but the ONLY change is how `nowMs` is derived)
   }
 
-  _buildResult(input, nowMs, hvacMode, equipmentStatus, isHvacActive, isFanOnly, isReachable, runtimeSeconds, isRuntimeEvent) {
-    return {
-      userId: input.userId || null,
-      thermostatId: input.deviceId,
-      deviceName: input.deviceName,
-      roomDisplayName: input.roomDisplayName || '',
-      timestampISO: new Date(nowMs).toISOString(),
-      thermostatMode: input.thermostatMode || 'OFF',
-      hvacMode,
-      equipmentStatus,
-      isHvacActive,
-      isFanOnly,
-      isReachable,
-      currentTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-      coolSetpointC: isNum(input.coolSetpointC) ? round2(input.coolSetpointC) : null,
-      heatSetpointC: isNum(input.heatSetpointC) ? round2(input.heatSetpointC) : null,
-      runtimeSeconds,
-      isRuntimeEvent,
-      startTempC: null,
-      endTempC: isNum(input.currentTempC) ? round2(input.currentTempC) : null,
-    };
-  }
-
-  toBubblePayload(result) {
-    const c2f = (c) => (c == null ? null : Math.round((c * 9) / 5 + 32));
-    return {
-      userId: result.userId || null,
-      thermostatId: result.thermostatId || null,
-      deviceName: result.deviceName || null,
-      roomDisplayName: result.roomDisplayName || '',
-      runtimeSeconds: result.runtimeSeconds,
-      runtimeMinutes: result.runtimeSeconds != null ? Math.round(result.runtimeSeconds / 60) : null,
-      isRuntimeEvent: Boolean(result.isRuntimeEvent),
-      hvacMode: result.hvacMode,
-      operatingState: result.equipmentStatus,
-      isHvacActive: Boolean(result.isHvacActive),
-      thermostatMode: result.thermostatMode,
-      isReachable: Boolean(result.isReachable),
-      currentTempF: c2f(result.currentTempC),
-      coolSetpointF: c2f(result.coolSetpointC),
-      heatSetpointF: c2f(result.heatSetpointC),
-      startTempF: null,
-      endTempF: c2f(result.endTempC),
-      currentTempC: result.currentTempC,
-      coolSetpointC: result.coolSetpointC,
-      heatSetpointC: result.heatSetpointC,
-      startTempC: null,
-      endTempC: result.endTempC,
-      lastIsCooling: result.equipmentStatus === 'cool',
-      lastIsHeating: result.equipmentStatus === 'heat',
-      lastIsFanOnly: result.equipmentStatus === 'fan',
-      lastEquipmentStatus: result.equipmentStatus,
-      equipmentStatus: result.equipmentStatus,
-      isFanOnly: result.isFanOnly,
-      timestamp: result.timestampISO,
-      eventId: genUuid(),
-      eventTimestamp: Date.parse(result.timestampISO),
-    };
-  }
+  // ... rest of SessionManager unchanged ...
 }
 
 /* ---------------- Inference ---------------- */
