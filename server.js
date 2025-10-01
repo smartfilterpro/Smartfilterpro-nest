@@ -44,6 +44,43 @@ app.use(express.json({ limit: '2mb' }));
 
 const sessions = new SessionManager();
 
+/* ---------------- Database Init ---------------- */
+
+async function initDatabase() {
+  if (!ENABLE_DATABASE || !pool) {
+    console.log('[DB] Database disabled');
+    return;
+  }
+  
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS nest_events (
+        id SERIAL PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        at TIMESTAMP NOT NULL,
+        hvac_mode TEXT,
+        is_active BOOLEAN,
+        hvac_status TEXT,
+        fan_only BOOLEAN,
+        temp_c NUMERIC(5,2),
+        cool_sp_c NUMERIC(5,2),
+        heat_sp_c NUMERIC(5,2),
+        reachable BOOLEAN,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_nest_events_device_at 
+      ON nest_events(device_id, at DESC)
+    `);
+    
+    console.log('[DB] nest_events table ready');
+  } catch (err) {
+    console.error('[ERROR] Database initialization failed:', err.message);
+  }
+}
+
 /* ---------------- Helpers ---------------- */
 
 function short(id = '') {
@@ -93,15 +130,15 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
       const traits = extractEffectiveTraits(evt);
 
       const input = {
-        userId: decoded.userId || DEFAULT_USER_ID,       // ensure userId always filled if desired
+        userId: decoded.userId || DEFAULT_USER_ID,
         projectId: decoded.projectId || null,
         structureId: decoded.structureId || null,
         deviceId: traits.deviceId,
         deviceName: traits.deviceName,
         roomDisplayName: traits.roomDisplayName || '',
         when: traits.timestamp,
-        thermostatMode: traits.thermostatMode,           // OFF/HEAT/COOL/HEATCOOL
-        hvacStatusRaw: traits.hvacStatusRaw,             // HEATING/COOLING/OFF (maybe absent)
+        thermostatMode: traits.thermostatMode,
+        hvacStatusRaw: traits.hvacStatusRaw,
         hasFanTrait: traits.hasFanTrait,
         fanTimerMode: traits.fanTimerMode,
         fanTimerOn: traits.fanTimerOn,
@@ -111,48 +148,55 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
         connectivity: traits.connectivity,
       };
 
-      const result = sessions.process(input);
-
-      if (ENABLE_DATABASE && pool) {
-        try {
-          await pool.query(
-            `INSERT INTO nest_events (
-               device_id, at, hvac_mode, is_active, hvac_status, fan_only, temp_c, cool_sp_c, heat_sp_c, reachable
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-            [
-              input.deviceId,
-              input.when,
-              result.thermostatMode || null,
-              result.isHvacActive,
-              result.equipmentStatus,
-              result.isFanOnly,
-              result.currentTempC,
-              result.coolSetpointC,
-              result.heatSetpointC,
-              result.isReachable,
-            ]
-          );
-        } catch (dbErr) {
-          console.warn('[WARN] DB insert failed (ok if table missing):', dbErr.message);
+      // Use queueEvent for batching instead of direct process
+      sessions.queueEvent(input, async (result) => {
+        // Database insert
+        if (ENABLE_DATABASE && pool) {
+          try {
+            await pool.query(
+              `INSERT INTO nest_events (
+                 device_id, at, hvac_mode, is_active, hvac_status, fan_only, temp_c, cool_sp_c, heat_sp_c, reachable
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+              [
+                input.deviceId,
+                input.when,
+                result.thermostatMode || null,
+                result.isHvacActive,
+                result.equipmentStatus,
+                result.isFanOnly,
+                result.currentTempC,
+                result.coolSetpointC,
+                result.heatSetpointC,
+                result.isReachable,
+              ]
+            );
+          } catch (dbErr) {
+            console.warn('[WARN] DB insert failed (ok if table missing):', dbErr.message);
+          }
         }
-      }
 
-      const bubblePayload = sessions.toBubblePayload(result);
+        // Only post to Bubble if shouldPost is true
+        if (result.shouldPost) {
+          const bubblePayload = sessions.toBubblePayload(result);
 
-      // log exactly what we send to Bubble (truncated)
-      console.log('[BUBBLE-PAYLOAD]', JSON.stringify(bubblePayload, null, 2).slice(0, 1000));
+          // log exactly what we send to Bubble (truncated)
+          console.log('[BUBBLE-PAYLOAD]', JSON.stringify(bubblePayload, null, 2).slice(0, 1000));
 
-      const postResp = await postToBubble(bubblePayload);
+          const postResp = await postToBubble(bubblePayload);
 
-      console.log(
-        `[POST] user=${bubblePayload.userId} thermo=${short(bubblePayload.thermostatId)} ` +
-        `active=${bubblePayload.isHvacActive} hvacMode=${bubblePayload.hvacMode} ` +
-        `status=${bubblePayload.equipmentStatus} runtime=${bubblePayload.runtimeSeconds ?? '—'}`
-      );
+          console.log(
+            `[POST] user=${bubblePayload.userId} thermo=${short(bubblePayload.thermostatId)} ` +
+            `active=${bubblePayload.isHvacActive} hvacMode=${bubblePayload.hvacMode} ` +
+            `status=${bubblePayload.equipmentStatus} runtime=${bubblePayload.runtimeSeconds ?? '—'}`
+          );
 
-      if (!postResp?.ok && !postResp?.skipped) {
-        console.error('[ERROR] Bubble post failed for device:', input.deviceId);
-      }
+          if (!postResp?.ok && !postResp?.skipped) {
+            console.error('[ERROR] Bubble post failed for device:', input.deviceId);
+          }
+        } else {
+          console.log(`[POST-SKIPPED] thermo=${short(input.deviceId)} no significant change`);
+        }
+      });
     }
 
     return res.status(204).end();
@@ -162,7 +206,14 @@ app.post(['/webhook', '/nest/events'], async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Nest runtime server listening on :${PORT}`);
-  console.log('Ready to receive Nest SDM pushes at /webhook and /nest/events');
-});
+/* ---------------- Startup ---------------- */
+
+async function start() {
+  await initDatabase();
+  app.listen(PORT, () => {
+    console.log(`Nest runtime server listening on :${PORT}`);
+    console.log('Ready to receive Nest SDM pushes at /webhook and /nest/events');
+  });
+}
+
+start();
