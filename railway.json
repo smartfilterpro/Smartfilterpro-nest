@@ -1,0 +1,19 @@
+// railway.json
+{
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "npm run migrate && npm start",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
+
+// .dockerignore
+node_modules
+npm-debug.log
+.env
+.git
+.gitignore
+README.md
