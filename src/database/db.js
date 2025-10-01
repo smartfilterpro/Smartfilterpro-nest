@@ -26,4 +26,3 @@ async function initDatabase() {
 }
 
 module.exports = { getPool, initDatabase };
-
