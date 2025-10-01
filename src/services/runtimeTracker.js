@@ -9,7 +9,6 @@ async function recoverActiveSessions() {
   const pool = getPool();
   
   try {
-    // Find all devices with active sessions
     const result = await pool.query(`
       SELECT 
         ds.device_key,
@@ -46,64 +45,72 @@ async function recoverActiveSessions() {
       };
       
       activeDevices.set(row.device_key, deviceState);
-      console.log(`Recovered active session for device: ${row.device_key}`);
+      console.log(`✓ Recovered active session for device: ${row.device_key}`);
     }
     
-    console.log(`Recovered ${activeDevices.size} active session(s)`);
+    console.log(`✓ Recovered ${activeDevices.size} active session(s)`);
   } catch (error) {
-    console.error('Error recovering active sessions:', error);
+    console.error('✗ Error recovering active sessions:', error);
   }
 }
 
 async function handleDeviceEvent(eventData) {
+  console.log('\n========== PROCESSING DEVICE EVENT ==========');
+  
   const pool = getPool();
   
   try {
-    // Extract device info from event
     const deviceName = eventData.resourceUpdate?.name || eventData.eventId;
     const deviceKey = extractDeviceKey(deviceName);
     const userId = eventData.userId;
     
+    console.log(`Device Key: ${deviceKey}`);
+    console.log(`User ID: ${userId}`);
+    
     if (!deviceKey) {
-      console.error('Could not extract device key from event');
+      console.error('✗ Could not extract device key from event');
       return;
     }
     
-    // Ensure device exists in database
     await ensureDeviceExists(deviceKey, userId, deviceName);
     
-    // Extract traits from event
     const traits = eventData.resourceUpdate?.traits || {};
+    console.log('Traits received:', Object.keys(traits));
     
-    // Handle connectivity changes
+    // Handle connectivity
     if (traits['sdm.devices.traits.Connectivity']) {
       const isReachable = traits['sdm.devices.traits.Connectivity'].status === 'ONLINE';
+      console.log(`Connectivity: ${isReachable ? 'ONLINE' : 'OFFLINE'}`);
       await updateDeviceReachability(deviceKey, isReachable);
     }
     
-    // Handle temperature changes
+    // Handle temperature
     if (traits['sdm.devices.traits.Temperature']) {
       const tempC = traits['sdm.devices.traits.Temperature'].ambientTemperatureCelsius;
       const tempF = celsiusToFahrenheit(tempC);
+      console.log(`Temperature: ${tempF}°F (${tempC}°C)`);
       await handleTemperatureChange(deviceKey, tempF, tempC, userId);
     }
     
-    // Handle thermostat mode changes
+    // Handle thermostat mode
     let thermostatMode = null;
     if (traits['sdm.devices.traits.ThermostatMode']) {
       thermostatMode = traits['sdm.devices.traits.ThermostatMode'].mode;
+      console.log(`Thermostat Mode: ${thermostatMode}`);
     }
     
-    // Handle equipment status (HEATING, COOLING, OFF)
+    // Handle equipment status
     let equipmentStatus = 'OFF';
     if (traits['sdm.devices.traits.ThermostatHvac']) {
       equipmentStatus = traits['sdm.devices.traits.ThermostatHvac'].status || 'OFF';
+      console.log(`Equipment Status: ${equipmentStatus}`);
     }
     
-    // Handle fan timer (Fan Only mode)
+    // Handle fan timer
     let isFanTimerOn = false;
     if (traits['sdm.devices.traits.Fan']) {
       isFanTimerOn = traits['sdm.devices.traits.Fan'].timerMode === 'ON';
+      console.log(`Fan Timer: ${isFanTimerOn ? 'ON' : 'OFF'}`);
     }
     
     // Handle setpoints
@@ -117,9 +124,9 @@ async function handleDeviceEvent(eventData) {
       if (setpoint.coolCelsius) {
         coolSetpoint = celsiusToFahrenheit(setpoint.coolCelsius);
       }
+      console.log(`Setpoints - Heat: ${heatSetpoint}°F, Cool: ${coolSetpoint}°F`);
     }
     
-    // Process runtime logic
     await processRuntimeLogic(
       deviceKey,
       userId,
@@ -131,8 +138,10 @@ async function handleDeviceEvent(eventData) {
       coolSetpoint
     );
     
+    console.log('========== EVENT PROCESSING COMPLETE ==========\n');
+    
   } catch (error) {
-    console.error('Error handling device event:', error);
+    console.error('✗ Error handling device event:', error);
     throw error;
   }
 }
@@ -147,23 +156,23 @@ async function processRuntimeLogic(
   heatSetpoint,
   coolSetpoint
 ) {
-  const pool = getPool();
+  console.log('\n--- RUNTIME LOGIC ---');
   
-  // Determine if HVAC is active
   const isHeating = equipmentStatus === 'HEATING';
   const isCooling = equipmentStatus === 'COOLING';
   const isOff = equipmentStatus === 'OFF';
   
-  // HVAC is active if:
-  // - Heating or Cooling is ON, OR
-  // - Fan timer is ON (Fan Only mode)
-  const shouldBeActive = isHeating || isCooling || isFanTimerOn;
+  console.log(`Equipment State - Heating: ${isHeating}, Cooling: ${isCooling}, Off: ${isOff}`);
+  console.log(`Fan Timer: ${isFanTimerOn}`);
   
+  const shouldBeActive = isHeating || isCooling || isFanTimerOn;
   const currentState = activeDevices.get(deviceKey);
   const wasActive = !!currentState;
   
+  console.log(`Should be active: ${shouldBeActive} (was active: ${wasActive})`);
+  
   if (shouldBeActive && !wasActive) {
-    // START NEW SESSION
+    console.log('→ ACTION: START NEW SESSION');
     await startRuntimeSession(
       deviceKey,
       userId,
@@ -175,10 +184,10 @@ async function processRuntimeLogic(
       coolSetpoint
     );
   } else if (!shouldBeActive && wasActive) {
-    // END SESSION
+    console.log('→ ACTION: END SESSION');
     await endRuntimeSession(deviceKey, userId, deviceName, equipmentStatus);
   } else if (shouldBeActive && wasActive) {
-    // UPDATE EXISTING SESSION
+    console.log('→ ACTION: UPDATE EXISTING SESSION');
     await updateRuntimeSession(
       deviceKey,
       equipmentStatus,
@@ -186,9 +195,10 @@ async function processRuntimeLogic(
       heatSetpoint,
       coolSetpoint
     );
+  } else {
+    console.log('→ ACTION: NO CHANGE (idle)');
   }
   
-  // Log equipment event
   await logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, currentState);
 }
 
@@ -207,20 +217,19 @@ async function startRuntimeSession(
   const now = new Date();
   
   try {
-    // Determine mode
     let mode = 'off';
     if (equipmentStatus === 'HEATING') mode = 'heating';
     else if (equipmentStatus === 'COOLING') mode = 'cooling';
     else if (isFanTimerOn) mode = 'fan_only';
     
-    // Get current temperature
+    console.log(`Starting session - Mode: ${mode}, Session ID: ${sessionId}`);
+    
     const tempResult = await pool.query(
       'SELECT last_temperature FROM device_status WHERE device_key = $1',
       [deviceKey]
     );
     const startTemp = tempResult.rows[0]?.last_temperature || null;
     
-    // Create runtime session
     await pool.query(`
       INSERT INTO runtime_sessions (
         device_key, session_id, mode, equipment_status,
@@ -232,7 +241,6 @@ async function startRuntimeSession(
       now, startTemp, heatSetpoint, coolSetpoint
     ]);
     
-    // Update device status
     await pool.query(`
       UPDATE device_status SET
         is_running = true,
@@ -246,7 +254,6 @@ async function startRuntimeSession(
       WHERE device_key = $1
     `, [deviceKey, now, mode, equipmentStatus, heatSetpoint, coolSetpoint]);
     
-    // Store in memory
     activeDevices.set(deviceKey, {
       deviceKey,
       frontendId: userId,
@@ -263,9 +270,10 @@ async function startRuntimeSession(
       coolSetpoint
     });
     
-    console.log(`Started runtime session for ${deviceKey}: ${mode}`);
+    console.log(`✓ Session started at ${now.toISOString()}`);
+    console.log(`✓ isHvacActive is now: TRUE`);
   } catch (error) {
-    console.error('Error starting runtime session:', error);
+    console.error('✗ Error starting runtime session:', error);
     throw error;
   }
 }
@@ -275,7 +283,7 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
   const deviceState = activeDevices.get(deviceKey);
   
   if (!deviceState) {
-    console.log(`No active session found for ${deviceKey}`);
+    console.log('✗ No active session found - cannot end session');
     return;
   }
   
@@ -284,15 +292,16 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
   const fanTailSeconds = parseInt(process.env.LAST_FAN_TAIL_SECONDS || '0', 10);
   const totalRuntimeSeconds = runtimeSeconds + fanTailSeconds;
   
+  console.log(`Ending session - Started: ${deviceState.sessionStartedAt.toISOString()}`);
+  console.log(`Runtime: ${runtimeSeconds}s + ${fanTailSeconds}s tail = ${totalRuntimeSeconds}s total`);
+  
   try {
-    // Get final temperature
     const tempResult = await pool.query(
       'SELECT last_temperature FROM device_status WHERE device_key = $1',
       [deviceKey]
     );
     const endTemp = tempResult.rows[0]?.last_temperature || null;
     
-    // Update runtime session
     await pool.query(`
       UPDATE runtime_sessions SET
         ended_at = $2,
@@ -302,12 +311,10 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
       WHERE session_id = $1
     `, [deviceState.sessionId, now, runtimeSeconds, endTemp]);
     
-    // Determine last mode flags
     const lastWasCooling = deviceState.isCooling;
     const lastWasHeating = deviceState.isHeating;
     const lastWasFanOnly = deviceState.isFanOnly && !deviceState.isHeating && !deviceState.isCooling;
     
-    // Update device status
     await pool.query(`
       UPDATE device_status SET
         is_running = false,
@@ -333,15 +340,16 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
       fanTailSeconds > 0 ? new Date(now.getTime() + fanTailSeconds * 1000) : null
     ]);
     
-    // Get isReachable status
     const reachableResult = await pool.query(
       'SELECT is_reachable FROM device_status WHERE device_key = $1',
       [deviceKey]
     );
     const isReachable = reachableResult.rows[0]?.is_reachable ?? true;
     
-    // Post to Bubble
+    console.log(`✓ isHvacActive is now: FALSE`);
+    
     if (totalRuntimeSeconds > 0) {
+      console.log('\n>>> POSTING RUNTIME EVENT TO BUBBLE <<<');
       await postToBubble({
         userId: userId,
         thermostatId: deviceKey,
@@ -365,14 +373,14 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
         eventId: uuidv4(),
         eventTimestamp: now.getTime()
       });
+    } else {
+      console.log('⊘ Runtime was 0 seconds - skipping Bubble post');
     }
     
-    // Remove from memory
     activeDevices.delete(deviceKey);
-    
-    console.log(`Ended runtime session for ${deviceKey}: ${totalRuntimeSeconds}s (${runtimeSeconds}s + ${fanTailSeconds}s tail)`);
+    console.log(`✓ Session ended successfully`);
   } catch (error) {
-    console.error('Error ending runtime session:', error);
+    console.error('✗ Error ending runtime session:', error);
     throw error;
   }
 }
@@ -390,9 +398,11 @@ async function updateRuntimeSession(
   if (!deviceState) return;
   
   const now = new Date();
+  const elapsed = Math.floor((now - deviceState.sessionStartedAt) / 1000);
+  
+  console.log(`Updating session - Elapsed: ${elapsed}s`);
   
   try {
-    // Update tick count
     await pool.query(`
       UPDATE runtime_sessions SET
         tick_count = tick_count + 1,
@@ -403,7 +413,6 @@ async function updateRuntimeSession(
       WHERE session_id = $1
     `, [deviceState.sessionId, now, heatSetpoint, coolSetpoint]);
     
-    // Update in-memory state
     deviceState.isHeating = equipmentStatus === 'HEATING';
     deviceState.isCooling = equipmentStatus === 'COOLING';
     deviceState.isFanOnly = isFanTimerOn;
@@ -411,8 +420,9 @@ async function updateRuntimeSession(
     deviceState.heatSetpoint = heatSetpoint;
     deviceState.coolSetpoint = coolSetpoint;
     
+    console.log(`✓ Session updated - isHvacActive: TRUE`);
   } catch (error) {
-    console.error('Error updating runtime session:', error);
+    console.error('✗ Error updating runtime session:', error);
   }
 }
 
@@ -420,7 +430,6 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
   const pool = getPool();
   
   try {
-    // Update device status
     await pool.query(`
       UPDATE device_status SET
         last_temperature = $2,
@@ -429,9 +438,9 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
       WHERE device_key = $1
     `, [deviceKey, tempF]);
     
-    // Log temperature reading
     const deviceState = activeDevices.get(deviceKey);
     const sessionId = deviceState?.sessionId || null;
+    const isHvacActive = !!deviceState;
     
     await pool.query(`
       INSERT INTO temp_readings (
@@ -439,7 +448,6 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
       ) VALUES ($1, $2, 'F', 'temperature_update', $3)
     `, [deviceKey, tempF, sessionId]);
     
-    // Get device info for Bubble post
     const deviceResult = await pool.query(`
       SELECT device_name, is_reachable, current_mode, current_equipment_status,
              last_was_cooling, last_was_heating, last_was_fan_only
@@ -452,7 +460,9 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     const device = deviceResult.rows[0];
     const currentMode = device.current_mode || 'off';
     
-    // Post temperature update to Bubble
+    console.log('\n>>> POSTING TEMPERATURE EVENT TO BUBBLE <<<');
+    console.log(`isHvacActive: ${isHvacActive}`);
+    
     await postToBubble({
       userId: userId,
       thermostatId: deviceKey,
@@ -461,7 +471,7 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
       runtimeMinutes: 0,
       isRuntimeEvent: false,
       hvacMode: currentMode,
-      isHvacActive: !!deviceState,
+      isHvacActive: isHvacActive,
       thermostatMode: currentMode.toUpperCase(),
       isReachable: device.is_reachable ?? true,
       currentTempF: tempF,
@@ -478,7 +488,7 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     });
     
   } catch (error) {
-    console.error('Error handling temperature change:', error);
+    console.error('✗ Error handling temperature change:', error);
   }
 }
 
@@ -494,9 +504,9 @@ async function updateDeviceReachability(deviceKey, isReachable) {
       WHERE device_key = $1
     `, [deviceKey, isReachable]);
     
-    console.log(`Device ${deviceKey} reachability: ${isReachable}`);
+    console.log(`✓ Device reachability updated`);
   } catch (error) {
-    console.error('Error updating device reachability:', error);
+    console.error('✗ Error updating device reachability:', error);
   }
 }
 
@@ -520,7 +530,7 @@ async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previ
       JSON.stringify({ isFanTimerOn })
     ]);
   } catch (error) {
-    console.error('Error logging equipment event:', error);
+    console.error('✗ Error logging equipment event:', error);
   }
 }
 
@@ -538,13 +548,11 @@ async function ensureDeviceExists(deviceKey, userId, deviceName) {
         updated_at = NOW()
     `, [deviceKey, userId, deviceName]);
   } catch (error) {
-    console.error('Error ensuring device exists:', error);
+    console.error('✗ Error ensuring device exists:', error);
   }
 }
 
 function extractDeviceKey(deviceName) {
-  // Extract device ID from full device name
-  // Format: enterprises/{project}/devices/{deviceId}
   const parts = deviceName.split('/');
   return parts[parts.length - 1];
 }
