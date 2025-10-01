@@ -7,9 +7,11 @@ const RETRY_DELAY = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);
 async function postToBubble(payload) {
   let lastError;
   
+  console.log('📤 BUBBLE PAYLOAD:', JSON.stringify(payload, null, 2));
+  
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      console.log(`Posting to Bubble (attempt ${attempt}/${MAX_RETRIES}):`, JSON.stringify(payload, null, 2));
+      console.log(`⏳ Attempt ${attempt}/${MAX_RETRIES} - Posting to Bubble...`);
       
       const response = await axios.post(BUBBLE_URL, payload, {
         headers: {
@@ -18,21 +20,26 @@ async function postToBubble(payload) {
         timeout: 10000
       });
       
-      console.log(`✓ Successfully posted to Bubble: ${response.status}`);
+      console.log(`✓ Bubble responded with status: ${response.status}`);
+      console.log(`✓ Response data:`, JSON.stringify(response.data, null, 2));
       return response.data;
       
     } catch (error) {
       lastError = error;
-      console.error(`✗ Bubble post attempt ${attempt} failed:`, error.message);
+      console.error(`✗ Attempt ${attempt} failed: ${error.message}`);
+      if (error.response) {
+        console.error(`✗ Response status: ${error.response.status}`);
+        console.error(`✗ Response data:`, error.response.data);
+      }
       
       if (attempt < MAX_RETRIES) {
-        console.log(`Retrying in ${RETRY_DELAY}ms...`);
+        console.log(`⏳ Retrying in ${RETRY_DELAY}ms...`);
         await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
       }
     }
   }
   
-  console.error(`Failed to post to Bubble after ${MAX_RETRIES} attempts`);
+  console.error(`✗ Failed to post to Bubble after ${MAX_RETRIES} attempts`);
   throw lastError;
 }
 
