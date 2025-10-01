@@ -5,7 +5,7 @@
  * - Counts runtime while air is moving: HEATING, COOLING, HEATCOOL (auto), or explicit FAN-only
  * - Keeps a tail (default 30s) after heat/cool ends
  * - Sticky-state: carries forward last known values if missing
- * - Explicit OFF respects tail, closes immediately only if NEST_FAN_TAIL_MS=0
+ * - Explicit OFF closes sessions immediately
  * - Timeout: force-close sessions if no OFF received (default 3m)
  */
 
@@ -154,7 +154,7 @@ class SessionManager {
     const prev = this.getPrev(input.deviceId);
     const nowMs = new Date(input.when).getTime();
 
-    // Sticky values
+    // Sticky only if hvacStatusRaw missing
     if (input.currentTempC == null && prev.lastTempC != null) input.currentTempC = prev.lastTempC;
     if (!input.thermostatMode && prev.lastMode) input.thermostatMode = prev.lastMode;
     if (!input.hvacStatusRaw && prev.lastEquipmentStatus) {
@@ -168,27 +168,11 @@ class SessionManager {
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
       this.computeActiveAndStatus(input, prev);
 
-    // Detect switch between active heating and cooling
-    const switchedWhileActive =
-      prev.isRunning &&
-      (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool') &&
-      (equipmentStatus === 'heat' || equipmentStatus === 'cool') &&
-      prev.lastEquipmentStatus !== equipmentStatus;
-
-    if (switchedWhileActive) {
-      prev.tailUntil = 0;
-      prev.isRunning = true;
-      prev.startStatus = equipmentStatus;
-      // startedAt stays the same → runtime continues
-    }
-
-    // Fan tail logic (only if not switching)
-    if (!isHvacActive && !switchedWhileActive) {
-      const justStopped = prev.isRunning &&
-        (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
+    // Fan tail
+    if (!isHvacActive) {
+      const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
-        console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
       }
       if (prev.tailUntil && nowMs < prev.tailUntil) {
         isHvacActive = true;
@@ -196,7 +180,7 @@ class SessionManager {
       } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
         prev.tailUntil = 0;
       }
-    } else if (isHvacActive) {
+    } else {
       if (prev.tailUntil) prev.tailUntil = 0;
     }
 
@@ -213,7 +197,7 @@ class SessionManager {
     }
 
     const becameActive = !prev.isRunning && isHvacActive;
-    const becameIdle = prev.isRunning && !isHvacActive;
+    let becameIdle = prev.isRunning && !isHvacActive;
 
     if (becameActive) {
       prev.isRunning = true;
@@ -225,28 +209,19 @@ class SessionManager {
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
 
-    // Explicit OFF handling
-    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt && !switchedWhileActive) {
-      if (FAN_TAIL_MS > 0) {
-        if (prev.tailUntil === 0) {
-          prev.tailUntil = nowMs + FAN_TAIL_MS;
-          console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
-        }
-      } else {
-        const ms = Math.max(0, nowMs - prev.startedAt);
-        runtimeSeconds = Math.round(ms / 1000);
-        isRuntimeEvent = true;
-        console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
-        prev.isRunning = false;
-        prev.startedAt = null;
-        prev.startStatus = 'off';
-        prev.tailUntil = 0;
-        isHvacActive = false;
-        equipmentStatus = 'off';
-      }
+    // Explicit OFF closes immediately
+    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
+      const ms = Math.max(0, nowMs - prev.startedAt);
+      runtimeSeconds = Math.round(ms / 1000);
+      isRuntimeEvent = true;
+      console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
+      prev.isRunning = false;
+      prev.startedAt = null;
+      prev.startStatus = 'off';
+      prev.tailUntil = 0;
     }
     // Normal idle transition
-    else if (becameIdle && prev.startedAt && !switchedWhileActive) {
+    else if (becameIdle && prev.startedAt) {
       const ms = Math.max(0, nowMs - prev.startedAt);
       runtimeSeconds = Math.round(ms / 1000);
       isRuntimeEvent = true;
