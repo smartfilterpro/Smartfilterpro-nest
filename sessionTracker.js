@@ -154,20 +154,15 @@ class SessionManager {
     const prev = this.getPrev(input.deviceId);
     const nowMs = new Date(input.when).getTime();
 
-    // Sticky only if hvacStatusRaw missing AND we have recent valid state
-    const hasRecentState = prev.lastAt > 0 && (nowMs - prev.lastAt < RECENT_WINDOW_MS);
-    
-    if (input.currentTempC == null && prev.lastTempC != null && hasRecentState) {
-      input.currentTempC = prev.lastTempC;
-    }
-    if (!input.thermostatMode && prev.lastMode && hasRecentState) {
-      input.thermostatMode = prev.lastMode;
-    }
-    // Only apply sticky state for active equipment (heat/cool), not for 'off'
-    // This allows temperature-based inference to work when equipment is off
-    if (!input.hvacStatusRaw && hasRecentState && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool')) {
-      input.hvacStatusRaw = prev.lastEquipmentStatus === 'heat' ? 'HEATING' : 'COOLING';
-      console.log('[STICKY-STATE]', input.deviceId, 'inferred', input.hvacStatusRaw, 'from previous', prev.lastEquipmentStatus);
+    // Sticky only if hvacStatusRaw missing
+    if (input.currentTempC == null && prev.lastTempC != null) input.currentTempC = prev.lastTempC;
+    if (!input.thermostatMode && prev.lastMode) input.thermostatMode = prev.lastMode;
+    if (!input.hvacStatusRaw && prev.lastEquipmentStatus) {
+      if (Date.now() - prev.lastAt < RECENT_WINDOW_MS) {
+        input.hvacStatusRaw =
+          prev.lastEquipmentStatus === 'heat' ? 'HEATING' :
+          prev.lastEquipmentStatus === 'cool' ? 'COOLING' : 'OFF';
+      }
     }
 
     let { isReachable, isHvacActive, equipmentStatus, isFanOnly } =
@@ -178,35 +173,15 @@ class SessionManager {
       const justStopped = prev.isRunning && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool');
       if (justStopped && FAN_TAIL_MS > 0 && prev.tailUntil === 0) {
         prev.tailUntil = nowMs + FAN_TAIL_MS;
-        console.log('[TAIL-START]', input.deviceId, 'until', new Date(prev.tailUntil).toISOString());
       }
       if (prev.tailUntil && nowMs < prev.tailUntil) {
-        // Validate that the tail equipment status is compatible with current mode
-        const modeCompatible = (
-          (input.thermostatMode === 'HEAT' && prev.lastEquipmentStatus === 'heat') ||
-          (input.thermostatMode === 'COOL' && prev.lastEquipmentStatus === 'cool') ||
-          (input.thermostatMode === 'HEATCOOL' && (prev.lastEquipmentStatus === 'heat' || prev.lastEquipmentStatus === 'cool')) ||
-          (input.thermostatMode === 'OFF')
-        );
-        
-        if (modeCompatible) {
-          isHvacActive = true;
-          equipmentStatus = prev.lastEquipmentStatus;
-          console.log('[TAIL-ACTIVE]', input.deviceId, 'extending', equipmentStatus);
-        } else {
-          // Mode changed, cancel the tail
-          console.log('[TAIL-CANCEL]', input.deviceId, 'mode changed from', prev.lastMode, 'to', input.thermostatMode);
-          prev.tailUntil = 0;
-        }
+        isHvacActive = true;
+        equipmentStatus = prev.lastEquipmentStatus;
       } else if (prev.tailUntil && nowMs >= prev.tailUntil) {
-        console.log('[TAIL-EXPIRED]', input.deviceId);
         prev.tailUntil = 0;
       }
     } else {
-      if (prev.tailUntil) {
-        console.log('[TAIL-CLEAR]', input.deviceId, 'HVAC active again');
-        prev.tailUntil = 0;
-      }
+      if (prev.tailUntil) prev.tailUntil = 0;
     }
 
     // Timeout safeguard
@@ -225,7 +200,6 @@ class SessionManager {
     let becameIdle = prev.isRunning && !isHvacActive;
 
     if (becameActive) {
-      console.log('[SESSION START]', input.deviceId, 'equipment:', equipmentStatus);
       prev.isRunning = true;
       prev.startedAt = nowMs;
       prev.startStatus = equipmentStatus;
@@ -235,23 +209,16 @@ class SessionManager {
     let runtimeSeconds = null;
     let isRuntimeEvent = false;
 
-    // Explicit OFF closes immediately and clears tail
-    if (input.hvacStatusRaw === 'OFF') {
-      if (prev.isRunning && prev.startedAt) {
-        const ms = Math.max(0, nowMs - prev.startedAt);
-        runtimeSeconds = Math.round(ms / 1000);
-        isRuntimeEvent = true;
-        console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
-        prev.isRunning = false;
-        prev.startedAt = null;
-        prev.startStatus = 'off';
-      }
-      // Clear tail and force inactive state when explicit OFF received
+    // Explicit OFF closes immediately
+    if (input.hvacStatusRaw === 'OFF' && prev.isRunning && prev.startedAt) {
+      const ms = Math.max(0, nowMs - prev.startedAt);
+      runtimeSeconds = Math.round(ms / 1000);
+      isRuntimeEvent = true;
+      console.log('[SESSION END - EXPLICIT OFF]', input.deviceId, 'runtime', runtimeSeconds);
+      prev.isRunning = false;
+      prev.startedAt = null;
+      prev.startStatus = 'off';
       prev.tailUntil = 0;
-      prev.lastEquipmentStatus = 'off';
-      isHvacActive = false;
-      equipmentStatus = 'off';
-      console.log('[EXPLICIT-OFF]', input.deviceId, 'forced inactive, cleared tail');
     }
     // Normal idle transition
     else if (becameIdle && prev.startedAt) {
