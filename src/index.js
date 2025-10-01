@@ -16,7 +16,7 @@ app.get('/health', (req, res) => {
 });
 
 // Routes
-app.use('/webhooks', webhookRoutes);
+app.use('/webhook', webhookRoutes);
 app.use('/api', deleteRoutes);
 
 // Error handler
@@ -40,7 +40,7 @@ async function startup() {
     // Start Express server
     app.listen(PORT, () => {
       console.log(`✓ Server running on port ${PORT}`);
-      console.log(`✓ Webhook endpoint: POST /webhooks`);
+      console.log(`✓ Webhook endpoint: POST /webhook`);
       console.log('Application ready!');
     });
   } catch (error) {
