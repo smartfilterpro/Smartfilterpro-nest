@@ -27,7 +27,33 @@ async function recoverActiveSessions() {
       WHERE ds.is_running = true
     `);
     
+    const now = new Date();
+    const MAX_SESSION_AGE_HOURS = 4; // Consider sessions older than 4 hours as stale
+    
     for (const row of result.rows) {
+      const sessionAge = (now - new Date(row.session_started_at)) / 1000 / 60 / 60; // hours
+      
+      if (sessionAge > MAX_SESSION_AGE_HOURS) {
+        console.log(`Skipping stale session for ${row.device_key} - age: ${sessionAge.toFixed(1)} hours`);
+        
+        // Mark the stale session as ended
+        await pool.query(`
+          UPDATE device_status 
+          SET is_running = false, session_started_at = NULL 
+          WHERE device_key = $1
+        `, [row.device_key]);
+        
+        if (row.session_id) {
+          await pool.query(`
+            UPDATE runtime_sessions 
+            SET ended_at = NOW(), duration_seconds = 0
+            WHERE session_id = $1
+          `, [row.session_id]);
+        }
+        
+        continue;
+      }
+      
       const deviceState = {
         deviceKey: row.device_key,
         frontendId: row.frontend_id,
@@ -45,7 +71,7 @@ async function recoverActiveSessions() {
       };
       
       activeDevices.set(row.device_key, deviceState);
-      console.log(`Recovered active session for device: ${row.device_key}`);
+      console.log(`Recovered active session for device: ${row.device_key} (age: ${sessionAge.toFixed(1)} hours)`);
     }
     
     console.log(`Recovered ${activeDevices.size} active session(s)`);
