@@ -35,23 +35,26 @@ async function startup() {
     await recoverActiveSessions();
     console.log('✓ Active sessions recovered');
     
-    // Poll immediately to sync actual state
-    const { pollAllUsers } = require('./services/nestPoller');
-    console.log('Polling all devices to verify current state...');
-    await pollAllUsers();
-    console.log('✓ Initial polling complete');
+    // Poll immediately to sync actual state (but don't crash if it fails)
+    const { pollAllUsers, startPoller } = require('./services/nestPoller');
     
-    // Start polling scheduler
-    const { startPoller } = require('./services/nestPoller');
-    startPoller();
-    console.log('✓ Nest API poller started');
-    
+    // Start the server first, then poll
     app.listen(PORT, () => {
       console.log(`✓ Server running on port ${PORT}`);
       console.log(`✓ Webhook endpoint: POST /webhook`);
       console.log(`✓ Token storage: POST /auth/store-tokens`);
       console.log('Application ready!');
     });
+    
+    // Poll in background - don't wait for it or let it crash startup
+    pollAllUsers()
+      .then(() => console.log('✓ Initial polling complete'))
+      .catch(err => console.error('Initial polling failed (non-fatal):', err.message));
+    
+    // Start polling scheduler
+    startPoller();
+    console.log('✓ Nest API poller scheduled');
+    
   } catch (error) {
     console.error('Failed to start application:', error);
     process.exit(1);
