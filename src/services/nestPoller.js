@@ -155,4 +155,4 @@ function stopPoller() {
   }
 }
 
-module.exports = { startPoller, stopPo
+module.exports = { startPoller, stopPoller, pollUserDevices, pollAllUsers };
