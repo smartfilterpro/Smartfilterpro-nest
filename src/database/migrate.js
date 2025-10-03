@@ -7,21 +7,11 @@ async function runMigrations() {
   try {
     await client.query('BEGIN');
     
-    console.log('Dropping existing tables if they exist...');
+    console.log('Running migrations...');
     
-    // Drop tables in reverse order (child tables first due to foreign keys)
-    await client.query('DROP TABLE IF EXISTS temp_readings CASCADE');
-    await client.query('DROP TABLE IF EXISTS equipment_events CASCADE');
-    await client.query('DROP TABLE IF EXISTS runtime_sessions CASCADE');
-    await client.query('DROP TABLE IF EXISTS oauth_tokens CASCADE');
-    await client.query('DROP TABLE IF EXISTS device_status CASCADE');
-    await client.query('DROP TABLE IF EXISTS device_states CASCADE');
-    
-    console.log('Creating fresh tables...');
-    
-    // Device Status Table
+    // Device Status Table - CREATE IF NOT EXISTS
     await client.query(`
-      CREATE TABLE device_status (
+      CREATE TABLE IF NOT EXISTS device_status (
         device_key TEXT PRIMARY KEY,
         frontend_id TEXT,
         mac_id TEXT,
@@ -56,7 +46,7 @@ async function runMigrations() {
     
     // OAuth Tokens Table
     await client.query(`
-      CREATE TABLE oauth_tokens (
+      CREATE TABLE IF NOT EXISTS oauth_tokens (
         user_id TEXT PRIMARY KEY,
         access_token TEXT NOT NULL,
         refresh_token TEXT,
@@ -68,7 +58,7 @@ async function runMigrations() {
     
     // Equipment Events Table
     await client.query(`
-      CREATE TABLE equipment_events (
+      CREATE TABLE IF NOT EXISTS equipment_events (
         id SERIAL PRIMARY KEY,
         device_key TEXT NOT NULL REFERENCES device_status(device_key) ON DELETE CASCADE,
         event_type TEXT NOT NULL,
@@ -82,18 +72,18 @@ async function runMigrations() {
     `);
     
     await client.query(`
-      CREATE INDEX idx_equipment_events_device_key 
+      CREATE INDEX IF NOT EXISTS idx_equipment_events_device_key 
       ON equipment_events(device_key)
     `);
     
     await client.query(`
-      CREATE INDEX idx_equipment_events_session_id 
+      CREATE INDEX IF NOT EXISTS idx_equipment_events_session_id 
       ON equipment_events(session_id)
     `);
     
     // Runtime Sessions Table
     await client.query(`
-      CREATE TABLE runtime_sessions (
+      CREATE TABLE IF NOT EXISTS runtime_sessions (
         id SERIAL PRIMARY KEY,
         device_key TEXT NOT NULL REFERENCES device_status(device_key) ON DELETE CASCADE,
         session_id UUID NOT NULL UNIQUE,
@@ -114,18 +104,18 @@ async function runMigrations() {
     `);
     
     await client.query(`
-      CREATE INDEX idx_runtime_sessions_device_key 
+      CREATE INDEX IF NOT EXISTS idx_runtime_sessions_device_key 
       ON runtime_sessions(device_key)
     `);
     
     await client.query(`
-      CREATE INDEX idx_runtime_sessions_session_id 
+      CREATE INDEX IF NOT EXISTS idx_runtime_sessions_session_id 
       ON runtime_sessions(session_id)
     `);
     
     // Temperature Readings Table
     await client.query(`
-      CREATE TABLE temp_readings (
+      CREATE TABLE IF NOT EXISTS temp_readings (
         id SERIAL PRIMARY KEY,
         device_key TEXT NOT NULL REFERENCES device_status(device_key) ON DELETE CASCADE,
         temperature DECIMAL(5,2) NOT NULL,
@@ -137,17 +127,17 @@ async function runMigrations() {
     `);
     
     await client.query(`
-      CREATE INDEX idx_temp_readings_device_key 
+      CREATE INDEX IF NOT EXISTS idx_temp_readings_device_key 
       ON temp_readings(device_key)
     `);
     
     await client.query(`
-      CREATE INDEX idx_temp_readings_session_id 
+      CREATE INDEX IF NOT EXISTS idx_temp_readings_session_id 
       ON temp_readings(session_id)
     `);
     
     await client.query('COMMIT');
-    console.log('All migrations completed successfully');
+    console.log('✓ All migrations completed successfully');
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Migration failed:', error);
@@ -158,7 +148,6 @@ async function runMigrations() {
   }
 }
 
-// Run migrations if called directly
 if (require.main === module) {
   runMigrations()
     .then(() => process.exit(0))
