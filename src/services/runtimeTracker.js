@@ -1,6 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const { getPool } = require('../database/db');
-const { postToBubble } = require('./bubblePoster');
+const { postToBubbleAsync } = require('./bubblePoster');
 
 // In-memory tracking of active devices
 const activeDevices = new Map();
@@ -89,8 +89,18 @@ async function handleDeviceEvent(eventData) {
     const deviceKey = extractDeviceKey(deviceName);
     const userId = eventData.userId;
     
+    // Use event timestamp if available, otherwise use server time
+    const eventTimestamp = eventData.timestamp ? new Date(eventData.timestamp) : new Date();
+    const serverTime = new Date();
+    
     console.log(`Device Key: ${deviceKey}`);
     console.log(`User ID: ${userId}`);
+    console.log(`Event Timestamp: ${eventTimestamp.toISOString()}`);
+    
+    const delay = Math.floor((serverTime - eventTimestamp) / 1000);
+    if (delay > 60) {
+      console.log(`WARNING: Event delayed by ${delay} seconds (${Math.floor(delay/60)} minutes)`);
+    }
     
     if (!deviceKey) {
       console.error('Could not extract device key from event');
@@ -106,7 +116,7 @@ async function handleDeviceEvent(eventData) {
     if (traits['sdm.devices.traits.Connectivity']) {
       const isReachable = traits['sdm.devices.traits.Connectivity'].status === 'ONLINE';
       console.log(`Connectivity: ${isReachable ? 'ONLINE' : 'OFFLINE'}`);
-      await updateDeviceReachability(deviceKey, isReachable);
+      await updateDeviceReachability(deviceKey, isReachable, eventTimestamp);
     }
     
     // Handle temperature
@@ -115,9 +125,12 @@ async function handleDeviceEvent(eventData) {
       const tempF = celsiusToFahrenheit(tempC);
       console.log(`Temperature: ${tempF}°F (${tempC}°C)`);
       try {
-        await handleTemperatureChange(deviceKey, tempF, tempC, userId);
+        // Fire-and-forget for temperature updates
+        handleTemperatureChange(deviceKey, tempF, tempC, userId, eventTimestamp).catch(err => {
+          console.error('Error in handleTemperatureChange (non-blocking):', err);
+        });
       } catch (error) {
-        console.error('Error in handleTemperatureChange:', error);
+        console.error('Error calling handleTemperatureChange:', error);
       }
     }
     
@@ -191,7 +204,8 @@ async function handleDeviceEvent(eventData) {
       isFanTimerOn,
       thermostatMode,
       heatSetpoint,
-      coolSetpoint
+      coolSetpoint,
+      eventTimestamp
     );
     
     console.log('========== EVENT PROCESSING COMPLETE ==========\n');
@@ -210,7 +224,8 @@ async function processRuntimeLogic(
   isFanTimerOn,
   thermostatMode,
   heatSetpoint,
-  coolSetpoint
+  coolSetpoint,
+  eventTimestamp
 ) {
   console.log('\n--- RUNTIME LOGIC EVALUATION ---');
   
@@ -230,13 +245,12 @@ async function processRuntimeLogic(
   
   // CHECK FOR STALE SESSION (no OFF event in 20 minutes while supposedly OFF)
   if (wasActive && isOff && !isFanTimerOn) {
-    const now = new Date();
-    const minutesSinceStart = (now - currentState.sessionStartedAt) / 1000 / 60;
+    const minutesSinceStart = (eventTimestamp - currentState.sessionStartedAt) / 1000 / 60;
     const ACTIVITY_TIMEOUT_MINUTES = 20;
     
     if (minutesSinceStart > ACTIVITY_TIMEOUT_MINUTES) {
       console.log(`\nSession timed out - running for ${minutesSinceStart.toFixed(1)} minutes but equipment is OFF`);
-      await endRuntimeSession(deviceKey, userId, deviceName, 'OFF');
+      await endRuntimeSession(deviceKey, userId, deviceName, 'OFF', eventTimestamp);
       return;
     }
   }
@@ -251,24 +265,24 @@ async function processRuntimeLogic(
     console.log('\nACTION: START NEW RUNTIME SESSION');
     await startRuntimeSession(
       deviceKey, userId, deviceName, equipmentStatus,
-      isFanTimerOn, thermostatMode, heatSetpoint, coolSetpoint
+      isFanTimerOn, thermostatMode, heatSetpoint, coolSetpoint, eventTimestamp
     );
   } else if (!shouldBeActive && wasActive) {
     console.log('\nACTION: END RUNTIME SESSION');
     console.log(`  Both equipment OFF (${equipmentStatus}) AND fan OFF (${!isFanTimerOn})`);
-    await endRuntimeSession(deviceKey, userId, deviceName, equipmentStatus);
+    await endRuntimeSession(deviceKey, userId, deviceName, equipmentStatus, eventTimestamp);
   } else if (shouldBeActive && wasActive) {
     console.log('\nACTION: UPDATE EXISTING SESSION (still active)');
-    const elapsed = Math.floor((new Date() - currentState.sessionStartedAt) / 1000);
+    const elapsed = Math.floor((eventTimestamp - currentState.sessionStartedAt) / 1000);
     console.log(`  Session has been running for ${elapsed} seconds`);
     await updateRuntimeSession(
-      deviceKey, equipmentStatus, isFanTimerOn, heatSetpoint, coolSetpoint
+      deviceKey, equipmentStatus, isFanTimerOn, heatSetpoint, coolSetpoint, eventTimestamp
     );
   } else {
     console.log('\nACTION: NO CHANGE (system idle)');
   }
   
-  await logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, currentState);
+  await logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, currentState, eventTimestamp);
 }
 
 async function startRuntimeSession(
@@ -279,11 +293,11 @@ async function startRuntimeSession(
   isFanTimerOn,
   thermostatMode,
   heatSetpoint,
-  coolSetpoint
+  coolSetpoint,
+  eventTimestamp
 ) {
   const pool = getPool();
   const sessionId = uuidv4();
-  const now = new Date();
   
   try {
     let mode = 'off';
@@ -296,6 +310,7 @@ async function startRuntimeSession(
     console.log(`  Session ID: ${sessionId}`);
     console.log(`  Equipment: ${equipmentStatus}`);
     console.log(`  Fan Timer: ${isFanTimerOn ? 'ON' : 'OFF'}`);
+    console.log(`  Event Time: ${eventTimestamp.toISOString()}`);
     
     const tempResult = await pool.query(
       'SELECT last_temperature FROM device_status WHERE device_key = $1',
@@ -311,7 +326,7 @@ async function startRuntimeSession(
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $5)
     `, [
       deviceKey, sessionId, mode, equipmentStatus,
-      now, startTemp, heatSetpoint, coolSetpoint
+      eventTimestamp, startTemp, heatSetpoint, coolSetpoint
     ]);
     
     await pool.query(`
@@ -324,16 +339,16 @@ async function startRuntimeSession(
         last_heat_setpoint = $6,
         last_cool_setpoint = $7,
         last_activity_at = $2,
-        updated_at = $2
+        updated_at = NOW()
       WHERE device_key = $1
-    `, [deviceKey, now, mode, equipmentStatus, isFanTimerOn ? 'ON' : 'OFF', heatSetpoint, coolSetpoint]);
+    `, [deviceKey, eventTimestamp, mode, equipmentStatus, isFanTimerOn ? 'ON' : 'OFF', heatSetpoint, coolSetpoint]);
     
     activeDevices.set(deviceKey, {
       deviceKey,
       frontendId: userId,
       deviceName,
       sessionId,
-      sessionStartedAt: now,
+      sessionStartedAt: eventTimestamp,
       currentMode: mode,
       currentEquipmentStatus: equipmentStatus,
       startTemperature: startTemp,
@@ -344,51 +359,48 @@ async function startRuntimeSession(
       coolSetpoint
     });
     
-    console.log(`Session started at ${now.toISOString()}`);
+    console.log(`Session started at ${eventTimestamp.toISOString()}`);
     console.log(`isHvacActive is now: TRUE`);
     
-    // POST TO BUBBLE - SESSION STARTED
-    console.log('\n>>> POSTING SESSION START TO BUBBLE <<<');
-    try {
-      const reachableResult = await pool.query(
-        'SELECT is_reachable FROM device_status WHERE device_key = $1',
-        [deviceKey]
-      );
-      const isReachable = reachableResult.rows[0]?.is_reachable ?? true;
-      
-      await postToBubble({
-        userId: userId,
-        thermostatId: deviceKey,
-        deviceName: deviceName,
-        runtimeSeconds: 0,
-        runtimeMinutes: 0,
-        isRuntimeEvent: false,
-        hvacMode: mode,
-        isHvacActive: true,  // <-- TRUE because session just started
-        thermostatMode: mode.toUpperCase(),
-        isReachable: isReachable,
-        currentTempF: startTemp,
-        currentTempC: startTemp ? (startTemp - 32) * 5/9 : null,
-        lastIsCooling: false,
-        lastIsHeating: false,
-        lastIsFanOnly: false,
-        lastEquipmentStatus: 'off',
-        equipmentStatus: equipmentStatus.toLowerCase(),
-        isFanOnly: isFanTimerOn,
-        timestamp: now.toISOString(),
-        eventId: uuidv4(),
-        eventTimestamp: now.getTime()
-      });
-    } catch (bubbleError) {
-      console.error('Error posting session start to Bubble:', bubbleError);
-    }
+    // POST TO BUBBLE - NON-BLOCKING
+    console.log('\n>>> POSTING SESSION START TO BUBBLE (ASYNC) <<<');
+    const reachableResult = await pool.query(
+      'SELECT is_reachable FROM device_status WHERE device_key = $1',
+      [deviceKey]
+    );
+    const isReachable = reachableResult.rows[0]?.is_reachable ?? true;
+    
+    postToBubbleAsync({
+      userId: userId,
+      thermostatId: deviceKey,
+      deviceName: deviceName,
+      runtimeSeconds: 0,
+      runtimeMinutes: 0,
+      isRuntimeEvent: false,
+      hvacMode: mode,
+      isHvacActive: true,
+      thermostatMode: mode.toUpperCase(),
+      isReachable: isReachable,
+      currentTempF: startTemp,
+      currentTempC: startTemp ? (startTemp - 32) * 5/9 : null,
+      lastIsCooling: false,
+      lastIsHeating: false,
+      lastIsFanOnly: false,
+      lastEquipmentStatus: 'off',
+      equipmentStatus: equipmentStatus.toLowerCase(),
+      isFanOnly: isFanTimerOn,
+      timestamp: eventTimestamp.toISOString(),
+      eventId: uuidv4(),
+      eventTimestamp: eventTimestamp.getTime()
+    });
     
   } catch (error) {
     console.error('Error starting runtime session:', error);
     throw error;
   }
 }
-async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentStatus) {
+
+async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentStatus, eventTimestamp) {
   const pool = getPool();
   const deviceState = activeDevices.get(deviceKey);
   
@@ -397,12 +409,12 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
     return;
   }
   
-  const now = new Date();
-  const runtimeSeconds = Math.floor((now - deviceState.sessionStartedAt) / 1000);
+  const runtimeSeconds = Math.floor((eventTimestamp - deviceState.sessionStartedAt) / 1000);
   const fanTailSeconds = parseInt(process.env.LAST_FAN_TAIL_SECONDS || '0', 10);
   const totalRuntimeSeconds = runtimeSeconds + fanTailSeconds;
   
   console.log(`Ending session - Started: ${deviceState.sessionStartedAt.toISOString()}`);
+  console.log(`                  Ended: ${eventTimestamp.toISOString()}`);
   console.log(`Runtime: ${runtimeSeconds}s + ${fanTailSeconds}s tail = ${totalRuntimeSeconds}s total`);
   
   try {
@@ -417,9 +429,9 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
         ended_at = $2,
         duration_seconds = $3,
         end_temperature = $4,
-        updated_at = $2
+        updated_at = NOW()
       WHERE session_id = $1
-    `, [deviceState.sessionId, now, runtimeSeconds, endTemp]);
+    `, [deviceState.sessionId, eventTimestamp, runtimeSeconds, endTemp]);
     
     const lastWasCooling = deviceState.isCooling;
     const lastWasHeating = deviceState.isHeating;
@@ -437,7 +449,7 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
         last_activity_at = $7,
         last_post_at = $7,
         last_fan_tail_until = $8,
-        updated_at = $7
+        updated_at = NOW()
       WHERE device_key = $1
     `, [
       deviceKey,
@@ -446,8 +458,8 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
       lastWasCooling,
       lastWasHeating,
       lastWasFanOnly,
-      now,
-      fanTailSeconds > 0 ? new Date(now.getTime() + fanTailSeconds * 1000) : null
+      eventTimestamp,
+      fanTailSeconds > 0 ? new Date(eventTimestamp.getTime() + fanTailSeconds * 1000) : null
     ]);
     
     const reachableResult = await pool.query(
@@ -459,34 +471,30 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
     console.log(`isHvacActive is now: FALSE`);
     
     if (totalRuntimeSeconds > 0) {
-      console.log('\n>>> POSTING RUNTIME EVENT TO BUBBLE <<<');
-      try {
-        await postToBubble({
-          userId: userId,
-          thermostatId: deviceKey,
-          deviceName: deviceName,
-          runtimeSeconds: totalRuntimeSeconds,
-          runtimeMinutes: Math.round(totalRuntimeSeconds / 60),
-          isRuntimeEvent: true,
-          hvacMode: deviceState.currentMode,
-          isHvacActive: false,
-          thermostatMode: deviceState.currentMode.toUpperCase(),
-          isReachable: isReachable,
-          currentTempF: null,
-          currentTempC: null,
-          lastIsCooling: lastWasCooling,
-          lastIsHeating: lastWasHeating,
-          lastIsFanOnly: lastWasFanOnly,
-          lastEquipmentStatus: deviceState.currentEquipmentStatus.toLowerCase(),
-          equipmentStatus: finalEquipmentStatus.toLowerCase(),
-          isFanOnly: false,
-          timestamp: now.toISOString(),
-          eventId: uuidv4(),
-          eventTimestamp: now.getTime()
-        });
-      } catch (error) {
-        console.error('Error posting runtime to Bubble:', error);
-      }
+      console.log('\n>>> POSTING RUNTIME EVENT TO BUBBLE (ASYNC) <<<');
+      postToBubbleAsync({
+        userId: userId,
+        thermostatId: deviceKey,
+        deviceName: deviceName,
+        runtimeSeconds: totalRuntimeSeconds,
+        runtimeMinutes: Math.round(totalRuntimeSeconds / 60),
+        isRuntimeEvent: true,
+        hvacMode: deviceState.currentMode,
+        isHvacActive: false,
+        thermostatMode: deviceState.currentMode.toUpperCase(),
+        isReachable: isReachable,
+        currentTempF: null,
+        currentTempC: null,
+        lastIsCooling: lastWasCooling,
+        lastIsHeating: lastWasHeating,
+        lastIsFanOnly: lastWasFanOnly,
+        lastEquipmentStatus: deviceState.currentEquipmentStatus.toLowerCase(),
+        equipmentStatus: finalEquipmentStatus.toLowerCase(),
+        isFanOnly: false,
+        timestamp: eventTimestamp.toISOString(),
+        eventId: uuidv4(),
+        eventTimestamp: eventTimestamp.getTime()
+      });
     } else {
       console.log('Runtime was 0 seconds - skipping Bubble post');
     }
@@ -504,15 +512,15 @@ async function updateRuntimeSession(
   equipmentStatus,
   isFanTimerOn,
   heatSetpoint,
-  coolSetpoint
+  coolSetpoint,
+  eventTimestamp
 ) {
   const pool = getPool();
   const deviceState = activeDevices.get(deviceKey);
   
   if (!deviceState) return;
   
-  const now = new Date();
-  const elapsed = Math.floor((now - deviceState.sessionStartedAt) / 1000);
+  const elapsed = Math.floor((eventTimestamp - deviceState.sessionStartedAt) / 1000);
   
   console.log(`Updating session - Elapsed: ${elapsed}s`);
   
@@ -523,9 +531,9 @@ async function updateRuntimeSession(
         last_tick_at = $2,
         heat_setpoint = $3,
         cool_setpoint = $4,
-        updated_at = $2
+        updated_at = NOW()
       WHERE session_id = $1
-    `, [deviceState.sessionId, now, heatSetpoint, coolSetpoint]);
+    `, [deviceState.sessionId, eventTimestamp, heatSetpoint, coolSetpoint]);
     
     await pool.query(`
       UPDATE device_status SET
@@ -548,7 +556,7 @@ async function updateRuntimeSession(
   }
 }
 
-async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
+async function handleTemperatureChange(deviceKey, tempF, tempC, userId, eventTimestamp) {
   console.log(`\nhandleTemperatureChange called for ${deviceKey}`);
   const pool = getPool();
   
@@ -556,10 +564,10 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     await pool.query(`
       UPDATE device_status SET
         last_temperature = $2,
-        last_seen_at = NOW(),
+        last_seen_at = $3,
         updated_at = NOW()
       WHERE device_key = $1
-    `, [deviceKey, tempF]);
+    `, [deviceKey, tempF, eventTimestamp]);
     
     console.log(`Temperature updated in database: ${tempF}°F`);
     
@@ -569,9 +577,9 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     
     await pool.query(`
       INSERT INTO temp_readings (
-        device_key, temperature, units, event_type, session_id
-      ) VALUES ($1, $2, 'F', 'temperature_update', $3)
-    `, [deviceKey, tempF, sessionId]);
+        device_key, temperature, units, event_type, session_id, recorded_at
+      ) VALUES ($1, $2, 'F', 'temperature_update', $3, $4)
+    `, [deviceKey, tempF, sessionId, eventTimestamp]);
     
     console.log(`Temperature reading logged to database`);
     
@@ -590,36 +598,32 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     const device = deviceResult.rows[0];
     const currentMode = device.current_mode || 'off';
     
-    console.log('\n>>> POSTING TEMPERATURE EVENT TO BUBBLE <<<');
+    console.log('\n>>> POSTING TEMPERATURE EVENT TO BUBBLE (ASYNC) <<<');
     console.log(`isHvacActive: ${isHvacActive}`);
     
-    try {
-      await postToBubble({
-        userId: userId,
-        thermostatId: deviceKey,
-        deviceName: device.device_name,
-        runtimeSeconds: 0,
-        runtimeMinutes: 0,
-        isRuntimeEvent: false,
-        hvacMode: currentMode,
-        isHvacActive: isHvacActive,
-        thermostatMode: currentMode.toUpperCase(),
-        isReachable: device.is_reachable ?? true,
-        currentTempF: tempF,
-        currentTempC: tempC,
-        lastIsCooling: device.last_was_cooling || false,
-        lastIsHeating: device.last_was_heating || false,
-        lastIsFanOnly: device.last_was_fan_only || false,
-        lastEquipmentStatus: device.current_equipment_status?.toLowerCase() || 'off',
-        equipmentStatus: device.current_equipment_status?.toLowerCase() || 'off',
-        isFanOnly: deviceState?.isFanOnly || false,
-        timestamp: new Date().toISOString(),
-        eventId: uuidv4(),
-        eventTimestamp: Date.now()
-      });
-    } catch (bubbleError) {
-      console.error('Error posting temperature to Bubble:', bubbleError);
-    }
+    postToBubbleAsync({
+      userId: userId,
+      thermostatId: deviceKey,
+      deviceName: device.device_name,
+      runtimeSeconds: 0,
+      runtimeMinutes: 0,
+      isRuntimeEvent: false,
+      hvacMode: currentMode,
+      isHvacActive: isHvacActive,
+      thermostatMode: currentMode.toUpperCase(),
+      isReachable: device.is_reachable ?? true,
+      currentTempF: tempF,
+      currentTempC: tempC,
+      lastIsCooling: device.last_was_cooling || false,
+      lastIsHeating: device.last_was_heating || false,
+      lastIsFanOnly: device.last_was_fan_only || false,
+      lastEquipmentStatus: device.current_equipment_status?.toLowerCase() || 'off',
+      equipmentStatus: device.current_equipment_status?.toLowerCase() || 'off',
+      isFanOnly: deviceState?.isFanOnly || false,
+      timestamp: eventTimestamp.toISOString(),
+      eventId: uuidv4(),
+      eventTimestamp: eventTimestamp.getTime()
+    });
     
   } catch (error) {
     console.error('Error handling temperature change:', error);
@@ -627,17 +631,17 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
   }
 }
 
-async function updateDeviceReachability(deviceKey, isReachable) {
+async function updateDeviceReachability(deviceKey, isReachable, eventTimestamp) {
   const pool = getPool();
   
   try {
     await pool.query(`
       UPDATE device_status SET
         is_reachable = $2,
-        last_seen_at = NOW(),
+        last_seen_at = $3,
         updated_at = NOW()
       WHERE device_key = $1
-    `, [deviceKey, isReachable]);
+    `, [deviceKey, isReachable, eventTimestamp]);
     
     console.log(`Device reachability updated`);
   } catch (error) {
@@ -645,7 +649,7 @@ async function updateDeviceReachability(deviceKey, isReachable) {
   }
 }
 
-async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previousState) {
+async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previousState, eventTimestamp) {
   const pool = getPool();
   const deviceState = activeDevices.get(deviceKey);
   
@@ -653,8 +657,8 @@ async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previ
     await pool.query(`
       INSERT INTO equipment_events (
         device_key, event_type, equipment_status, previous_status,
-        is_active, session_id, event_data
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        is_active, session_id, event_data, recorded_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     `, [
       deviceKey,
       'status_change',
@@ -662,7 +666,8 @@ async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previ
       previousState?.currentEquipmentStatus || 'unknown',
       !!deviceState,
       deviceState?.sessionId || null,
-      JSON.stringify({ isFanTimerOn })
+      JSON.stringify({ isFanTimerOn }),
+      eventTimestamp
     ]);
   } catch (error) {
     console.error('Error logging equipment event:', error);
@@ -698,5 +703,6 @@ function celsiusToFahrenheit(celsius) {
 
 module.exports = {
   handleDeviceEvent,
-  recoverActiveSessions
+  recoverActiveSessions,
+  activeDevices
 };
