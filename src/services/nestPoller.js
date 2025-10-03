@@ -137,15 +137,7 @@ async function pollUserDevices(userId) {
   }
 }
 
-function startPoller() {
-  console.log(`Starting Nest API poller (every ${POLL_INTERVAL_MS / 60000} minutes)`);
-  
-  // Poll immediately on startup
-  pollAllUsers();
-  
-  // Then poll every 20 minutes
-  pollInterval = setInterval(pollAllUsers, POLL_INTERVAL_MS);
-}
+
 
 function stopPoller() {
   if (pollInterval) {
