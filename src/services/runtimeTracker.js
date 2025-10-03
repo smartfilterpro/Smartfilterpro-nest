@@ -346,12 +346,48 @@ async function startRuntimeSession(
     
     console.log(`Session started at ${now.toISOString()}`);
     console.log(`isHvacActive is now: TRUE`);
+    
+    // POST TO BUBBLE - SESSION STARTED
+    console.log('\n>>> POSTING SESSION START TO BUBBLE <<<');
+    try {
+      const reachableResult = await pool.query(
+        'SELECT is_reachable FROM device_status WHERE device_key = $1',
+        [deviceKey]
+      );
+      const isReachable = reachableResult.rows[0]?.is_reachable ?? true;
+      
+      await postToBubble({
+        userId: userId,
+        thermostatId: deviceKey,
+        deviceName: deviceName,
+        runtimeSeconds: 0,
+        runtimeMinutes: 0,
+        isRuntimeEvent: false,
+        hvacMode: mode,
+        isHvacActive: true,  // <-- TRUE because session just started
+        thermostatMode: mode.toUpperCase(),
+        isReachable: isReachable,
+        currentTempF: startTemp,
+        currentTempC: startTemp ? (startTemp - 32) * 5/9 : null,
+        lastIsCooling: false,
+        lastIsHeating: false,
+        lastIsFanOnly: false,
+        lastEquipmentStatus: 'off',
+        equipmentStatus: equipmentStatus.toLowerCase(),
+        isFanOnly: isFanTimerOn,
+        timestamp: now.toISOString(),
+        eventId: uuidv4(),
+        eventTimestamp: now.getTime()
+      });
+    } catch (bubbleError) {
+      console.error('Error posting session start to Bubble:', bubbleError);
+    }
+    
   } catch (error) {
     console.error('Error starting runtime session:', error);
     throw error;
   }
 }
-
 async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentStatus) {
   const pool = getPool();
   const deviceState = activeDevices.get(deviceKey);
