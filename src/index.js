@@ -35,7 +35,14 @@ async function startup() {
     await recoverActiveSessions();
     console.log('✓ Active sessions recovered');
     
-    // Start polling
+    // Poll immediately to sync actual state
+    const { pollAllUsers } = require('./services/nestPoller');
+    console.log('Polling all devices to verify current state...');
+    await pollAllUsers();
+    console.log('✓ Initial polling complete');
+    
+    // Start polling scheduler
+    const { startPoller } = require('./services/nestPoller');
     startPoller();
     console.log('✓ Nest API poller started');
     
