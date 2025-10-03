@@ -1,158 +1,46 @@
-const { google } = require('googleapis');
-const { getPool } = require('../database/db');
-const { handleDeviceEvent } = require('./runtimeTracker');
+const axios = require('axios');
 
-const POLL_INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
-const smartdevicemanagement = google.smartdevicemanagement('v1');
+const BUBBLE_URL = process.env.BUBBLE_WEBHOOK_URL;
+const MAX_RETRIES = parseInt(process.env.MAX_RETRY_ATTEMPTS || '3', 10);
+const RETRY_DELAY = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);
 
-let pollInterval;
-
-async function getOAuthClientForUser(userId) {
-  const pool = getPool();
+async function postToBubble(payload) {
+  let lastError;
   
-  const result = await pool.query(
-    'SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE user_id = $1',
-    [userId]
-  );
+  console.log('📤 BUBBLE PAYLOAD:', JSON.stringify(payload, null, 2));
   
-  if (result.rows.length === 0) {
-    throw new Error(`No OAuth tokens found for user: ${userId}`);
-  }
-  
-  const { access_token, refresh_token, expires_at } = result.rows[0];
-  
-  const oauth2Client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
-  );
-  
-  oauth2Client.setCredentials({
-    access_token,
-    refresh_token,
-    expiry_date: new Date(expires_at).getTime()
-  });
-  
-  // Auto-refresh tokens and save to database
-  oauth2Client.on('tokens', async (tokens) => {
-    console.log(`Refreshing tokens for user: ${userId}`);
-    
-    if (tokens.access_token) {
-      const expiresAt = new Date(Date.now() + (tokens.expiry_date || 3600000));
-      await pool.query(
-        'UPDATE oauth_tokens SET access_token = $1, expires_at = $2, updated_at = NOW() WHERE user_id = $3',
-        [tokens.access_token, expiresAt, userId]
-      );
-    }
-    
-    if (tokens.refresh_token) {
-      await pool.query(
-        'UPDATE oauth_tokens SET refresh_token = $1, updated_at = NOW() WHERE user_id = $2',
-        [tokens.refresh_token, userId]
-      );
-    }
-  });
-  
-  return oauth2Client;
-}
-
-async function pollAllUsers() {
-  const pool = getPool();
-  
-  try {
-    console.log('\n=== POLLING NEST DEVICES FOR ALL USERS ===');
-    
-    // Get all users with tokens
-    const usersResult = await pool.query(
-      'SELECT DISTINCT user_id FROM oauth_tokens'
-    );
-    
-    console.log(`Found ${usersResult.rows.length} user(s) with tokens`);
-    
-    for (const row of usersResult.rows) {
-      await pollUserDevices(row.user_id);
-    }
-    
-    console.log('=== POLLING COMPLETE ===\n');
-  } catch (error) {
-    console.error('Polling error:', error.message);
-  }
-}
-
-async function pollUserDevices(userId) {
-  try {
-    console.log(`Polling devices for user: ${userId}`);
-    
-    const auth = await getOAuthClientForUser(userId);
-    
-    // Get project ID from environment or extract from device names in database
-    let projectId = process.env.GOOGLE_PROJECT_ID;
-    
-    if (!projectId) {
-      // Try to get it from existing device data
-      const pool = getPool();
-      const deviceResult = await pool.query(
-        'SELECT device_name FROM device_status WHERE frontend_id = $1 LIMIT 1',
-        [userId]
-      );
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`⏳ Attempt ${attempt}/${MAX_RETRIES} - Posting to Bubble...`);
       
-      if (deviceResult.rows.length > 0) {
-        // Extract from device name: enterprises/{project}/devices/{deviceId}
-        const parts = deviceResult.rows[0].device_name.split('/');
-        projectId = parts[1];
-      } else {
-        console.error('Cannot determine project ID for user:', userId);
-        return;
+      const response = await axios.post(BUBBLE_URL, payload, {
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      });
+      
+      console.log(`✓ Bubble responded with status: ${response.status}`);
+      console.log(`✓ Response data:`, JSON.stringify(response.data, null, 2));
+      return response.data;
+      
+    } catch (error) {
+      lastError = error;
+      console.error(`✗ Attempt ${attempt} failed: ${error.message}`);
+      if (error.response) {
+        console.error(`✗ Response status: ${error.response.status}`);
+        console.error(`✗ Response data:`, error.response.data);
+      }
+      
+      if (attempt < MAX_RETRIES) {
+        console.log(`⏳ Retrying in ${RETRY_DELAY}ms...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
       }
     }
-    
-    // List all devices for this user
-    const response = await smartdevicemanagement.enterprises.devices.list({
-      auth,
-      parent: `enterprises/${projectId}`
-    });
-    
-    const devices = response.data.devices || [];
-    console.log(`Found ${devices.length} device(s) for user ${userId}`);
-    
-    for (const device of devices) {
-      console.log(`Processing device: ${device.name}`);
-      
-      // Convert device data to event format
-      const syntheticEvent = {
-        eventId: `poll-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        timestamp: new Date().toISOString(),
-        resourceUpdate: {
-          name: device.name,
-          traits: device.traits || {}
-        },
-        userId: userId,
-        resourceGroup: [device.name]
-      };
-      
-      await handleDeviceEvent(syntheticEvent);
-    }
-  } catch (error) {
-    console.error(`Error polling devices for user ${userId}:`, error.message);
   }
-}
-
-function startPoller() {
-  console.log(`Starting Nest API poller (every ${POLL_INTERVAL_MS / 60000} minutes)`);
   
-  // Poll immediately on startup
-  pollAllUsers();
-  
-  // Then poll every 20 minutes
-  pollInterval = setInterval(pollAllUsers, POLL_INTERVAL_MS);
+  console.error(`✗ Failed to post to Bubble after ${MAX_RETRIES} attempts`);
+  throw lastError;
 }
 
-function stopPoller() {
-  if (pollInterval) {
-    clearInterval(pollInterval);
-    pollInterval = null;
-    console.log('Poller stopped');
-  }
-}
-
-module.exports = { startPoller, stopPoller, pollUserDevices, pollAllUsers };
+module.exports = { postToBubble };
