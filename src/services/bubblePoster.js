@@ -1,8 +1,8 @@
 const axios = require('axios');
 
 const BUBBLE_URL = process.env.BUBBLE_WEBHOOK_URL;
-const MAX_RETRIES = parseInt(process.env.MAX_RETRY_ATTEMPTS || '3', 10);
-const RETRY_DELAY = parseInt(process.env.RETRY_DELAY_MS || '2000', 10);
+const MAX_RETRIES = parseInt(process.env.MAX_RETRY_ATTEMPTS || '2', 10);
+const RETRY_DELAY = parseInt(process.env.RETRY_DELAY_MS || '1000', 10);
 
 async function postToBubble(payload) {
   let lastError;
@@ -17,7 +17,7 @@ async function postToBubble(payload) {
         headers: {
           'Content-Type': 'application/json'
         },
-        timeout: 10000
+        timeout: 5000  // Reduced from 10000ms to 5000ms
       });
       
       console.log(`✓ Bubble responded with status: ${response.status}`);
@@ -43,4 +43,11 @@ async function postToBubble(payload) {
   throw lastError;
 }
 
-module.exports = { postToBubble };
+// Fire-and-forget version - does not block caller
+function postToBubbleAsync(payload) {
+  postToBubble(payload).catch(err => {
+    console.error('Async Bubble post failed (non-blocking):', err.message);
+  });
+}
+
+module.exports = { postToBubble, postToBubbleAsync };
