@@ -2,7 +2,8 @@ const { google } = require('googleapis');
 const { getPool } = require('../database/db');
 const { handleDeviceEvent } = require('./runtimeTracker');
 
-const POLL_INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
+const POLL_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
+const STALE_THRESHOLD_MS = 20 * 60 * 1000; // Poll if no update in 20 minutes
 const smartdevicemanagement = google.smartdevicemanagement('v1');
 
 let pollInterval;
@@ -55,29 +56,66 @@ async function getOAuthClientForUser(userId) {
   return oauth2Client;
 }
 
-async function pollAllUsers() {
+async function pollStaleDevices() {
   const pool = getPool();
   
   try {
-    console.log('\n=== POLLING NEST DEVICES FOR ALL USERS ===');
+    console.log('\n=== CHECKING FOR STALE DEVICES ===');
     
-    const usersResult = await pool.query(
-      'SELECT DISTINCT user_id FROM oauth_tokens'
-    );
+    const now = new Date();
+    const staleThreshold = new Date(now.getTime() - STALE_THRESHOLD_MS);
     
-    console.log(`Found ${usersResult.rows.length} user(s) with tokens`);
+    // Find devices that haven't reported in 20+ minutes
+    const staleDevicesResult = await pool.query(`
+      SELECT 
+        ds.device_key,
+        ds.device_name,
+        ds.frontend_id as user_id,
+        ds.last_seen_at,
+        ds.last_activity_at,
+        GREATEST(ds.last_seen_at, ds.last_activity_at) as last_update,
+        EXTRACT(EPOCH FROM (NOW() - GREATEST(ds.last_seen_at, ds.last_activity_at)))/60 as minutes_since_update
+      FROM device_status ds
+      WHERE GREATEST(ds.last_seen_at, ds.last_activity_at) < $1
+         OR (ds.last_seen_at IS NULL AND ds.last_activity_at IS NULL)
+      ORDER BY GREATEST(ds.last_seen_at, ds.last_activity_at) ASC NULLS FIRST
+    `, [staleThreshold]);
     
-    for (const row of usersResult.rows) {
-      await pollUserDevices(row.user_id);
+    if (staleDevicesResult.rows.length === 0) {
+      console.log('✓ All devices are up-to-date (no polling needed)');
+      console.log('=== CHECK COMPLETE ===\n');
+      return;
     }
     
-    console.log('=== POLLING COMPLETE ===\n');
+    console.log(`Found ${staleDevicesResult.rows.length} stale device(s) to poll:`);
+    
+    for (const device of staleDevicesResult.rows) {
+      const minutesStale = device.minutes_since_update || 'never';
+      console.log(`  - ${device.device_key}: ${minutesStale === 'never' ? 'never updated' : minutesStale.toFixed(1) + ' min ago'}`);
+    }
+    
+    // Group by user to minimize API calls
+    const devicesByUser = staleDevicesResult.rows.reduce((acc, device) => {
+      if (!acc[device.user_id]) {
+        acc[device.user_id] = [];
+      }
+      acc[device.user_id].push(device);
+      return acc;
+    }, {});
+    
+    console.log(`Polling ${Object.keys(devicesByUser).length} user(s)`);
+    
+    for (const [userId, devices] of Object.entries(devicesByUser)) {
+      await pollUserDevices(userId, devices.map(d => d.device_key));
+    }
+    
+    console.log('=== STALE DEVICE CHECK COMPLETE ===\n');
   } catch (error) {
-    console.error('Polling error:', error.message);
+    console.error('Error checking stale devices:', error.message);
   }
 }
 
-async function pollUserDevices(userId) {
+async function pollUserDevices(userId, staleDeviceKeys = null) {
   try {
     console.log(`Polling devices for user: ${userId}`);
     
@@ -107,10 +145,21 @@ async function pollUserDevices(userId) {
     });
     
     const devices = response.data.devices || [];
-    console.log(`Found ${devices.length} device(s) for user ${userId}`);
+    console.log(`Found ${devices.length} total device(s) for user ${userId}`);
     
-    for (const device of devices) {
-      console.log(`Processing device: ${device.name}`);
+    // Filter to only stale devices if specified
+    const devicesToProcess = staleDeviceKeys 
+      ? devices.filter(d => {
+          const deviceKey = d.name.split('/').pop();
+          return staleDeviceKeys.includes(deviceKey);
+        })
+      : devices;
+    
+    console.log(`Processing ${devicesToProcess.length} device(s)`);
+    
+    for (const device of devicesToProcess) {
+      const deviceKey = device.name.split('/').pop();
+      console.log(`Polling stale device: ${deviceKey}`);
       
       const syntheticEvent = {
         eventId: `poll-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -130,9 +179,40 @@ async function pollUserDevices(userId) {
   }
 }
 
+// Manual poll all users (for initial startup or manual trigger)
+async function pollAllUsers() {
+  const pool = getPool();
+  
+  try {
+    console.log('\n=== POLLING ALL DEVICES (MANUAL) ===');
+    
+    const usersResult = await pool.query(
+      'SELECT DISTINCT user_id FROM oauth_tokens'
+    );
+    
+    console.log(`Found ${usersResult.rows.length} user(s) with tokens`);
+    
+    for (const row of usersResult.rows) {
+      await pollUserDevices(row.user_id);
+    }
+    
+    console.log('=== MANUAL POLLING COMPLETE ===\n');
+  } catch (error) {
+    console.error('Manual polling error:', error.message);
+  }
+}
+
 function startPoller() {
-  console.log(`Starting Nest API poller (every ${POLL_INTERVAL_MS / 60000} minutes)`);
-  pollInterval = setInterval(pollAllUsers, POLL_INTERVAL_MS);
+  console.log(`Starting stale device checker (every ${POLL_INTERVAL_MS / 60000} minutes)`);
+  console.log(`Will poll devices with no update in ${STALE_THRESHOLD_MS / 60000} minutes`);
+  
+  // Run immediately on startup
+  pollStaleDevices().catch(err => 
+    console.error('Initial stale check failed (non-fatal):', err.message)
+  );
+  
+  // Then run on interval
+  pollInterval = setInterval(pollStaleDevices, POLL_INTERVAL_MS);
 }
 
 function stopPoller() {
