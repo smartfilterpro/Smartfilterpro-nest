@@ -33,7 +33,6 @@ async function getOAuthClientForUser(userId) {
     expiry_date: new Date(expires_at).getTime()
   });
   
-  // Auto-refresh tokens and save to database
   oauth2Client.on('tokens', async (tokens) => {
     console.log(`Refreshing tokens for user: ${userId}`);
     
@@ -62,7 +61,6 @@ async function pollAllUsers() {
   try {
     console.log('\n=== POLLING NEST DEVICES FOR ALL USERS ===');
     
-    // Get all users with tokens
     const usersResult = await pool.query(
       'SELECT DISTINCT user_id FROM oauth_tokens'
     );
@@ -85,11 +83,9 @@ async function pollUserDevices(userId) {
     
     const auth = await getOAuthClientForUser(userId);
     
-    // Get project ID from environment or extract from device names in database
     let projectId = process.env.GOOGLE_PROJECT_ID;
     
     if (!projectId) {
-      // Try to get it from existing device data
       const pool = getPool();
       const deviceResult = await pool.query(
         'SELECT device_name FROM device_status WHERE frontend_id = $1 LIMIT 1',
@@ -97,7 +93,6 @@ async function pollUserDevices(userId) {
       );
       
       if (deviceResult.rows.length > 0) {
-        // Extract from device name: enterprises/{project}/devices/{deviceId}
         const parts = deviceResult.rows[0].device_name.split('/');
         projectId = parts[1];
       } else {
@@ -106,7 +101,6 @@ async function pollUserDevices(userId) {
       }
     }
     
-    // List all devices for this user
     const response = await smartdevicemanagement.enterprises.devices.list({
       auth,
       parent: `enterprises/${projectId}`
@@ -118,7 +112,6 @@ async function pollUserDevices(userId) {
     for (const device of devices) {
       console.log(`Processing device: ${device.name}`);
       
-      // Convert device data to event format
       const syntheticEvent = {
         eventId: `poll-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         timestamp: new Date().toISOString(),
@@ -137,7 +130,10 @@ async function pollUserDevices(userId) {
   }
 }
 
-
+function startPoller() {
+  console.log(`Starting Nest API poller (every ${POLL_INTERVAL_MS / 60000} minutes)`);
+  pollInterval = setInterval(pollAllUsers, POLL_INTERVAL_MS);
+}
 
 function stopPoller() {
   if (pollInterval) {
