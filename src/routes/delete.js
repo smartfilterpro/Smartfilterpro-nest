@@ -3,8 +3,23 @@ const { getPool } = require('../database/db');
 
 const router = express.Router();
 
+// Middleware to verify API key
+function verifyApiKey(req, res, next) {
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey || req.body.apiKey;
+  
+  if (apiKey !== process.env.RAILWAY_API_KEY) {
+    console.error('Unauthorized deletion attempt - invalid API key');
+    return res.status(401).json({ 
+      success: false,
+      error: 'Unauthorized - Invalid API key' 
+    });
+  }
+  
+  next();
+}
+
 // Delete user and all associated data
-router.delete('/user/:userId', async (req, res) => {
+router.delete('/user/:userId', verifyApiKey, async (req, res) => {
   const { userId } = req.params;
   const pool = getPool();
   
@@ -86,10 +101,40 @@ router.delete('/user/:userId', async (req, res) => {
 });
 
 // Delete specific thermostat
-router.delete('/device/:deviceKey', async (req, res) => {
+router.delete('/device/:deviceKey', verifyApiKey, async (req, res) => {
   const { deviceKey } = req.params;
   const pool = getPool();
   
   try {
     const result = await pool.query(
-      'DELETE FROM device_status WHERE device_key = $1 RE
+      'DELETE FROM device_status WHERE device_key = $1 RETURNING device_name',
+      [deviceKey]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Device not found'
+      });
+    }
+    
+    // Clear from in-memory cache
+    const { activeDevices } = require('../services/runtimeTracker');
+    if (activeDevices && activeDevices.has(deviceKey)) {
+      activeDevices.delete(deviceKey);
+      console.log(`Cleared ${deviceKey} from active sessions cache`);
+    }
+    
+    console.log(`Deleted device ${deviceKey}`);
+    
+    res.json({
+      success: true,
+      message: `Deleted device ${deviceKey}`
+    });
+  } catch (error) {
+    console.error('Error deleting device:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+module.exports = router;
