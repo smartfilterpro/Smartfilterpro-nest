@@ -13,8 +13,9 @@ async function runMigrations() {
     await client.query('DROP TABLE IF EXISTS temp_readings CASCADE');
     await client.query('DROP TABLE IF EXISTS equipment_events CASCADE');
     await client.query('DROP TABLE IF EXISTS runtime_sessions CASCADE');
+    await client.query('DROP TABLE IF EXISTS oauth_tokens CASCADE');
     await client.query('DROP TABLE IF EXISTS device_status CASCADE');
-    await client.query('DROP TABLE IF EXISTS device_states CASCADE'); // Drop old incorrect table name too
+    await client.query('DROP TABLE IF EXISTS device_states CASCADE');
     
     console.log('Creating fresh tables...');
     
@@ -50,6 +51,18 @@ async function runMigrations() {
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         room_display_name TEXT,
         last_fan_tail_until TIMESTAMPTZ
+      )
+    `);
+    
+    // OAuth Tokens Table
+    await client.query(`
+      CREATE TABLE oauth_tokens (
+        user_id TEXT PRIMARY KEY,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
     
