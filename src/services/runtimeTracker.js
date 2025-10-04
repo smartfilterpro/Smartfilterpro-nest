@@ -189,6 +189,27 @@ async function handleDeviceEvent(eventData) {
       coolSetpoint
     );
     
+    // CRITICAL: Always update fan status in database, even when idle
+    // This prevents stale fan status from being read by subsequent webhooks
+    if (isFanTimerOn !== null) {
+      await pool.query(`
+        UPDATE device_status 
+        SET last_fan_status = $2, updated_at = NOW() 
+        WHERE device_key = $1
+      `, [deviceKey, isFanTimerOn ? 'ON' : 'OFF']);
+      console.log('DEBUG - Fan status updated in DB:', isFanTimerOn ? 'ON' : 'OFF');
+    }
+    
+    // Also update equipment status if present (even when idle)
+    if (equipmentStatus !== null) {
+      await pool.query(`
+        UPDATE device_status 
+        SET current_equipment_status = $2, updated_at = NOW() 
+        WHERE device_key = $1
+      `, [deviceKey, equipmentStatus]);
+      console.log('DEBUG - Equipment status updated in DB:', equipmentStatus);
+    }
+    
   } catch (error) {
     console.error('Error handling device event:', error);
     throw error;
