@@ -90,8 +90,9 @@ async function pollStaleDevices() {
     console.log(`Found ${staleDevicesResult.rows.length} stale device(s) to poll:`);
     
     for (const device of staleDevicesResult.rows) {
-      const minutesStale = device.minutes_since_update || 'never';
-      console.log(`  - ${device.device_key}: ${minutesStale === 'never' ? 'never updated' : minutesStale.toFixed(1) + ' min ago'}`);
+     const minutesStale = device.minutes_since_update;
+     const staleMsg = minutesStale ? `${minutesStale.toFixed(1)} min ago` : 'never updated';
+     console.log(`  - ${device.device_key}: ${staleMsg}`);
     }
     
     // Group by user to minimize API calls
