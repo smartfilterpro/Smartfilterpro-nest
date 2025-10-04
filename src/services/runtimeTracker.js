@@ -383,14 +383,23 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
   console.log('Ending session - Started:', deviceState.sessionStartedAt.toISOString());
   console.log('Runtime:', runtimeSeconds, 's +', fanTailSeconds, 's tail =', totalRuntimeSeconds, 's total');
   
+  // CRITICAL: Delete from in-memory FIRST to prevent race conditions
+  // This ensures subsequent webhooks won't see an active session
+  activeDevices.delete(deviceKey);
+  console.log('Cleared in-memory session state');
+  
+  const client = await pool.connect();
   try {
-    const tempResult = await pool.query(
+    await client.query('BEGIN');
+    
+    const tempResult = await client.query(
       'SELECT last_temperature FROM device_status WHERE device_key = $1',
       [deviceKey]
     );
     const endTemp = tempResult.rows[0]?.last_temperature || null;
     
-    await pool.query(`
+    // Update runtime session
+    await client.query(`
       UPDATE runtime_sessions SET
         ended_at = $2,
         duration_seconds = $3,
@@ -403,10 +412,13 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
     const lastWasHeating = deviceState.isHeating;
     const lastWasFanOnly = deviceState.isFanOnly && !deviceState.isHeating && !deviceState.isCooling;
     
-    await pool.query(`
+    // Update device status - mark as NOT running with OFF status
+    await client.query(`
       UPDATE device_status SET
         is_running = false,
         session_started_at = NULL,
+        current_equipment_status = 'OFF',
+        current_mode = 'off',
         last_equipment_status = $2,
         last_mode = $3,
         last_was_cooling = $4,
@@ -428,7 +440,10 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
       fanTailSeconds > 0 ? new Date(now.getTime() + fanTailSeconds * 1000) : null
     ]);
     
-    const reachableResult = await pool.query(
+    await client.query('COMMIT');
+    console.log('Database transaction committed - state is now OFF');
+    
+    const reachableResult = await client.query(
       'SELECT is_reachable FROM device_status WHERE device_key = $1',
       [deviceKey]
     );
@@ -464,11 +479,15 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalEquipmentSt
       console.log('Runtime was 0 seconds - skipping Bubble post');
     }
     
-    activeDevices.delete(deviceKey);
     console.log('Session ended successfully');
   } catch (error) {
-    console.error('Error ending runtime session:', error);
+    await client.query('ROLLBACK');
+    // Restore in-memory state on error
+    activeDevices.set(deviceKey, deviceState);
+    console.error('Error ending runtime session (rolled back):', error);
     throw error;
+  } finally {
+    client.release();
   }
 }
 
