@@ -1,77 +1,57 @@
-const { Pool } = require(‘pg’);
+const { Pool } = require('pg');
 
 let pool;
 
 function getPool() {
-if (!pool) {
-pool = new Pool({
-connectionString: process.env.DATABASE_URL,
-ssl: process.env.NODE_ENV === ‘production’ ? { rejectUnauthorized: false } : false,
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+      max: 20,
+      min: 2,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+      statement_timeout: 30000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000
+    });
 
-```
-  // Connection pool limits for scalability
-  max: 20, // Maximum number of clients in the pool
-  min: 2, // Minimum number of clients to keep alive
-  
-  // Connection timeouts
-  connectionTimeoutMillis: 5000, // How long to wait for a connection
-  idleTimeoutMillis: 30000, // How long a client can be idle before being closed
-  
-  // Keep connections alive
-  keepAlive: true,
-  keepAliveInitialDelayMillis: 10000,
-  
-  // Statement timeout to prevent long-running queries
-  statement_timeout: 10000, // 10 second timeout for queries
-});
+    pool.on('error', (err, client) => {
+      console.error('Unexpected error on idle client', err);
+    });
 
-// Log pool errors
-pool.on('error', (err, client) => {
-  console.error('Unexpected error on idle client', err);
-});
-
-// Monitor pool metrics
-pool.on('connect', () => {
-  console.log('New database connection established');
-});
-
-pool.on('remove', () => {
-  console.log('Database connection removed from pool');
-});
-```
-
-}
-return pool;
+    if (process.env.LOG_POOL_STATS === 'true') {
+      setInterval(() => {
+        console.log('Pool stats:', {
+          total: pool.totalCount,
+          idle: pool.idleCount,
+          waiting: pool.waitingCount
+        });
+      }, 60000);
+    }
+  }
+  return pool;
 }
 
 async function initDatabase() {
-const pool = getPool();
-
-// Test connection
-const client = await pool.connect();
-try {
-await client.query(‘SELECT NOW()’);
-console.log(‘Database connection successful’);
-
-```
-// Log pool status
-console.log(`Pool status: ${pool.totalCount} total, ${pool.idleCount} idle, ${pool.waitingCount} waiting`);
-```
-
-} finally {
-client.release();
-}
+  const pool = getPool();
+  
+  const client = await pool.connect();
+  try {
+    await client.query('SELECT NOW()');
+    console.log('Database connection successful');
+    console.log(`Pool config: max=${pool.options.max}, min=${pool.options.min}`);
+  } finally {
+    client.release();
+  }
 }
 
-// Get pool metrics for monitoring
-function getPoolMetrics() {
-if (!pool) return null;
-
-return {
-total: pool.totalCount,
-idle: pool.idleCount,
-waiting: pool.waitingCount
-};
+async function closePool() {
+  if (pool) {
+    await pool.end();
+    pool = null;
+    console.log('Database pool closed');
+  }
 }
 
-module.exports = { getPool, initDatabase, getPoolMetrics };
+module.exports = { getPool, initDatabase, closePool };
