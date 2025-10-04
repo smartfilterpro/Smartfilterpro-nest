@@ -45,22 +45,6 @@ await client.query(`
   )
 `);
 
-// Performance indexes for device_status
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_device_status_frontend_id 
-  ON device_status(frontend_id)
-`);
-
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_device_status_is_running 
-  ON device_status(is_running) WHERE is_running = true
-`);
-
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_device_status_last_activity 
-  ON device_status(last_activity_at DESC NULLS LAST, last_seen_at DESC NULLS LAST)
-`);
-
 // OAuth Tokens Table
 await client.query(`
   CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -98,11 +82,6 @@ await client.query(`
   ON equipment_events(session_id)
 `);
 
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_equipment_events_recorded_at 
-  ON equipment_events(recorded_at DESC)
-`);
-
 // Runtime Sessions Table
 await client.query(`
   CREATE TABLE IF NOT EXISTS runtime_sessions (
@@ -135,16 +114,6 @@ await client.query(`
   ON runtime_sessions(session_id)
 `);
 
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_runtime_sessions_started_at 
-  ON runtime_sessions(started_at DESC)
-`);
-
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_runtime_sessions_active 
-  ON runtime_sessions(device_key, ended_at) WHERE ended_at IS NULL
-`);
-
 // Temperature Readings Table
 await client.query(`
   CREATE TABLE IF NOT EXISTS temp_readings (
@@ -168,14 +137,8 @@ await client.query(`
   ON temp_readings(session_id)
 `);
 
-await client.query(`
-  CREATE INDEX IF NOT EXISTS idx_temp_readings_recorded_at 
-  ON temp_readings(recorded_at DESC)
-`);
-
 await client.query('COMMIT');
 console.log('✓ All migrations completed successfully');
-console.log('✓ Performance indexes created');
 ```
 
 } catch (error) {
