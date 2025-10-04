@@ -709,3 +709,4 @@ module.exports = {
   handleDeviceEvent,
   recoverActiveSessions,
   activeDevices
+};
