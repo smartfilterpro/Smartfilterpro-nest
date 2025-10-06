@@ -54,7 +54,7 @@ async function handleDeviceEvent(eventData) {
        SET current_equipment_status=$2,
            last_fan_status=$3,
            updated_at=NOW()
-       WHERE device_id=$1`,
+       WHERE device_key=$1`,
       [deviceId, equipmentStatus, isFanTimerOn ? 'ON' : 'OFF']
     );
 
@@ -133,7 +133,7 @@ async function startRuntimeSession(deviceId, userId, deviceName, equipmentStatus
 
   // 🌐 Core payload
   const corePayload = {
-    device_id: deviceId,
+    device_key: deviceId,
     event_type: eventType,
     is_active: isActive,
     equipment_status: equipmentStatus,
@@ -177,7 +177,7 @@ async function stopRuntimeSession(deviceId, userId, deviceName, finalStatus) {
   const eventType = 'SESSION_END';
 
   const corePayload = {
-    device_id: deviceId,
+    device_key: deviceId,
     event_type: eventType,
     is_active: isActive,
     equipment_status: finalStatus,
@@ -214,7 +214,7 @@ async function handleTemperatureChange(deviceId, userId) {
   const equipmentStatus = activeDevices.get(deviceId)?.currentEquipmentStatus || 'OFF';
 
   const corePayload = {
-    device_id: deviceId,
+    device_key: deviceId,
     event_type: 'TEMP',
     is_active: isActive,
     equipment_status: equipmentStatus,
@@ -252,7 +252,7 @@ function deriveEventType(equipmentStatus, isFanTimerOn, isStart) {
 async function getCurrentTemp(deviceId) {
   const pool = getPool();
   try {
-    const r = await pool.query(`SELECT current_temp_f FROM device_status WHERE device_id=$1`, [deviceId]);
+    const r = await pool.query(`SELECT current_temp_f FROM device_status WHERE device_key=$1`, [deviceId]);
     return r.rows.length ? r.rows[0].current_temp_f : null;
   } catch {
     return null;
@@ -262,7 +262,7 @@ async function getCurrentTemp(deviceId) {
 async function getUseForcedAirForHeat(deviceId) {
   const pool = getPool();
   try {
-    const r = await pool.query(`SELECT use_forced_air_for_heat FROM device_status WHERE device_id=$1`, [deviceId]);
+    const r = await pool.query(`SELECT use_forced_air_for_heat FROM device_status WHERE device_key=$1`, [deviceId]);
     if (!r.rows.length) return true;
     const v = r.rows[0]?.use_forced_air_for_heat;
     return (v === null || v === undefined) ? true : !!v;
