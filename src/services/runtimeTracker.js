@@ -21,7 +21,7 @@ async function handleDeviceEvent(eventData) {
   const pool = getPool();
 
   try {
-    const { resourceUpdate, userId, deviceName, deviceId } = eventData;
+    const { resourceUpdate, userId, deviceName, deviceKey } = eventData;
     const traits = resourceUpdate?.traits || {};
 
     const heatSetpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius ?? null;
@@ -36,7 +36,7 @@ async function handleDeviceEvent(eventData) {
       const r = await pool.query(
         `SELECT current_equipment_status, last_fan_status
          FROM device_status
-         WHERE device_id = $1`,
+         WHERE device_key = $1`,
         [deviceId]
       );
       if (r.rows.length) {
