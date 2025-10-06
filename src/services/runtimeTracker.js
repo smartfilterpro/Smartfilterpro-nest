@@ -173,12 +173,15 @@ async function startRuntimeSession(deviceKey, userId, deviceName, equipmentStatu
 
   postToBubbleAsync(payload);
 
-  // --- Core Ingest (normalized, required fields only)
+  // --- Core Ingest (normalized)
   postToCoreIngestAsync({
     device_id: deviceKey,
-    event_type: deriveEventType(equipmentStatus, isFanTimerOn, true), // start event
+    event_type: deriveEventType(equipmentStatus, isFanTimerOn, true),
     is_active: true,
-    current_temp: startTemp,
+    equipment_status: equipmentStatus,
+    temperature_f: startTemp,
+    temperature_c: startTemp ? ((startTemp - 32) * 5 / 9).toFixed(2) : null,
+    runtime_seconds: 0,
     timestamp: now.toISOString()
   });
 }
@@ -216,7 +219,10 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
     device_id: deviceKey,
     event_type: 'SESSION_END',
     is_active: false,
-    current_temp: null,
+    equipment_status: finalStatus,
+    temperature_f: null,
+    temperature_c: null,
+    runtime_seconds: runtimeSeconds,
     timestamp: now.toISOString()
   });
 }
@@ -255,9 +261,12 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
   // --- Core Ingest (normalized)
   postToCoreIngestAsync({
     device_id: deviceKey,
-    event_type: 'TEMP', // temperature-only update
+    event_type: 'TEMP',
     is_active: !!deviceState,
-    current_temp: tempF,
+    equipment_status: deviceState?.currentEquipmentStatus || 'OFF',
+    temperature_f: tempF,
+    temperature_c: tempC,
+    runtime_seconds: null,
     timestamp: new Date().toISOString()
   });
 }
