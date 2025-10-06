@@ -21,7 +21,7 @@ async function handleDeviceEvent(eventData) {
   const pool = getPool();
 
   try {
-    const { resourceUpdate, userId, deviceName, deviceKey } = eventData;
+    const { resourceUpdate, userId, deviceName, deviceId } = eventData;
     const traits = resourceUpdate?.traits || {};
 
     const heatSetpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius ?? null;
@@ -51,10 +51,10 @@ async function handleDeviceEvent(eventData) {
     // 🧠 Persist latest statuses
     await pool.query(
       `UPDATE device_status
-       SET current_equipment_status=$2,
-           last_fan_status=$3,
-           updated_at=NOW()
-       WHERE device_key=$1`,
+        SET current_equipment_status=$2,
+        last_fan_status=$3,
+        updated_at=NOW()
+        WHERE device_id=$1`,
       [deviceKey, equipmentStatus, isFanTimerOn ? 'ON' : 'OFF']
     );
 
@@ -252,7 +252,7 @@ function deriveEventType(equipmentStatus, isFanTimerOn, isStart) {
 async function getCurrentTemp(deviceKey) {
   const pool = getPool();
   try {
-    const r = await pool.query(`SELECT current_temp_f FROM device_status WHERE device_key=$1`, [deviceKey]);
+    const r = await pool.query(`SELECT current_temp_f FROM device_status WHERE device_id=$1`, [deviceKey]);
     return r.rows.length ? r.rows[0].current_temp_f : null;
   } catch {
     return null;
@@ -262,7 +262,7 @@ async function getCurrentTemp(deviceKey) {
 async function getUseForcedAirForHeat(deviceKey) {
   const pool = getPool();
   try {
-    const r = await pool.query(`SELECT use_forced_air_for_heat FROM device_status WHERE device_key=$1`, [deviceKey]);
+    const r = await pool.query(`SELECT use_forced_air_for_heat FROM device_status WHERE device_id=$1`, [deviceKey]);
     if (!r.rows.length) return true;
     const v = r.rows[0]?.use_forced_air_for_heat;
     return (v === null || v === undefined) ? true : !!v;
