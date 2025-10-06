@@ -1,91 +1,58 @@
 'use strict';
 
+/**
+ * SmartFilterPro – Nest Runtime Tracker
+ * -------------------------------------
+ * Tracks HVAC runtime sessions, posts updates to Bubble and Core Ingest.
+ * Includes DB fallbacks, fan-tail logic, and respects useForcedAirForHeat.
+ */
+
 const { v4: uuidv4 } = require('uuid');
 const { getPool } = require('../database/db');
 const { postToBubbleAsync } = require('./bubblePoster');
-const { postToCoreIngestAsync } = require('./ingestPoster'); // dual-post helper
+const { postToCoreIngestAsync } = require('./ingestPoster');
 
 // In-memory tracking of active devices
 const activeDevices = new Map();
 
-async function recoverActiveSessions() {
-  const pool = getPool();
-  try {
-    const result = await pool.query(`
-      SELECT 
-        ds.device_key,
-        ds.frontend_id,
-        ds.device_name,
-        ds.is_running,
-        ds.session_started_at,
-        ds.current_mode,
-        ds.current_equipment_status,
-        rs.session_id
-      FROM device_status ds
-      LEFT JOIN runtime_sessions rs ON ds.device_key = rs.device_key AND rs.ended_at IS NULL
-      WHERE ds.is_running = true
-    `);
-
-    for (const row of result.rows) {
-      const deviceState = {
-        deviceKey: row.device_key,
-        frontendId: row.frontend_id,
-        deviceName: row.device_name,
-        sessionId: row.session_id || uuidv4(),
-        sessionStartedAt: new Date(row.session_started_at),
-        currentMode: row.current_mode,
-        currentEquipmentStatus: row.current_equipment_status,
-        isHeating: row.current_equipment_status === 'HEATING',
-        isCooling: row.current_equipment_status === 'COOLING',
-        isFanOnly: row.current_equipment_status === 'FAN'
-      };
-      activeDevices.set(row.device_key, deviceState);
-    }
-
-    console.log(`Recovered ${activeDevices.size} active session(s)`);
-  } catch (error) {
-    console.error('Error recovering active sessions:', error);
-  }
-}
-
+/**
+ * Called when Nest webhook event arrives
+ */
 async function handleDeviceEvent(eventData) {
   const pool = getPool();
+
   try {
-    const deviceName = eventData.resourceUpdate?.name || eventData.eventId;
-    const deviceKey = extractDeviceKey(deviceName);
-    const userId = eventData.userId;
+    const { resourceUpdate, userId, deviceName, deviceKey } = eventData;
+    const traits = resourceUpdate?.traits || {};
+    const heatSetpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius || null;
+    const coolSetpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius || null;
 
-    if (!deviceKey) {
-      console.error('Could not extract device key from event');
-      return;
-    }
+    const thermostatMode = traits['sdm.devices.traits.ThermostatMode']?.mode ?? null;
+    let equipmentStatus = traits['sdm.devices.traits.ThermostatHvac']?.status ?? null;
+    let isFanTimerOn = traits['sdm.devices.traits.Fan']?.timerMode === 'ON' ? true : null;
 
-    await ensureDeviceExists(deviceKey, userId, deviceName);
-
-    const traits = eventData.resourceUpdate?.traits || {};
-
-    // Connectivity
-    if (traits['sdm.devices.traits.Connectivity']) {
-      const isReachable = traits['sdm.devices.traits.Connectivity'].status === 'ONLINE';
-      await updateDeviceReachability(deviceKey, isReachable);
-    }
-
-    // Temperature
-    if (traits['sdm.devices.traits.Temperature']) {
-      const tempC = traits['sdm.devices.traits.Temperature'].ambientTemperatureCelsius;
-      const tempF = celsiusToFahrenheit(tempC);
-      handleTemperatureChange(deviceKey, tempF, tempC, userId).catch(err =>
-        console.error('Error handling temperature change:', err)
+    // 🧠 Fallbacks for temperature-only events
+    if (equipmentStatus === null || isFanTimerOn === null) {
+      const r = await pool.query(
+        `SELECT current_equipment_status, last_fan_status FROM device_status WHERE device_key=$1`,
+        [deviceKey]
       );
+      if (r.rows.length) {
+        if (equipmentStatus === null) equipmentStatus = r.rows[0].current_equipment_status || 'OFF';
+        if (isFanTimerOn === null) isFanTimerOn = r.rows[0].last_fan_status === 'ON';
+      } else {
+        equipmentStatus = equipmentStatus ?? 'OFF';
+        isFanTimerOn = isFanTimerOn ?? false;
+      }
     }
 
-    const thermostatMode = traits['sdm.devices.traits.ThermostatMode']?.mode || null;
-    const equipmentStatus = traits['sdm.devices.traits.ThermostatHvac']?.status || 'OFF';
-    const isFanTimerOn = traits['sdm.devices.traits.Fan']?.timerMode === 'ON' || false;
-
-    const setpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint'] || {};
-    const heatSetpoint = setpoint.heatCelsius ? celsiusToFahrenheit(setpoint.heatCelsius) : null;
-    const coolSetpoint = setpoint.coolCelsius ? celsiusToFahrenheit(setpoint.coolCelsius) : null;
+    // 🧩 Persist latest statuses for next fallback
+    await pool.query(
+      `UPDATE device_status
+       SET current_equipment_status=$2, last_fan_status=$3, updated_at=NOW()
+       WHERE device_key=$1`,
+      [deviceKey, equipmentStatus, isFanTimerOn ? 'ON' : 'OFF']
+    );
 
     await processRuntimeLogic(
       deviceKey,
@@ -97,11 +64,14 @@ async function handleDeviceEvent(eventData) {
       heatSetpoint,
       coolSetpoint
     );
-  } catch (error) {
-    console.error('Error handling device event:', error);
+  } catch (err) {
+    console.error('[runtimeTracker] handleDeviceEvent error:', err);
   }
 }
 
+/**
+ * Core runtime logic determining state transitions
+ */
 async function processRuntimeLogic(
   deviceKey,
   userId,
@@ -112,109 +82,125 @@ async function processRuntimeLogic(
   heatSetpoint,
   coolSetpoint
 ) {
-  const isHeating = equipmentStatus === 'HEATING';
+  const useForcedAirForHeat = await getUseForcedAirForHeat(deviceKey);
+
+  const isHeating = equipmentStatus === 'HEATING' && useForcedAirForHeat;
   const isCooling = equipmentStatus === 'COOLING';
   const shouldBeActive = isHeating || isCooling || isFanTimerOn;
+
   const currentState = activeDevices.get(deviceKey);
-  const wasActive = !!currentState;
 
-  if (shouldBeActive && !wasActive) {
-    await startRuntimeSession(deviceKey, userId, deviceName, equipmentStatus, isFanTimerOn, thermostatMode, heatSetpoint, coolSetpoint);
-  } else if (!shouldBeActive && wasActive) {
-    await endRuntimeSession(deviceKey, userId, deviceName, equipmentStatus);
-  } else if (shouldBeActive && wasActive) {
-    await updateRuntimeSession(deviceKey, equipmentStatus, isFanTimerOn, heatSetpoint, coolSetpoint);
+  if (!currentState && shouldBeActive) {
+    await startRuntimeSession(
+      deviceKey,
+      userId,
+      deviceName,
+      equipmentStatus,
+      isFanTimerOn,
+      thermostatMode,
+      heatSetpoint,
+      coolSetpoint
+    );
+  } else if (currentState && !shouldBeActive) {
+    await stopRuntimeSession(deviceKey, userId, deviceName, equipmentStatus);
+  } else if (currentState && shouldBeActive) {
+    // Continue active session: temperature change / periodic update
+    await handleTemperatureChange(deviceKey, null, null, userId);
   }
-
-  await logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, currentState);
 }
 
+/**
+ * Start of runtime session
+ */
 async function startRuntimeSession(deviceKey, userId, deviceName, equipmentStatus, isFanTimerOn, thermostatMode, heatSetpoint, coolSetpoint) {
-  const pool = getPool();
   const now = new Date();
+  const startTemp = await getCurrentTemp(deviceKey);
   const sessionId = uuidv4();
 
-  const mode = equipmentStatus === 'HEATING' ? 'heating'
-              : equipmentStatus === 'COOLING' ? 'cooling'
-              : isFanTimerOn ? 'fan_only'
-              : 'off';
-
-  const startTempResult = await pool.query('SELECT last_temperature FROM device_status WHERE device_key = $1', [deviceKey]);
-  const startTemp = startTempResult.rows[0]?.last_temperature || null;
-
-  await pool.query(`
-    INSERT INTO runtime_sessions (device_key, session_id, mode, equipment_status, started_at, start_temperature, heat_setpoint, cool_setpoint)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-  `, [deviceKey, sessionId, mode, equipmentStatus, now, startTemp, heatSetpoint, coolSetpoint]);
-
-  activeDevices.set(deviceKey, {
+  const state = {
     sessionId,
-    sessionStartedAt: now,
-    currentMode: mode,
-    currentEquipmentStatus: equipmentStatus,
-    isHeating: equipmentStatus === 'HEATING',
+    startedAt: now,
     isCooling: equipmentStatus === 'COOLING',
-    isFanOnly: isFanTimerOn
-  });
+    isHeating: equipmentStatus === 'HEATING',
+    isFanOnly: isFanTimerOn,
+    currentEquipmentStatus: equipmentStatus,
+  };
+
+  activeDevices.set(deviceKey, state);
 
   const payload = {
     userId,
     thermostatId: deviceKey,
-    deviceName,
     runtimeSeconds: 0,
-    isRuntimeEvent: false,
-    hvacMode: mode,
-    isHvacActive: true,
-    thermostatMode: mode.toUpperCase(),
-    currentTempF: startTemp,
-    timestamp: now.toISOString(),
-    eventId: uuidv4()
+    currentTemperature: startTemp,
+    isActive: true,
+    deviceName,
+    mode: thermostatMode,
   };
 
-  postToBubbleAsync(payload);
+  // 🔁 Bubble payload (restored last* fields)
+  postToBubbleAsync({
+    ...payload,
+    lastIsCooling: false,
+    lastIsHeating: false,
+    lastIsFanOnly: false,
+    lastEquipmentStatus: 'off',
+    equipmentStatus: (equipmentStatus || 'OFF').toLowerCase(),
+    isFanOnly: isFanTimerOn,
+  });
 
-  // --- Core Ingest (normalized)
+  // 🌐 Core payload
   postToCoreIngestAsync({
     device_id: deviceKey,
     event_type: deriveEventType(equipmentStatus, isFanTimerOn, true),
     is_active: true,
     equipment_status: equipmentStatus,
     temperature_f: startTemp,
-    temperature_c: startTemp ? ((startTemp - 32) * 5 / 9).toFixed(2) : null,
+    temperature_c: startTemp != null ? ((startTemp - 32) * 5 / 9).toFixed(2) : null,
     runtime_seconds: 0,
-    timestamp: now.toISOString()
+    timestamp: now.toISOString(),
+    current_temp: startTemp,
   });
+
+  console.log(`[runtimeTracker] Session started for ${deviceName} (${deviceKey})`);
 }
 
-async function endRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
-  const pool = getPool();
+/**
+ * Stop of runtime session
+ */
+async function stopRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
+  const state = activeDevices.get(deviceKey);
+  if (!state) return;
+
   const now = new Date();
-  const deviceState = activeDevices.get(deviceKey);
-  if (!deviceState) return;
+  const runtimeSeconds = Math.floor((now - new Date(state.startedAt)) / 1000);
 
-  const runtimeSeconds = Math.floor((now - deviceState.sessionStartedAt) / 1000);
   activeDevices.delete(deviceKey);
-
-  await pool.query(`
-    UPDATE runtime_sessions SET ended_at=$2,duration_seconds=$3 WHERE session_id=$1
-  `, [deviceState.sessionId, now, runtimeSeconds]);
 
   const payload = {
     userId,
     thermostatId: deviceKey,
-    deviceName,
     runtimeSeconds,
-    isRuntimeEvent: true,
-    hvacMode: deviceState.currentMode,
-    isHvacActive: false,
-    thermostatMode: deviceState.currentMode?.toUpperCase() || 'OFF',
-    timestamp: now.toISOString(),
-    eventId: uuidv4()
+    currentTemperature: null,
+    isActive: false,
+    deviceName,
   };
 
-  postToBubbleAsync(payload);
+  // Restore last* flags for Bubble UI
+  const lastWasCooling = !!state.isCooling;
+  const lastWasHeating = !!state.isHeating;
+  const lastWasFanOnly = !!state.isFanOnly && !state.isHeating && !state.isCooling;
 
-  // --- Core Ingest (normalized)
+  postToBubbleAsync({
+    ...payload,
+    lastIsCooling: lastWasCooling,
+    lastIsHeating: lastWasHeating,
+    lastIsFanOnly: lastWasFanOnly,
+    lastEquipmentStatus: (state.currentEquipmentStatus || 'OFF').toLowerCase(),
+    equipmentStatus: (finalStatus || 'OFF').toLowerCase(),
+    isFanOnly: false,
+  });
+
   postToCoreIngestAsync({
     device_id: deviceKey,
     event_type: 'SESSION_END',
@@ -223,94 +209,60 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
     temperature_f: null,
     temperature_c: null,
     runtime_seconds: runtimeSeconds,
-    timestamp: now.toISOString()
+    timestamp: now.toISOString(),
+    current_temp: null,
   });
+
+  console.log(`[runtimeTracker] Session ended for ${deviceName} (${deviceKey}) runtime=${runtimeSeconds}s`);
 }
 
-async function updateRuntimeSession(deviceKey, equipmentStatus, isFanTimerOn, heatSetpoint, coolSetpoint) {
-  const pool = getPool();
-  const now = new Date();
-  const deviceState = activeDevices.get(deviceKey);
-  if (!deviceState) return;
-
-  await pool.query(`
-    UPDATE runtime_sessions SET tick_count=tick_count+1,last_tick_at=$2,updated_at=$2 WHERE session_id=$1
-  `, [deviceState.sessionId, now]);
-}
-
+/**
+ * Temperature update (while idle or active)
+ */
 async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
-  const pool = getPool();
-  await pool.query(`
-    UPDATE device_status SET last_temperature=$2,last_seen_at=NOW(),updated_at=NOW() WHERE device_key=$1
-  `, [deviceKey, tempF]);
-
   const deviceState = activeDevices.get(deviceKey);
+  const pool = getPool();
+
+  // if no explicit temp provided, try DB
+  const temp = tempF ?? (await getCurrentTemp(deviceKey));
+  const tempCelsius = tempC ?? (temp != null ? ((temp - 32) * 5) / 9 : null);
+
   const payload = {
     userId,
     thermostatId: deviceKey,
-    runtimeSeconds: 0,
-    isRuntimeEvent: false,
-    isHvacActive: !!deviceState,
-    currentTempF: tempF,
-    timestamp: new Date().toISOString(),
-    eventId: uuidv4()
+    runtimeSeconds: null,
+    currentTemperature: temp,
+    isActive: !!deviceState,
   };
 
-  postToBubbleAsync(payload);
+  // Bubble
+  postToBubbleAsync({
+    ...payload,
+    equipmentStatus: (deviceState?.currentEquipmentStatus || 'OFF').toLowerCase(),
+    lastIsCooling: false,
+    lastIsHeating: false,
+    lastIsFanOnly: false,
+    lastEquipmentStatus: (deviceState?.currentEquipmentStatus || 'OFF').toLowerCase(),
+    currentTempC: tempCelsius,
+  });
 
-  // --- Core Ingest (normalized)
+  // Core
   postToCoreIngestAsync({
     device_id: deviceKey,
     event_type: 'TEMP',
     is_active: !!deviceState,
     equipment_status: deviceState?.currentEquipmentStatus || 'OFF',
-    temperature_f: tempF,
-    temperature_c: tempC,
+    temperature_f: temp,
+    temperature_c: tempCelsius,
     runtime_seconds: null,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    current_temp: temp,
   });
 }
 
-async function ensureDeviceExists(deviceKey, userId, deviceName) {
-  const pool = getPool();
-  await pool.query(`
-    INSERT INTO device_status (device_key, frontend_id, device_name, created_at, updated_at)
-    VALUES ($1,$2,$3,NOW(),NOW())
-    ON CONFLICT (device_key) DO UPDATE
-      SET frontend_id=EXCLUDED.frontend_id,device_name=EXCLUDED.device_name,updated_at=NOW()
-  `, [deviceKey, userId, deviceName]);
-}
-
-async function updateDeviceReachability(deviceKey, isReachable) {
-  const pool = getPool();
-  await pool.query(`UPDATE device_status SET is_reachable=$2,updated_at=NOW() WHERE device_key=$1`, [deviceKey, isReachable]);
-}
-
-async function logEquipmentEvent(deviceKey, equipmentStatus, isFanTimerOn, previousState) {
-  const pool = getPool();
-  await pool.query(`
-    INSERT INTO equipment_events (device_key, event_type, equipment_status, previous_status, is_active, session_id, event_data)
-    VALUES ($1,$2,$3,$4,$5,$6,$7)
-  `, [
-    deviceKey,
-    'status_change',
-    equipmentStatus,
-    previousState?.currentEquipmentStatus || 'unknown',
-    !!previousState,
-    previousState?.sessionId || null,
-    JSON.stringify({ isFanTimerOn })
-  ]);
-}
-
-function extractDeviceKey(deviceName) {
-  const parts = deviceName.split('/');
-  return parts[parts.length - 1];
-}
-
-function celsiusToFahrenheit(celsius) {
-  return Math.round((celsius * 9 / 5 + 32) * 100) / 100;
-}
-
+/**
+ * Derives a concise event type label
+ */
 function deriveEventType(equipmentStatus, isFanTimerOn, isStart) {
   if (equipmentStatus === 'HEATING') return isStart ? 'HEAT_ON' : 'HEAT';
   if (equipmentStatus === 'COOLING') return isStart ? 'COOL_ON' : 'COOL';
@@ -318,8 +270,68 @@ function deriveEventType(equipmentStatus, isFanTimerOn, isStart) {
   return 'IDLE';
 }
 
+/**
+ * Fetch latest temperature (°F) from DB
+ */
+async function getCurrentTemp(deviceKey) {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT current_temp_f FROM device_status WHERE device_key=$1`,
+      [deviceKey]
+    );
+    return r.rows.length ? r.rows[0].current_temp_f : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pulls the Bubble-configured preference for forced-air heating
+ */
+async function getUseForcedAirForHeat(deviceKey) {
+  const pool = getPool();
+  try {
+    const r = await pool.query(
+      `SELECT use_forced_air_for_heat FROM device_status WHERE device_key=$1`,
+      [deviceKey]
+    );
+    if (!r.rows.length) return true;
+    const v = r.rows[0]?.use_forced_air_for_heat;
+    return (v === null || v === undefined) ? true : !!v;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Recovers sessions from DB after restart (optional, if you persist state)
+ */
+async function recoverActiveSessions() {
+  const pool = getPool();
+  try {
+    const result = await pool.query(`
+      SELECT device_key, device_name, is_running, started_at
+      FROM device_status
+      WHERE is_running = TRUE
+    `);
+    result.rows.forEach((r) => {
+      activeDevices.set(r.device_key, {
+        sessionId: uuidv4(),
+        startedAt: r.started_at,
+        isCooling: false,
+        isHeating: false,
+        isFanOnly: false,
+        currentEquipmentStatus: 'OFF',
+      });
+    });
+    console.log(`[runtimeTracker] Recovered ${result.rows.length} active sessions`);
+  } catch (err) {
+    console.error('[runtimeTracker] recoverActiveSessions error:', err);
+  }
+}
+
 module.exports = {
   handleDeviceEvent,
   recoverActiveSessions,
-  activeDevices
 };
