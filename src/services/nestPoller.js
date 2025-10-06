@@ -77,7 +77,7 @@ async function pollStaleDevices() {
     const staleDevicesResult = await pool.query(
       `
       SELECT 
-        ds.device_id,
+        ds.device_key,
         ds.device_name,
         ds.frontend_id AS user_id,
         ds.last_seen_at,
@@ -110,7 +110,7 @@ async function pollStaleDevices() {
         minutesStale > 0
           ? `${minutesStale.toFixed(1)} min ago`
           : 'never updated';
-      console.log(`  - ${device.device_id}: ${staleMsg}`);
+      console.log(`  - ${device.device_key}: ${staleMsg}`);
     }
 
     // Group by user to minimize API calls
@@ -123,7 +123,7 @@ async function pollStaleDevices() {
     console.log(`Polling ${Object.keys(devicesByUser).length} user(s)`);
 
     for (const [userId, devices] of Object.entries(devicesByUser)) {
-      await pollUserDevices(userId, devices.map((d) => d.device_id));
+      await pollUserDevices(userId, devices.map((d) => d.device_key));
     }
 
     console.log('=== STALE DEVICE CHECK COMPLETE ===\n');
