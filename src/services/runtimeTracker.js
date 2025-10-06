@@ -86,10 +86,9 @@ async function processRuntimeLogic(
   heatSetpoint,
   coolSetpoint
 ) {
-  const pool = getPool();
   const state = activeDevices.get(deviceKey);
-
   const useForcedAirForHeat = await getUseForcedAirForHeat(deviceKey);
+
   const isHeating = equipmentStatus === 'HEATING';
   const isCooling = equipmentStatus === 'COOLING';
   const isFan = isFanTimerOn === true;
@@ -145,13 +144,12 @@ async function startRuntimeSession(deviceKey, userId, deviceName, equipmentStatu
     current_temp: currentTemp,
   };
 
-  // 💧 Bubble payload
+  // 💧 Bubble payload (original schema)
   const bubblePayload = {
-    userId,
-    thermostatId: deviceKey,
-    runtimeSeconds,
-    currentTemperature: currentTemp,
-    isActive,
+    isHvacActive: equipmentStatus !== 'OFF',
+    hvacMode: equipmentStatus ?? 'OFF',
+    runtimeMinutes: runtimeSeconds ? Math.round(runtimeSeconds / 60) : 0,
+    isRuntimeEvent: isActive ?? false,
   };
 
   console.log('📤 CORE POST:', JSON.stringify(corePayload, null, 2));
@@ -191,11 +189,10 @@ async function stopRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
   };
 
   const bubblePayload = {
-    userId,
-    thermostatId: deviceKey,
-    runtimeSeconds,
-    currentTemperature: currentTemp,
-    isActive,
+    isHvacActive: false,
+    hvacMode: finalStatus ?? 'OFF',
+    runtimeMinutes: Math.round(runtimeSeconds / 60),
+    isRuntimeEvent: true,
   };
 
   console.log('📤 CORE POST:', JSON.stringify(corePayload, null, 2));
@@ -211,17 +208,16 @@ async function stopRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
  * Handle temp-only updates (no state change)
  */
 async function handleTemperatureChange(deviceKey, userId) {
-  const pool = getPool();
   const tempF = await getCurrentTemp(deviceKey);
   const tempC = tempF != null ? ((tempF - 32) * 5) / 9 : null;
-
   const isActive = !!activeDevices.get(deviceKey);
+  const equipmentStatus = activeDevices.get(deviceKey)?.currentEquipmentStatus || 'OFF';
 
   const corePayload = {
     device_id: deviceKey,
     event_type: 'TEMP',
     is_active: isActive,
-    equipment_status: activeDevices.get(deviceKey)?.currentEquipmentStatus || 'OFF',
+    equipment_status: equipmentStatus,
     temperature_f: tempF,
     temperature_c: tempC,
     runtime_seconds: null,
@@ -230,11 +226,10 @@ async function handleTemperatureChange(deviceKey, userId) {
   };
 
   const bubblePayload = {
-    userId,
-    thermostatId: deviceKey,
-    runtimeSeconds: null,
-    currentTemperature: tempF,
-    isActive,
+    isHvacActive: equipmentStatus !== 'OFF',
+    hvacMode: equipmentStatus,
+    runtimeMinutes: null,
+    isRuntimeEvent: false,
   };
 
   console.log('📤 CORE POST:', JSON.stringify(corePayload, null, 2));
