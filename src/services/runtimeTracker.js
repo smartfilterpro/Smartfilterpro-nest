@@ -3,7 +3,7 @@
 const { v4: uuidv4 } = require('uuid');
 const { getPool } = require('../database/db');
 const { postToBubbleAsync } = require('./bubblePoster');
-const { postToCoreIngestAsync } = require('./ingestPoster'); // 🆕 dual-post helper
+const { postToCoreIngestAsync } = require('./ingestPoster'); // dual-post helper
 
 // In-memory tracking of active devices
 const activeDevices = new Map();
@@ -26,7 +26,6 @@ async function recoverActiveSessions() {
       WHERE ds.is_running = true
     `);
 
-    const now = new Date();
     for (const row of result.rows) {
       const deviceState = {
         deviceKey: row.device_key,
@@ -153,8 +152,8 @@ async function startRuntimeSession(deviceKey, userId, deviceName, equipmentStatu
     sessionStartedAt: now,
     currentMode: mode,
     currentEquipmentStatus: equipmentStatus,
-    isHeating,
-    isCooling,
+    isHeating: equipmentStatus === 'HEATING',
+    isCooling: equipmentStatus === 'COOLING',
     isFanOnly: isFanTimerOn
   });
 
@@ -174,21 +173,13 @@ async function startRuntimeSession(deviceKey, userId, deviceName, equipmentStatu
 
   postToBubbleAsync(payload);
 
-  // 🆕 Dual-post to Core Ingest
+  // --- Core Ingest (normalized, required fields only)
   postToCoreIngestAsync({
-    source: 'nest',
-    workspace_id: userId,
     device_id: deviceKey,
-    device_name: deviceName,
-    zip_code_prefix: null, // to be filled per thermostat later
+    event_type: deriveEventType(equipmentStatus, isFanTimerOn, true), // start event
     is_active: true,
-    is_cooling: equipmentStatus === 'COOLING',
-    is_heating: equipmentStatus === 'HEATING',
-    is_fan_running: !!isFanTimerOn,
-    current_temperature: startTemp,
-    target_temperature: heatSetpoint || coolSetpoint || null,
-    timestamp: now.toISOString(),
-    metadata: { model: 'Nest Thermostat', manufacturer: 'Google', vendor_account_id: userId }
+    current_temp: startTemp,
+    timestamp: now.toISOString()
   });
 }
 
@@ -220,21 +211,13 @@ async function endRuntimeSession(deviceKey, userId, deviceName, finalStatus) {
 
   postToBubbleAsync(payload);
 
-  // 🆕 Dual-post to Core Ingest
+  // --- Core Ingest (normalized)
   postToCoreIngestAsync({
-    source: 'nest',
-    workspace_id: userId,
     device_id: deviceKey,
-    device_name: deviceName,
-    zip_code_prefix: null,
+    event_type: 'SESSION_END',
     is_active: false,
-    is_cooling: deviceState.isCooling,
-    is_heating: deviceState.isHeating,
-    is_fan_running: false,
-    current_temperature: null,
-    target_temperature: null,
-    timestamp: now.toISOString(),
-    metadata: { model: 'Nest Thermostat', manufacturer: 'Google', vendor_account_id: userId }
+    current_temp: null,
+    timestamp: now.toISOString()
   });
 }
 
@@ -269,21 +252,13 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
 
   postToBubbleAsync(payload);
 
-  // 🆕 Dual-post to Core Ingest
+  // --- Core Ingest (normalized)
   postToCoreIngestAsync({
-    source: 'nest',
-    workspace_id: userId,
     device_id: deviceKey,
-    device_name: deviceState?.deviceName || null,
-    zip_code_prefix: null,
+    event_type: 'TEMP', // temperature-only update
     is_active: !!deviceState,
-    is_cooling: deviceState?.isCooling || false,
-    is_heating: deviceState?.isHeating || false,
-    is_fan_running: deviceState?.isFanOnly || false,
-    current_temperature: tempF,
-    target_temperature: null,
-    timestamp: new Date().toISOString(),
-    metadata: { model: 'Nest Thermostat', manufacturer: 'Google', vendor_account_id: userId }
+    current_temp: tempF,
+    timestamp: new Date().toISOString()
   });
 }
 
@@ -325,6 +300,13 @@ function extractDeviceKey(deviceName) {
 
 function celsiusToFahrenheit(celsius) {
   return Math.round((celsius * 9 / 5 + 32) * 100) / 100;
+}
+
+function deriveEventType(equipmentStatus, isFanTimerOn, isStart) {
+  if (equipmentStatus === 'HEATING') return isStart ? 'HEAT_ON' : 'HEAT';
+  if (equipmentStatus === 'COOLING') return isStart ? 'COOL_ON' : 'COOL';
+  if (isFanTimerOn) return isStart ? 'FAN_ON' : 'FAN';
+  return 'IDLE';
 }
 
 module.exports = {
