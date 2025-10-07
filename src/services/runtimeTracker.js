@@ -8,6 +8,9 @@ const { postToCoreIngestAsync } = require('./ingestPoster');
 // In-memory tracking of active devices
 const activeDevices = new Map();
 
+/**
+ * Rehydrate sessions marked as active from DB on startup
+ */
 async function recoverActiveSessions() {
   const pool = getPool();
   try {
@@ -29,7 +32,7 @@ async function recoverActiveSessions() {
         startTime: new Date(row.session_start_at),
       });
     }
-    console.log(`[runtimeTracker] Recovered ${activeDevices.size} active sessions.`);
+    console.log(`[runtimeTracker] Recovered ${activeDevices.size} active sessions from DB.`);
   } catch (err) {
     console.error('[runtimeTracker] Error recovering sessions:', err.message);
   }
@@ -40,7 +43,19 @@ async function recoverActiveSessions() {
  */
 async function handleNormalizedUpdate(event) {
   try {
-    const { deviceKey, hvacStatus, fanTimerMode, currentTempC, humidityPercent, isTelemetryOnly } = event;
+    const {
+      deviceKey,
+      hvacStatus,
+      fanTimerMode,
+      currentTempC,
+      humidityPercent,
+      isTelemetryOnly,
+      deviceName,
+      userId,
+      source = 'nest',
+      eventId,
+      observedAt
+    } = event;
 
     // ✅ Skip telemetry-only updates
     if (isTelemetryOnly) {
@@ -48,17 +63,23 @@ async function handleNormalizedUpdate(event) {
       return;
     }
 
-    const isActive = hvacStatus === 'HEATING' || hvacStatus === 'COOLING' || fanTimerMode === 'ON';
-    const now = new Date(event.observedAt || Date.now());
+    const isActive =
+      hvacStatus === 'HEATING' || hvacStatus === 'COOLING' || fanTimerMode === 'ON';
 
-    // Determine state transitions
+    const now = new Date(observedAt || Date.now());
     const prevSession = activeDevices.get(deviceKey);
     let runtimeSeconds = null;
     let eventType = null;
     let previousStatus = prevSession?.lastStatus || 'UNKNOWN';
 
+    // 🆕 Stable source_event_id for deduplication
+    const sourceEventId =
+      eventId ||
+      `${deviceKey}-${hvacStatus}-${now.toISOString().slice(0, 19)}`;
+
+    // 🧭 Determine transitions
     if (isActive && !prevSession) {
-      // 🟢 Start of a new runtime session
+      // 🟢 Start of new runtime session
       activeDevices.set(deviceKey, {
         startTime: now,
         lastStatus: hvacStatus,
@@ -71,20 +92,23 @@ async function handleNormalizedUpdate(event) {
       runtimeSeconds = Math.round(durationMs / 1000);
       activeDevices.delete(deviceKey);
       eventType = 'STATUS_CHANGE';
-      console.log(`[runtimeTracker] Session ended for ${deviceKey}. Runtime: ${runtimeSeconds}s`);
+      console.log(
+        `[runtimeTracker] Session ended for ${deviceKey}. Runtime: ${runtimeSeconds}s`
+      );
     } else {
-      // 🟡 Ongoing or steady state
+      // 🟡 Steady state (no transition)
       eventType = 'STATUS_CHANGE';
     }
 
+    // 🧩 Build payload for Core + Bubble
     const payload = {
       device_key: deviceKey,
       device_id: `nest:${deviceKey}`,
-      workspace_id: event.userId || 'unknown',
-      device_name: event.deviceName || 'Nest Thermostat',
+      workspace_id: userId || 'unknown',
+      device_name: deviceName || 'Nest Thermostat',
       manufacturer: 'Google Nest',
       model: 'Nest Thermostat',
-      source: 'nest',
+      source,
       connection_source: 'nest',
       event_type: eventType,
       is_active: isActive,
@@ -94,18 +118,22 @@ async function handleNormalizedUpdate(event) {
       humidity: humidityPercent,
       runtime_seconds: runtimeSeconds,
       timestamp: now.toISOString(),
-      source_event_id: event.eventId,
-      payload_raw: event,
+      source_event_id: sourceEventId,
+      payload_raw: event
     };
 
-    // Post to Core and Bubble
-    await Promise.all([
+    console.log(
+      `[runtimeTracker] → Forwarding to Core: ${payload.device_id} | ${payload.event_type} | ${payload.equipment_status} | active=${payload.is_active} | runtime=${payload.runtime_seconds ?? '—'}`
+    );
+
+    // ✅ Dual-post to Core and Bubble
+    await Promise.allSettled([
       postToCoreIngestAsync(payload),
       postToBubbleAsync(payload)
     ]);
 
   } catch (err) {
-    console.error('[runtimeTracker] Error handling normalized update:', err.message);
+    console.error('[runtimeTracker] ❌ Error handling normalized update:', err.message);
   }
 }
 
