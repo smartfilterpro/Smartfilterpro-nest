@@ -1,9 +1,8 @@
 'use strict';
 
 const express = require('express');
-const { handleNormalizedUpdate } = require('../services/runtimeTracker');
-
 const router = express.Router();
+const { handleNormalizedUpdate } = require('../services/runtimeTracker');
 
 // Per-device processing locks to prevent race conditions
 const processingLocks = new Map();
@@ -35,10 +34,16 @@ function normalizeNestEvent(eventData) {
   const temp = traits['sdm.devices.traits.Temperature'] || {};
   const humidity = traits['sdm.devices.traits.Humidity'] || {};
 
-  const hvacStatus = hvac?.status?.toUpperCase?.() || 'OFF';
-  const fanTimerMode = fan?.timerMode?.toUpperCase?.() || 'OFF';
+  const hvacStatusRaw = hvac?.status;
+  const fanTimerModeRaw = fan?.timerMode;
   const currentTempC = typeof temp?.ambientTemperatureCelsius === 'number' ? temp.ambientTemperatureCelsius : null;
   const humidityPercent = typeof humidity?.ambientHumidityPercent === 'number' ? humidity.ambientHumidityPercent : null;
+
+  // ➕ Detect telemetry-only updates (temperature/humidity but no HVAC/fan)
+  const isTelemetryOnly = !hvacStatusRaw && !fanTimerModeRaw && currentTempC !== null;
+
+  const hvacStatus = hvacStatusRaw?.toUpperCase?.() || (isTelemetryOnly ? 'UNCHANGED' : 'OFF');
+  const fanTimerMode = fanTimerModeRaw?.toUpperCase?.() || (isTelemetryOnly ? 'UNCHANGED' : 'OFF');
 
   return {
     eventId: eventData.eventId,
@@ -50,6 +55,7 @@ function normalizeNestEvent(eventData) {
     fanTimerMode,
     currentTempC,
     humidityPercent,
+    isTelemetryOnly,
     source: 'nest',
   };
 }
@@ -68,7 +74,7 @@ router.post('/', async (req, res) => {
     res.status(200).json({ status: 'received' });
     res.end();
 
-    // Process event asynchronously (non-blocking)
+    // Process event asynchronously
     process.nextTick(async () => {
       let eventData = req.body;
       let deviceKey = null;
@@ -110,8 +116,6 @@ router.post('/', async (req, res) => {
         })();
 
         processingLocks.set(deviceKey, processingPromise);
-
-        // ✅ Wait for processing to complete
         await processingPromise;
 
         // ✅ Release the lock
@@ -120,7 +124,6 @@ router.post('/', async (req, res) => {
       } catch (error) {
         console.error('❌ Error processing webhook event:', error);
 
-        // 🧹 Cleanup lock if an error occurred
         if (deviceKey && processingLocks.has(deviceKey)) {
           processingLocks.delete(deviceKey);
           console.log(`🔓 Lock released due to error for device: ${deviceKey}`);
