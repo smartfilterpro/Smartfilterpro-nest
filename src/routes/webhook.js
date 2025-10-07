@@ -1,7 +1,8 @@
 'use strict';
 
 const express = require('express');
-const { handleDeviceEvent } = require('../services/runtimeTracker');
+const { handleNormalizedUpdate } = require('../services/runtimeTracker');
+
 
 const router = express.Router();
 
