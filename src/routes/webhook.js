@@ -3,7 +3,6 @@
 const express = require('express');
 const { handleNormalizedUpdate } = require('../services/runtimeTracker');
 
-
 const router = express.Router();
 
 // Per-device processing locks to prevent race conditions
@@ -24,6 +23,35 @@ function extractDeviceKey(eventData) {
  */
 function extractDeviceName(eventData) {
   return eventData?.resourceUpdate?.name || 'Unknown Device';
+}
+
+/**
+ * Normalize Google SDM event payload into standard runtimeTracker format
+ */
+function normalizeNestEvent(eventData) {
+  const traits = eventData?.resourceUpdate?.traits || {};
+  const hvac = traits['sdm.devices.traits.ThermostatHvac'];
+  const fan = traits['sdm.devices.traits.Fan'];
+  const temp = traits['sdm.devices.traits.Temperature'] || {};
+  const humidity = traits['sdm.devices.traits.Humidity'] || {};
+
+  const hvacStatus = hvac?.status?.toUpperCase?.() || 'OFF';
+  const fanTimerMode = fan?.timerMode?.toUpperCase?.() || 'OFF';
+  const currentTempC = typeof temp?.ambientTemperatureCelsius === 'number' ? temp.ambientTemperatureCelsius : null;
+  const humidityPercent = typeof humidity?.ambientHumidityPercent === 'number' ? humidity.ambientHumidityPercent : null;
+
+  return {
+    eventId: eventData.eventId,
+    observedAt: eventData.timestamp || new Date().toISOString(),
+    deviceKey: extractDeviceKey(eventData),
+    deviceName: extractDeviceName(eventData),
+    userId: eventData.userId || null,
+    hvacStatus,
+    fanTimerMode,
+    currentTempC,
+    humidityPercent,
+    source: 'nest',
+  };
 }
 
 /**
@@ -55,19 +83,12 @@ router.post('/', async (req, res) => {
           console.log('📋 Parsed event:', JSON.stringify(eventData, null, 2));
         }
 
-        console.log('========================================\n');
-
-        // ✅ Extract device info
         deviceKey = extractDeviceKey(eventData);
         const deviceName = extractDeviceName(eventData);
 
         if (!deviceKey) {
           console.error('⚠️ Cannot extract device key from event — processing without lock');
-          await handleDeviceEvent({
-            ...eventData,
-            deviceKey: null,
-            deviceName,
-          });
+          await handleNormalizedUpdate(normalizeNestEvent(eventData));
           return;
         }
 
@@ -80,11 +101,8 @@ router.post('/', async (req, res) => {
         // ✅ Create a new lock for this device
         const processingPromise = (async () => {
           try {
-            await handleDeviceEvent({
-              ...eventData,
-              deviceKey,
-              deviceName,
-            });
+            const normalizedEvent = normalizeNestEvent(eventData);
+            await handleNormalizedUpdate(normalizedEvent);
           } catch (error) {
             console.error(`❌ Error processing event for device ${deviceKey}:`, error);
             throw error;
