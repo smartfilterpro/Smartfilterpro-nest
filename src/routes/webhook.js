@@ -1,14 +1,14 @@
 'use strict';
 
 const express = require('express');
+const { handleDeviceEvent } = require('../services/runtimeTracker'); // ✅ updated import
 const router = express.Router();
-const { handleNormalizedUpdate } = require('../services/runtimeTracker');
 
-// Per-device processing locks to prevent race conditions
+// Per-device locks to prevent race conditions
 const processingLocks = new Map();
 
 /**
- * Extracts a unique device key from event data
+ * Extract a unique device key from event data
  */
 function extractDeviceKey(eventData) {
   const deviceName = eventData?.resourceUpdate?.name || eventData?.eventId || null;
@@ -18,128 +18,93 @@ function extractDeviceKey(eventData) {
 }
 
 /**
- * Extracts a human-readable device name
+ * Extract human-readable device name
  */
 function extractDeviceName(eventData) {
   return eventData?.resourceUpdate?.name || 'Unknown Device';
 }
 
 /**
- * Normalize Google SDM event payload into standard runtimeTracker format
- */
-function normalizeNestEvent(eventData) {
-  const traits = eventData?.resourceUpdate?.traits || {};
-  const hvac = traits['sdm.devices.traits.ThermostatHvac'];
-  const fan = traits['sdm.devices.traits.Fan'];
-  const temp = traits['sdm.devices.traits.Temperature'] || {};
-  const humidity = traits['sdm.devices.traits.Humidity'] || {};
-
-  const hvacStatusRaw = hvac?.status;
-  const fanTimerModeRaw = fan?.timerMode;
-  const currentTempC = typeof temp?.ambientTemperatureCelsius === 'number' ? temp.ambientTemperatureCelsius : null;
-  const humidityPercent = typeof humidity?.ambientHumidityPercent === 'number' ? humidity.ambientHumidityPercent : null;
-
-  // ➕ Detect telemetry-only updates (temperature/humidity but no HVAC/fan)
-  const isTelemetryOnly = !hvacStatusRaw && !fanTimerModeRaw && currentTempC !== null;
-
-  const hvacStatus = hvacStatusRaw?.toUpperCase?.() || (isTelemetryOnly ? 'UNCHANGED' : 'OFF');
-  const fanTimerMode = fanTimerModeRaw?.toUpperCase?.() || (isTelemetryOnly ? 'UNCHANGED' : 'OFF');
-
-  return {
-    eventId: eventData.eventId,
-    observedAt: eventData.timestamp || new Date().toISOString(),
-    deviceKey: extractDeviceKey(eventData),
-    deviceName: extractDeviceName(eventData),
-    userId: eventData.userId || null,
-    hvacStatus,
-    fanTimerMode,
-    currentTempC,
-    humidityPercent,
-    isTelemetryOnly,
-    source: 'nest',
-  };
-}
-
-/**
- * Google Nest Webhook Endpoint
+ * Main Google Pub/Sub Webhook
  */
 router.post('/', async (req, res) => {
-  try {
-    console.log('\n========================================');
-    console.log('🔔 WEBHOOK RECEIVED FROM GOOGLE');
-    console.log('========================================');
-    console.log('Raw body:', JSON.stringify(req.body, null, 2));
+  console.log('\n========================================');
+  console.log('🔔 WEBHOOK RECEIVED FROM GOOGLE');
+  console.log('========================================');
+  console.log('Raw body:', JSON.stringify(req.body, null, 2));
 
-    // ✅ Immediately acknowledge to Google (prevents retries)
-    res.status(200).json({ status: 'received' });
-    res.end();
+  // ✅ Immediately acknowledge (prevents Pub/Sub retry)
+  res.status(200).json({ status: 'received' });
+  res.end();
 
-    // Process event asynchronously
-    process.nextTick(async () => {
-      let eventData = req.body;
-      let deviceKey = null;
+  // Process asynchronously (don’t block response)
+  process.nextTick(async () => {
+    let eventData = req.body;
+    let deviceKey = null;
 
-      try {
-        // ✅ Decode Pub/Sub payload if present
-        if (req.body.message && req.body.message.data) {
-          const decodedData = Buffer.from(req.body.message.data, 'base64').toString('utf-8');
-          console.log('📦 Decoded data:', decodedData);
-
-          eventData = JSON.parse(decodedData);
-          console.log('📋 Parsed event:', JSON.stringify(eventData, null, 2));
-        }
-
-        deviceKey = extractDeviceKey(eventData);
-        const deviceName = extractDeviceName(eventData);
-
-        if (!deviceKey) {
-          console.error('⚠️ Cannot extract device key from event — processing without lock');
-          await handleNormalizedUpdate(normalizeNestEvent(eventData));
-          return;
-        }
-
-        // ✅ Wait for any in-flight event for this device
-        if (processingLocks.has(deviceKey)) {
-          console.log(`⏳ Waiting for previous event to finish processing for device: ${deviceKey}`);
-          await processingLocks.get(deviceKey);
-        }
-
-        // ✅ Create a new lock for this device
-        const processingPromise = (async () => {
-          try {
-            const normalizedEvent = normalizeNestEvent(eventData);
-            await handleNormalizedUpdate(normalizedEvent);
-          } catch (error) {
-            console.error(`❌ Error processing event for device ${deviceKey}:`, error);
-            throw error;
-          }
-        })();
-
-        processingLocks.set(deviceKey, processingPromise);
-        await processingPromise;
-
-        // ✅ Release the lock
-        processingLocks.delete(deviceKey);
-        console.log(`✓ Event processed and lock released for device: ${deviceKey}`);
-      } catch (error) {
-        console.error('❌ Error processing webhook event:', error);
-
-        if (deviceKey && processingLocks.has(deviceKey)) {
-          processingLocks.delete(deviceKey);
-          console.log(`🔓 Lock released due to error for device: ${deviceKey}`);
-        }
+    try {
+      // ✅ Decode Pub/Sub payload
+      if (req.body.message && req.body.message.data) {
+        const decodedData = Buffer.from(req.body.message.data, 'base64').toString('utf-8');
+        console.log('📦 Decoded data:', decodedData);
+        eventData = JSON.parse(decodedData);
+        console.log('📋 Parsed event:', JSON.stringify(eventData, null, 2));
       }
-    });
-  } catch (error) {
-    console.error('Webhook handler error:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Internal server error' });
+
+      console.log('========================================\n');
+
+      // Extract key + name
+      deviceKey = extractDeviceKey(eventData);
+      const deviceName = extractDeviceName(eventData);
+
+      if (!deviceKey) {
+        console.error('⚠️ Cannot extract device key from event');
+        return;
+      }
+
+      // Lock: prevent simultaneous processing for the same device
+      if (processingLocks.has(deviceKey)) {
+        console.log(`⏳ Waiting for previous event to finish for device: ${deviceKey}`);
+        await processingLocks.get(deviceKey);
+      }
+
+      // Create a processing promise and store it in the map
+      const processingPromise = (async () => {
+        try {
+          console.log(`📩 Processing event for device: ${deviceKey}`);
+
+          await handleDeviceEvent({
+            ...eventData,
+            deviceKey,
+            deviceName
+          });
+
+          console.log(`✅ Event handled successfully for device: ${deviceKey}`);
+        } catch (err) {
+          console.error(`❌ Error processing event for device ${deviceKey}:`, err);
+        }
+      })();
+
+      processingLocks.set(deviceKey, processingPromise);
+
+      // Wait for this device’s event to complete
+      await processingPromise;
+
+      // Unlock
+      processingLocks.delete(deviceKey);
+      console.log(`🔓 Lock released for device: ${deviceKey}`);
+    } catch (error) {
+      console.error('❌ Error processing webhook event:', error);
+      if (deviceKey && processingLocks.has(deviceKey)) {
+        processingLocks.delete(deviceKey);
+        console.log(`🔓 Lock released due to error for device: ${deviceKey}`);
+      }
     }
-  }
+  });
 });
 
 /**
- * Debug endpoint to check lock status (optional)
+ * Debug endpoint — list currently locked devices
  */
 router.get('/locks', (req, res) => {
   const { apiKey } = req.query;
