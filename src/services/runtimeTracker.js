@@ -261,7 +261,65 @@ async function handleDeviceEvent(eventData) {
   }
 }
 
-//
-// The rest of your runtime logic (processRuntimeLogic, startRuntimeSession, endRuntimeSession,
-// updateRuntimeSession, handleTemperatureChange, etc.) remains **unchanged**.
-//
+// ===========================
+// Runtime/session logic
+// ===========================
+async function processRuntimeLogic({
+  eventData,
+  deviceKey,
+  userId,
+  deviceName,
+  equipmentStatus,
+  isFanTimerOn,
+  heatSetpoint,
+  coolSetpoint,
+  firmwareVersion,
+  serialNumber
+}) {
+  const isHeating = equipmentStatus === 'HEATING';
+  const isCooling = equipmentStatus === 'COOLING';
+  const isFanOnly = !isHeating && !isCooling && isFanTimerOn;
+  const shouldBeActive = isHeating || isCooling || isFanTimerOn;
+  const wasActive = activeDevices.has(deviceKey);
+
+  console.log('RUNTIME STATE:', {
+    equipmentStatus,
+    isHeating,
+    isCooling,
+    isFanOnly,
+    shouldBeActive,
+    wasActive
+  });
+
+  if (shouldBeActive && !wasActive) {
+    await startRuntimeSession({
+      deviceKey, userId, deviceName, equipmentStatus,
+      isFanTimerOn, heatSetpoint, coolSetpoint,
+      firmwareVersion, serialNumber, eventData
+    });
+  } else if (!shouldBeActive && wasActive) {
+    await endRuntimeSession({
+      deviceKey, userId, deviceName, finalEquipmentStatus: equipmentStatus,
+      firmwareVersion, serialNumber, eventData
+    });
+  } else if (shouldBeActive && wasActive) {
+    await updateRuntimeSession({ deviceKey, equipmentStatus, isFanTimerOn, heatSetpoint, coolSetpoint });
+  }
+}
+
+// ===========================
+// Session lifecycle helpers
+// ===========================
+async function startRuntimeSession({...args}) { /* use your existing implementation */ }
+async function endRuntimeSession({...args}) { /* use your existing implementation */ }
+async function updateRuntimeSession({...args}) { /* use your existing implementation */ }
+async function handleTemperatureChange({...args}) { /* unchanged from your current version */ }
+
+// ===========================
+// Exports
+// ===========================
+module.exports = {
+  handleDeviceEvent,
+  recoverActiveSessions,
+  activeDevices
+};
