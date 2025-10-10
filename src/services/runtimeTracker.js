@@ -121,11 +121,55 @@ async function ensureDeviceExists(deviceKey, userId, deviceName) {
 async function updateDeviceReachability(deviceKey, isReachable) {
   const pool = getPool();
   try {
+    // Check previous reachability first
+    const { rows } = await pool.query(`
+      SELECT is_reachable FROM device_status WHERE device_key = $1
+    `, [deviceKey]);
+
+    const prevReachable = rows[0]?.is_reachable;
+    const changed = prevReachable !== isReachable;
+
+    // Update database regardless
     await pool.query(`
       UPDATE device_status
       SET is_reachable = $2, last_seen_at = NOW(), updated_at = NOW()
       WHERE device_key = $1
     `, [deviceKey, isReachable]);
+
+    if (changed) {
+      console.log(`[runtimeTracker] Connectivity changed for ${deviceKey}: ${prevReachable} → ${isReachable}`);
+
+      // Build core event payload
+      const corePayload = buildCorePayload({
+        deviceKey,
+        userId: null, // optional if not in scope here
+        deviceName: null,
+        eventType: 'CONNECTIVITY_CHANGE',
+        equipmentStatus: 'OFF',
+        previousStatus: prevReachable ? 'ONLINE' : 'OFFLINE',
+        isActive: isReachable,
+        mode: 'off',
+        runtimeSeconds: null,
+        temperatureF: null,
+        humidity: null,
+        observedAt: new Date(),
+        sourceEventId: uuidv4(),
+        payloadRaw: { connectivity: isReachable ? 'ONLINE' : 'OFFLINE' }
+      });
+
+      await postToCoreIngestAsync(corePayload).catch(err =>
+        console.error('[runtimeTracker] Failed to post connectivity event to Core:', err)
+      );
+
+      // Optionally mirror to Bubble
+      await postToBubbleAsync({
+        thermostatId: deviceKey,
+        isReachable,
+        timestamp: new Date().toISOString()
+      }).catch(err =>
+        console.error('[runtimeTracker] Failed to post connectivity event to Bubble:', err)
+      );
+    }
   } catch (error) {
     console.error('[runtimeTracker] Error updating device reachability:', error);
   }
