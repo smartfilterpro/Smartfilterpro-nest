@@ -125,3 +125,13 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 startup();
+
+async function recoverActiveSessions() {
+  console.log("[runtimeTracker] Skipping active session recovery (not implemented)");
+  return;
+}
+
+module.exports = {
+  handleRuntimeEvent,
+  recoverActiveSessions
+};
