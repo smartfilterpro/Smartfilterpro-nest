@@ -168,7 +168,7 @@ async function handleDeviceUpdate(normalized) {
   }
 
   // --- handle idle telemetry update (temp/humidity only)
-  if (shouldPostTempUpdate) {
+   if (shouldPostTempUpdate) {
     const payload = buildCorePayload({
       deviceKey,
       userId,
@@ -198,13 +198,14 @@ async function handleDeviceUpdate(normalized) {
   }
 
   // --- persist latest state
-deviceStateMemory.set(deviceKey, {
-  lastTempF: tempF,
-  lastHumidity: humidity,
-  lastIsActive: isActive,
-  lastEquipStatus: equipmentStatus,
-  lastPostTempAt: shouldPostTempUpdate ? nowMs : prevState.lastPostTempAt,
-});
+  deviceStateMemory.set(deviceKey, {
+    lastTempF: tempF,
+    lastHumidity: humidity,
+    lastIsActive: isActive,
+    lastEquipStatus: equipmentStatus,
+    lastPostTempAt: shouldPostTempUpdate ? nowMs : prevState.lastPostTempAt,
+  });
+} // <-- closes handleDeviceUpdate function
 
 // =========================================
 // Recovery stub for startup
@@ -219,6 +220,6 @@ async function recoverActiveSessions() {
 // =========================================
 module.exports = {
   handleDeviceUpdate,
-  handleRuntimeEvent,    // ← if defined above
+  handleRuntimeEvent,
   recoverActiveSessions
 };
