@@ -1,88 +1,210 @@
-function buildCorePayload({
-  deviceKey,
-  userId,
-  deviceName,
-  manufacturer = 'Google Nest',
-  model = 'Nest Thermostat',
-  connectionSource = 'nest',
-  source = 'nest',
-  sourceVendor = 'nest',
-  workspaceId = userId,
-  deviceType = 'thermostat',
-  firmwareVersion = null,
-  serialNumber = null,
-  timezone,     // optional, only include if defined
-  zipPrefix,    // optional, only include if defined
+'use strict';
 
-  eventType,
-  equipmentStatus,
-  previousStatus,
-  isActive,
-  mode,
-  runtimeSeconds,
-  temperatureF,
-  humidity,
-  heatSetpoint,
-  coolSetpoint,
-  observedAt,
-  sourceEventId,
-  payloadRaw
-}) {
-  const temperatureC =
-    typeof temperatureF === 'number'
-      ? Math.round(((temperatureF - 32) * 5 / 9) * 100) / 100
-      : null;
+const { v4: uuidv4 } = require('uuid');
+const { getPool } = require('../database/db');
+const { postToBubbleAsync } = require('./bubblePoster');
+const { postToCoreIngestAsync } = require('./ingestPoster');
+const { buildCorePayload } = require('./buildCorePayload');
 
-  const iso = (observedAt || new Date()).toISOString();
+// ===========================
+// In-memory active sessions
+// ===========================
+const activeDevices = new Map();
 
-  // Base payload — only includes values we know from the Nest API
-  const payload = {
-    device_key: deviceKey,
-    device_id: `nest:${deviceKey}`,
-    user_id: userId || null,
-    workspace_id: workspaceId || null,
-    device_name: deviceName || 'Nest Thermostat',
+// ===========================
+// Persistent state memory (for partial webhooks)
+// ===========================
+const deviceStateMemory = new Map();
+
+// ===========================
+// Utility helpers
+// ===========================
+function fToC(f) {
+  if (typeof f !== 'number') return null;
+  return Math.round(((f - 32) * 5 / 9) * 100) / 100;
+}
+
+// ===========================
+// Session helpers
+// ===========================
+function startSession(deviceKey, data) {
+  const now = new Date();
+  activeDevices.set(deviceKey, {
+    ...data,
+    startTime: now,
+    lastTempF: data.temperatureF,
+    lastHumidity: data.humidity ?? null,
+  });
+}
+
+function endSession(deviceKey) {
+  const sess = activeDevices.get(deviceKey);
+  if (!sess) return null;
+  const endTime = new Date();
+  const runtimeSeconds = Math.round((endTime - sess.startTime) / 1000);
+  activeDevices.delete(deviceKey);
+  return runtimeSeconds;
+}
+
+// ===========================
+// Core + Bubble posting logic
+// ===========================
+async function handleDeviceUpdate(normalized) {
+  const {
+    userId,
+    thermostatId,
+    deviceName,
+    isActive,
+    currentTemperature,
+    currentHumidity,
+    eventType,
+    equipmentStatus,
+    heatSetpoint,
+    coolSetpoint,
     manufacturer,
     model,
-    device_type: deviceType,
-    source,
-    source_vendor: sourceVendor,
-    connection_source: connectionSource,
-    firmware_version: firmwareVersion,
-    serial_number: serialNumber,
+    serialNumber,
+    firmwareVersion,
+    timezone,
+    zipPrefix,
+  } = normalized;
 
-    // State snapshot
-    last_mode: mode || null,
-    last_is_cooling: equipmentStatus === 'COOLING',
-    last_is_heating: equipmentStatus === 'HEATING',
-    last_is_fan_only: equipmentStatus === 'FAN',
-    last_equipment_status: equipmentStatus || null,
-    is_reachable: true,
+  const deviceKey = thermostatId;
+  const now = new Date();
 
-    // Telemetry snapshot
-    last_temperature: temperatureF ?? null,
-    last_humidity: humidity ?? null,
-    last_heat_setpoint: heatSetpoint ?? null,
-    last_cool_setpoint: coolSetpoint ?? null,
-
-    // Event metadata
-    event_type: eventType,
-    is_active: !!isActive,
-    equipment_status: equipmentStatus || 'OFF',
-    previous_status: previousStatus || 'UNKNOWN',
-    runtime_seconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null,
-    timestamp: iso,
-    recorded_at: iso,
-    source_event_id: sourceEventId || uuidv4(),
-    payload_raw: payloadRaw || null
+  // ---- Initialize state memory ----
+  const prevState = deviceStateMemory.get(deviceKey) || {
+    lastTempF: null,
+    lastHumidity: null,
+    lastIsActive: null,
+    lastEquipStatus: null,
+    lastPostTempAt: 0,
   };
 
-  // ✅ Only include optional fields if they are defined
-  if (timezone) payload.timezone = timezone;
-  if (zipPrefix) {
-    payload.zip_prefix = zipPrefix;
-    payload.zip_code_prefix = zipPrefix;
+  const tempF = typeof currentTemperature === 'number' ? currentTemperature : prevState.lastTempF;
+  const humidity = typeof currentHumidity === 'number' ? currentHumidity : prevState.lastHumidity;
+
+  const tempChanged = Math.abs((tempF ?? 0) - (prevState.lastTempF ?? 0)) >= 0.5; // only post if Δ ≥ 0.5°F
+  const humidChanged = Math.abs((humidity ?? 0) - (prevState.lastHumidity ?? 0)) >= 2;
+  const nowMs = now.getTime();
+  const elapsedMs = nowMs - (prevState.lastPostTempAt || 0);
+  const enoughTimeElapsed = elapsedMs > 5 * 60 * 1000; // 5 minutes min interval
+
+  const activeStateChanged = prevState.lastIsActive !== isActive;
+  const equipChanged = prevState.lastEquipStatus !== equipmentStatus;
+
+  const shouldPostTempUpdate =
+    (!isActive && (tempChanged || humidChanged) && enoughTimeElapsed);
+
+  // --- always forward to Bubble
+  await postToBubbleAsync({
+    userId,
+    thermostatId,
+    runtimeSeconds: isActive ? null : 0,
+    currentTemperature: tempF,
+    isActive,
+  });
+
+  // --- handle active transitions
+  if (activeStateChanged || equipChanged) {
+    if (isActive) {
+      // Session start
+      startSession(deviceKey, { temperatureF: tempF, humidity });
+      const payload = buildCorePayload({
+        deviceKey,
+        userId,
+        deviceName,
+        manufacturer,
+        model,
+        serialNumber,
+        connectionSource: 'nest',
+        source: 'nest',
+        sourceVendor: 'nest',
+        eventType: `${equipmentStatus || 'UNKNOWN'}_START`,
+        equipmentStatus: equipmentStatus || 'OFF',
+        previousStatus: prevState.lastEquipStatus || 'OFF',
+        isActive: true,
+        mode: equipmentStatus === 'COOLING' ? 'cooling' :
+              equipmentStatus === 'HEATING' ? 'heating' : 'fanonly',
+        runtimeSeconds: null,
+        temperatureF: tempF,
+        humidity,
+        heatSetpoint,
+        coolSetpoint,
+        observedAt: now,
+        sourceEventId: uuidv4(),
+        payloadRaw: normalized
+      });
+      await postToCoreIngestAsync(payload, 'session-start');
+    } else {
+      // Session end
+      const runtimeSeconds = endSession(deviceKey);
+      const payload = buildCorePayload({
+        deviceKey,
+        userId,
+        deviceName,
+        manufacturer,
+        model,
+        serialNumber,
+        connectionSource: 'nest',
+        source: 'nest',
+        sourceVendor: 'nest',
+        eventType: 'STATUS_CHANGE',
+        equipmentStatus: 'OFF',
+        previousStatus: prevState.lastEquipStatus || 'UNKNOWN',
+        isActive: false,
+        mode: 'off',
+        runtimeSeconds,
+        temperatureF: tempF,
+        humidity,
+        heatSetpoint,
+        coolSetpoint,
+        observedAt: now,
+        sourceEventId: uuidv4(),
+        payloadRaw: normalized
+      });
+      await postToCoreIngestAsync(payload, 'session-end');
+    }
   }
 
-  return payload;
+  // --- handle idle telemetry update (temp/humidity only)
+  if (shouldPostTempUpdate) {
+    const payload = buildCorePayload({
+      deviceKey,
+      userId,
+      deviceName,
+      manufacturer,
+      model,
+      serialNumber,
+      connectionSource: 'nest',
+      source: 'nest',
+      sourceVendor: 'nest',
+      eventType: 'STATE_UPDATE',
+      equipmentStatus: equipmentStatus || 'OFF',
+      previousStatus: prevState.lastEquipStatus || 'UNKNOWN',
+      isActive: false,
+      mode: 'off',
+      runtimeSeconds: null,
+      temperatureF: tempF,
+      humidity,
+      heatSetpoint,
+      coolSetpoint,
+      observedAt: now,
+      sourceEventId: uuidv4(),
+      payloadRaw: normalized
+    });
+
+    await postToCoreIngestAsync(payload, 'state-update');
+  }
+
+  // --- persist latest state
+  deviceStateMemory.set(deviceKey, {
+    lastTempF: tempF,
+    lastHumidity: humidity,
+    lastIsActive: isActive,
+    lastEquipStatus: equipmentStatus,
+    lastPostTempAt: shouldPostTempUpdate ? nowMs : prevState.lastPostTempAt,
+  });
 }
+
+module.exports = { handleDeviceUpdate };
