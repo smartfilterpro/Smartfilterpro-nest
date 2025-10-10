@@ -340,6 +340,10 @@ async function handleDeviceEvent(eventData) {
       if (typeof tSetpoint.coolCelsius === 'number') coolSetpoint = celsiusToFahrenheit(tSetpoint.coolCelsius);
     }
 
+    const hasActiveSession = activeDevices.has(deviceKey);
+    if (!hasActiveSession) {
+      await handleIdleTelemetryUpdate(deviceKey, traits, userId);
+
     await processRuntimeLogic({
       eventData,
       deviceKey,
@@ -811,6 +815,59 @@ async function handleTemperatureChange(deviceKey, tempF, tempC, userId) {
     console.error('[runtimeTracker] Error handling temperature change:', error);
   }
 }
+
+// ===========================
+// Idle-day telemetry capture
+// ===========================
+async function handleIdleTelemetryUpdate(deviceKey, traits, userId) {
+  const pool = getPool();
+
+  const tTemp = traits['sdm.devices.traits.Temperature'];
+  const tHumidity = traits['sdm.devices.traits.Humidity'];
+  const tSetpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint'];
+
+  const temperatureC = tTemp?.ambientTemperatureCelsius ?? null;
+  const temperatureF = typeof temperatureC === 'number'
+    ? Math.round((temperatureC * 9 / 5 + 32) * 100) / 100
+    : null;
+  const humidity = tHumidity?.ambientHumidityPercent ?? null;
+  const heatSetpoint = tSetpoint?.heatCelsius
+    ? Math.round((tSetpoint.heatCelsius * 9 / 5 + 32) * 100) / 100
+    : null;
+  const coolSetpoint = tSetpoint?.coolCelsius
+    ? Math.round((tSetpoint.coolCelsius * 9 / 5 + 32) * 100) / 100
+    : null;
+
+  // Skip if no telemetry to log
+  if (temperatureF === null && humidity === null && heatSetpoint === null && coolSetpoint === null) {
+    return;
+  }
+
+  // Insert new reading
+  await pool.query(`
+    INSERT INTO temp_readings (
+      device_key, temperature, humidity, heat_setpoint, cool_setpoint, event_type, recorded_at, created_at
+    )
+    VALUES ($1, $2, $3, $4, $5, 'idle_update', NOW(), NOW())
+  `, [deviceKey, temperatureF, humidity, heatSetpoint, coolSetpoint]);
+
+  // Update device_status snapshot
+  await pool.query(`
+    UPDATE device_status SET
+      last_temperature = COALESCE($2, last_temperature),
+      last_humidity = COALESCE($3, last_humidity),
+      last_heat_setpoint = COALESCE($4, last_heat_setpoint),
+      last_cool_setpoint = COALESCE($5, last_cool_setpoint),
+      updated_at = NOW()
+    WHERE device_key = $1
+  `, [deviceKey, temperatureF, humidity, heatSetpoint, coolSetpoint]);
+
+  console.log(`[runtimeTracker] Idle telemetry logged for ${deviceKey}`, {
+    temperatureF, humidity, heatSetpoint, coolSetpoint
+  });
+}
+
+
 
 module.exports = {
   handleDeviceEvent,
