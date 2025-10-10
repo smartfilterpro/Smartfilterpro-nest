@@ -343,7 +343,7 @@ async function handleDeviceEvent(eventData) {
     const hasActiveSession = activeDevices.has(deviceKey);
     if (!hasActiveSession) {
       await handleIdleTelemetryUpdate(deviceKey, traits, userId);
-
+    }
     await processRuntimeLogic({
       eventData,
       deviceKey,
