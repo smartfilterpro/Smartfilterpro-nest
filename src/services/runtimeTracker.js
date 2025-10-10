@@ -153,6 +153,102 @@ async function getBackfillState(deviceKey) {
   }
 }
 
+/**
+ * Core payload builder — matches devices / device_status / equipment_events fields (where applicable).
+ * Sends a rich, consistent shape; nulls when unknown.
+ */
+function buildCorePayload({
+  deviceKey,
+  userId,
+  deviceName,
+  // traits & vendor info
+  manufacturer = 'Google Nest',
+  model = 'Nest Thermostat',
+  connectionSource = 'nest',
+  source = 'nest',
+  sourceVendor = 'nest',
+  workspaceId = userId,
+  deviceType = 'thermostat',
+  firmwareVersion = null,
+  serialNumber = null,
+  ipAddress = null,
+  timezone = null,
+  zipPrefix = null,
+
+  // runtime
+  eventType,                 // e.g., COOLING_ON, STATUS_CHANGE, FAN_ON
+  equipmentStatus,           // HEATING/COOLING/OFF/FAN
+  previousStatus,            // previous hvac status or 'unknown'
+  isActive,                  // boolean
+  mode,                      // 'heating' | 'cooling' | 'fan_only' | 'off'
+  runtimeSeconds,            // integer or null
+
+  // telemetry
+  temperatureF,              // number or null
+  humidity,                  // number or null
+  heatSetpoint,              // number or null
+  coolSetpoint,              // number or null
+
+  // linking
+  observedAt,                // JS Date
+  sourceEventId,             // stable per logical event / session
+  payloadRaw                 // raw event for traceability
+}) {
+  const temperatureC = typeof temperatureF === 'number'
+    ? Math.round(((temperatureF - 32) * 5 / 9) * 100) / 100
+    : null;
+
+  const isoNow = (observedAt || new Date()).toISOString();
+
+  return {
+    // identity
+    device_key: deviceKey,
+    device_id: `nest:${deviceKey}`,
+    user_id: userId || null,
+    workspace_id: workspaceId || userId || null,
+    device_name: deviceName || 'Nest Thermostat',
+    manufacturer,
+    model,
+    device_type: deviceType,
+    source,
+    source_vendor: sourceVendor,
+    connection_source: connectionSource,
+    firmware_version: firmwareVersion,
+    serial_number: serialNumber,
+    ip_address: ipAddress,
+    timezone,
+    zip_prefix: zipPrefix,
+    zip_code_prefix: zipPrefix,
+
+    // state snapshot
+    last_mode: mode || null,
+    last_is_cooling: equipmentStatus === 'COOLING',
+    last_is_heating: equipmentStatus === 'HEATING',
+    last_is_fan_only: equipmentStatus === 'FAN',
+    last_equipment_status: equipmentStatus || null,
+    is_reachable: true, // best-effort; device_status table will be authoritative
+
+    // telemetry snapshot (duplicated to ease UPSERTs on devices/device_status)
+    last_temperature: temperatureF ?? null,
+    last_humidity: humidity ?? null,
+    last_heat_setpoint: heatSetpoint ?? null,
+    last_cool_setpoint: coolSetpoint ?? null,
+
+    // event-specific fields
+    event_type: eventType,
+    is_active: !!isActive,
+    equipment_status: equipmentStatus || 'OFF',
+    previous_status: previousStatus || 'UNKNOWN',
+    runtime_seconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null,
+    timestamp: isoNow,
+    recorded_at: isoNow,
+
+    // dedupe + trace
+    source_event_id: sourceEventId || uuidv4(),
+    payload_raw: payloadRaw || null
+  };
+}
+
 // ===========================
 // Public entrypoint
 // ===========================
