@@ -102,12 +102,12 @@ async function recoverActiveSessions() {
   console.log('[runtimeTracker] ⚠️ Skipping active session recovery (not implemented)');
   return;
 }
-
 // =========================================
 // Unified export
 // =========================================
 module.exports = {
+  handleDeviceEvent: handleDeviceUpdate, // ✅ Alias so webhook.js works
   handleDeviceUpdate,
   handleRuntimeEvent,
-  recoverActiveSessions
+  recoverActiveSessions,
 };
