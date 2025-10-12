@@ -11,8 +11,12 @@ const { buildCorePayload } = require('./buildCorePayload');
 // ================================
 const deviceStateMemory = new Map();
 
+const MIN_SEGMENT_SECONDS = 5; // Ignore tiny blips
+const MAX_OUT_OF_ORDER_MS = 60000; // 1 minute tolerance
+const DEBUG_RUNTIME = process.env.DEBUG_RUNTIME === '1';
+
 // =========================================
-// Handle Nest device updates (core logic)
+// Core device update (temperature / idle)
 // =========================================
 async function handleDeviceUpdate(normalized) {
   const {
@@ -79,6 +83,7 @@ async function handleDeviceUpdate(normalized) {
 
   // --- persist latest state
   deviceStateMemory.set(deviceKey, {
+    ...prevState,
     lastTempF: tempF,
     lastHumidity: humidity,
     lastIsActive: isActive,
@@ -88,23 +93,153 @@ async function handleDeviceUpdate(normalized) {
 }
 
 // =========================================
-// Stub for runtime events (session tracking)
+// Runtime session tracking (start/stop)
 // =========================================
 async function handleRuntimeEvent(event) {
-  console.log('[runtimeTracker] handleRuntimeEvent called (stub)', event?.deviceKey);
-  // You can extend this to process session-based runtime later.
+  const pool = getPool();
+  const client = await pool.connect();
+  const nowMs = Date.now();
+
+  try {
+    const deviceKey = event.deviceKey;
+    const isActive = event.isActive;
+    const equipmentStatus = event.equipmentStatus || 'OFF';
+    const eventType = event.eventType || (isActive ? 'HVAC_ON' : 'HVAC_OFF');
+    const temperatureF = event.temperatureF ?? null;
+    const userId = event.userId || 'unknown';
+    const deviceName = event.deviceName || 'Nest Thermostat';
+
+    let rec = deviceStateMemory.get(deviceKey) || {
+      lastIsActive: null,
+      lastActiveStart: null,
+      lastEventTime: null,
+      lastEquipStatus: 'UNKNOWN',
+    };
+
+    if (rec.lastEventTime && nowMs < rec.lastEventTime) {
+      const diff = rec.lastEventTime - nowMs;
+      if (diff < MAX_OUT_OF_ORDER_MS) {
+        if (DEBUG_RUNTIME)
+          console.log(`⚠️ Out-of-order event for ${deviceKey} (${diff}ms) - adjusting timestamp`);
+        nowMs = rec.lastEventTime + 1;
+      } else {
+        console.warn(`⚠️ Skipping too-old event for ${deviceKey}`);
+        return;
+      }
+    }
+
+    let runtimeSeconds = null;
+
+    // Transition from active → inactive
+    if (!isActive && rec.lastIsActive && rec.lastActiveStart) {
+      const durationMs = nowMs - rec.lastActiveStart;
+      const durationSec = Math.round(durationMs / 1000);
+      if (durationSec >= MIN_SEGMENT_SECONDS) {
+        runtimeSeconds = durationSec;
+
+        const payload = buildCorePayload({
+          deviceKey,
+          userId,
+          deviceName,
+          manufacturer: 'Google Nest',
+          model: 'Nest Thermostat',
+          connectionSource: 'nest',
+          source: 'nest',
+          sourceVendor: 'nest',
+          eventType,
+          equipmentStatus,
+          previousStatus: rec.lastEquipStatus || 'UNKNOWN',
+          isActive: false,
+          runtimeSeconds,
+          temperatureF,
+          observedAt: new Date(),
+          sourceEventId: uuidv4(),
+          payloadRaw: event,
+        });
+
+        await postToCoreIngestAsync(payload, 'runtime-end');
+        await postToBubbleAsync(payload);
+
+        console.log(
+          `✅ [runtimeTracker] Closed session for ${deviceKey} (${durationSec}s, ${equipmentStatus})`
+        );
+      } else {
+        if (DEBUG_RUNTIME)
+          console.log(`[runtimeTracker] Short runtime ignored (${durationSec}s < ${MIN_SEGMENT_SECONDS}s)`);
+      }
+
+      rec.lastActiveStart = null;
+    }
+
+    // Transition from inactive → active
+    if (isActive && !rec.lastIsActive) {
+      rec.lastActiveStart = nowMs;
+      if (DEBUG_RUNTIME)
+        console.log(`[runtimeTracker] Started runtime for ${deviceKey} (${equipmentStatus})`);
+    }
+
+    // Update state tracking
+    rec.lastIsActive = isActive;
+    rec.lastEventTime = nowMs;
+    rec.lastEquipStatus = equipmentStatus;
+    deviceStateMemory.set(deviceKey, rec);
+
+    // Persist runtime state in DB
+    await client.query(
+      `
+      INSERT INTO device_runtime_state 
+      (device_id, last_is_active, last_active_start, last_event_time, last_state, updated_at)
+      VALUES ($1,$2,$3,$4,$5,NOW())
+      ON CONFLICT (device_id) DO UPDATE SET
+        last_is_active = EXCLUDED.last_is_active,
+        last_active_start = EXCLUDED.last_active_start,
+        last_event_time = EXCLUDED.last_event_time,
+        last_state = EXCLUDED.last_state,
+        updated_at = NOW()
+    `,
+      [
+        deviceKey,
+        rec.lastIsActive,
+        rec.lastActiveStart ? new Date(rec.lastActiveStart).toISOString() : null,
+        new Date(rec.lastEventTime).toISOString(),
+        equipmentStatus,
+      ]
+    );
+  } catch (err) {
+    console.error('[runtimeTracker] ❌ Runtime error:', err);
+  } finally {
+    client.release();
+  }
 }
 
 // =========================================
-// Recovery stub for startup
+// Startup recovery
 // =========================================
 async function recoverActiveSessions() {
-  console.log('[runtimeTracker] ⚠️ Skipping active session recovery (not implemented)');
-  return;
+  const pool = getPool();
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      'SELECT device_id, last_is_active, last_active_start, last_event_time, last_state FROM device_runtime_state'
+    );
+    console.log(`[runtimeTracker] Recovered ${result.rows.length} devices from DB`);
+    for (const row of result.rows) {
+      deviceStateMemory.set(row.device_id, {
+        lastIsActive: row.last_is_active,
+        lastActiveStart: row.last_active_start ? new Date(row.last_active_start).getTime() : null,
+        lastEventTime: row.last_event_time ? new Date(row.last_event_time).getTime() : null,
+        lastEquipStatus: row.last_state || 'UNKNOWN',
+      });
+    }
+  } catch (err) {
+    console.error('[runtimeTracker] ❌ Error recovering sessions:', err);
+  } finally {
+    client.release();
+  }
 }
 
 // =========================================
-// 🆕 handleDeviceEvent — public entrypoint for webhook.js
+// Unified webhook entrypoint (for routes/webhook.js)
 // =========================================
 async function handleDeviceEvent(eventData) {
   try {
@@ -135,33 +270,18 @@ async function handleDeviceEvent(eventData) {
       humidity: humidity.ambientHumidityPercent ?? null,
       isActive,
       equipmentStatus,
-      heatSetpoint: traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius ?? null,
-      coolSetpoint: traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius ?? null,
+      heatSetpoint:
+        traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius ?? null,
+      coolSetpoint:
+        traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius ?? null,
     };
 
-    console.log(
-      `[handleDeviceEvent] ${deviceKey} → ${equipmentStatus} (${isActive ? 'ACTIVE' : 'IDLE'})`
-    );
-
-    // Reuse your existing logic
+    // Update state + runtime tracking
     await handleDeviceUpdate(normalized);
-
-    // Post runtime event if HVAC changes
-    if (equipmentStatus === 'OFF' || equipmentStatus === 'IDLE') {
-      await handleRuntimeEvent({ deviceKey, eventType: 'HVAC_OFF' });
-    } else if (isActive) {
-      await handleRuntimeEvent({ deviceKey, eventType: 'HVAC_ON' });
-    }
-
-    // Optional dual post (state update already posts to Core)
-    const bubblePayload = {
-      userId: eventData.userId || 'unknown',
-      thermostatId: deviceKey,
-      currentTemperature: normalized.tempF,
-      isActive,
-      equipmentStatus,
-    };
-    await postToBubbleAsync(bubblePayload);
+    await handleRuntimeEvent({
+      ...normalized,
+      eventType: isActive ? 'HVAC_ON' : 'HVAC_OFF',
+    });
   } catch (err) {
     console.error('[handleDeviceEvent] ❌ Error:', err);
   }
