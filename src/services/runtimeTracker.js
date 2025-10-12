@@ -12,7 +12,7 @@ const { buildCorePayload } = require('./buildCorePayload');
 const deviceStateMemory = new Map();
 
 // =========================================
-// Handle Nest device updates
+// Handle Nest device updates (core logic)
 // =========================================
 async function handleDeviceUpdate(normalized) {
   const {
@@ -71,7 +71,7 @@ async function handleDeviceUpdate(normalized) {
       coolSetpoint,
       observedAt: now,
       sourceEventId: uuidv4(),
-      payloadRaw: normalized
+      payloadRaw: normalized,
     });
 
     await postToCoreIngestAsync(payload, 'state-update');
@@ -104,10 +104,75 @@ async function recoverActiveSessions() {
 }
 
 // =========================================
+// 🆕 handleDeviceEvent — public entrypoint for webhook.js
+// =========================================
+async function handleDeviceEvent(eventData) {
+  try {
+    const resource = eventData?.resourceUpdate || {};
+    const traits = resource.traits || {};
+    const hvac = traits['sdm.devices.traits.ThermostatHvac'] || {};
+    const temp = traits['sdm.devices.traits.Temperature'] || {};
+    const humidity = traits['sdm.devices.traits.Humidity'] || {};
+    const deviceKey = eventData.deviceKey || resource.name?.split('/').pop();
+
+    if (!deviceKey) {
+      console.warn('[handleDeviceEvent] ⚠️ Missing deviceKey — skipping event');
+      return;
+    }
+
+    const status = hvac.status || 'OFF';
+    const isActive = status !== 'OFF' && status !== 'IDLE';
+    const equipmentStatus = status.toUpperCase();
+
+    const normalized = {
+      deviceKey,
+      userId: eventData.userId || 'unknown',
+      deviceName: eventData.deviceName || 'Nest Thermostat',
+      manufacturer: 'Google Nest',
+      model: 'Nest Thermostat',
+      serialNumber: null,
+      tempF: temp.ambientTemperatureFahrenheit ?? null,
+      humidity: humidity.ambientHumidityPercent ?? null,
+      isActive,
+      equipmentStatus,
+      heatSetpoint: traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.heatCelsius ?? null,
+      coolSetpoint: traits['sdm.devices.traits.ThermostatTemperatureSetpoint']?.coolCelsius ?? null,
+    };
+
+    console.log(
+      `[handleDeviceEvent] ${deviceKey} → ${equipmentStatus} (${isActive ? 'ACTIVE' : 'IDLE'})`
+    );
+
+    // Reuse your existing logic
+    await handleDeviceUpdate(normalized);
+
+    // Post runtime event if HVAC changes
+    if (equipmentStatus === 'OFF' || equipmentStatus === 'IDLE') {
+      await handleRuntimeEvent({ deviceKey, eventType: 'HVAC_OFF' });
+    } else if (isActive) {
+      await handleRuntimeEvent({ deviceKey, eventType: 'HVAC_ON' });
+    }
+
+    // Optional dual post (state update already posts to Core)
+    const bubblePayload = {
+      userId: eventData.userId || 'unknown',
+      thermostatId: deviceKey,
+      currentTemperature: normalized.tempF,
+      isActive,
+      equipmentStatus,
+    };
+    await postToBubbleAsync(bubblePayload);
+  } catch (err) {
+    console.error('[handleDeviceEvent] ❌ Error:', err);
+  }
+}
+
+// =========================================
 // Unified export
 // =========================================
 module.exports = {
+  handleDeviceEvent,
   handleDeviceUpdate,
   handleRuntimeEvent,
-  recoverActiveSessions
+  recoverActiveSessions,
 };
