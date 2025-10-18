@@ -13,7 +13,7 @@ const activeDevices = new Map();
 //   deviceKey, frontendId, deviceName,
 //   sessionId, sessionStartedAt, currentMode,
 //   currentEquipmentStatus, startTemperature,
-//   isHeating, isCooling, isFanOnly,
+//   isHeating, isCooling, isAuxHeat, isFanOnly,
 //   heatSetpoint, coolSetpoint,
 //   lastEventTime, isReachable
 // }
@@ -29,22 +29,37 @@ function checkDeviceReachability(deviceState, nowMs) {
 }
 
 // ===========================
-// State Classification
+// State Classification (8-State System)
 // ===========================
-function classifyEquipmentState(equipmentStatus, isFanTimerOn) {
+function classifyEquipmentState(equipmentStatus, isFanTimerOn, hvacMode) {
   const status = (equipmentStatus || 'OFF').toUpperCase();
   
   let eventType;
   let finalEquipmentStatus;
   let isActive;
 
-  if (status === 'HEATING') {
+  // Check for auxiliary heat (typically reported as 'AUX_HEATING' or detected via hvacMode)
+  const isAuxHeat = status === 'AUX_HEATING' || status === 'EMERGENCY_HEAT';
+
+  if (isAuxHeat) {
+    // Auxiliary/Emergency heat (expensive)
+    if (isFanTimerOn) {
+      eventType = 'AuxHeat_Fan';
+      finalEquipmentStatus = 'AUX_HEATING';
+      isActive = true;
+    } else {
+      eventType = 'AuxHeat';
+      finalEquipmentStatus = 'AUX_HEATING';
+      isActive = true;
+    }
+  } else if (status === 'HEATING') {
+    // Primary heating (heat pump, furnace)
     if (isFanTimerOn) {
       eventType = 'Heating_Fan';
       finalEquipmentStatus = 'HEATING';
       isActive = true;
     } else {
-      eventType = 'Heating_on';
+      eventType = 'Heating';
       finalEquipmentStatus = 'HEATING';
       isActive = true;
     }
@@ -54,7 +69,7 @@ function classifyEquipmentState(equipmentStatus, isFanTimerOn) {
       finalEquipmentStatus = 'COOLING';
       isActive = true;
     } else {
-      eventType = 'Cooling_on';
+      eventType = 'Cooling';
       finalEquipmentStatus = 'COOLING';
       isActive = true;
     }
@@ -121,6 +136,8 @@ async function recoverActiveSessions() {
         continue;
       }
 
+      const isAuxHeat = row.current_equipment_status === 'AUX_HEATING';
+
       activeDevices.set(row.device_key, {
         deviceKey: row.device_key,
         frontendId: row.frontend_id,
@@ -132,6 +149,7 @@ async function recoverActiveSessions() {
         startTemperature: row.last_temperature,
         isHeating: row.current_equipment_status === 'HEATING',
         isCooling: row.current_equipment_status === 'COOLING',
+        isAuxHeat,
         isFanOnly: row.current_equipment_status === 'FAN',
         heatSetpoint: row.last_heat_setpoint,
         coolSetpoint: row.last_cool_setpoint,
@@ -369,7 +387,7 @@ async function handleDeviceEvent(eventData) {
     }
 
     // HVAC + Fan + Setpoints
-    const equipmentStatus = tHvac?.status || null;  // HEATING/COOLING/OFF
+    const equipmentStatus = tHvac?.status || null;  // HEATING/COOLING/OFF/AUX_HEATING
     const isFanTimerOn = tFan?.timerMode === 'ON' || false;
     const thermostatMode = tMode?.mode || null;  // "HEAT", "COOL", "HEATCOOL", "OFF"
 
@@ -456,8 +474,8 @@ async function processRuntimeLogic({
   console.log('\n=== RUNTIME LOGIC EVALUATION ===');
   const pool = getPool();
 
-  // Classify current state
-  const label = classifyEquipmentState(equipmentStatus, isFanTimerOn);
+  // Classify current state (8-state system)
+  const label = classifyEquipmentState(equipmentStatus, isFanTimerOn, thermostatMode);
   const isActiveNow = label.isActive;
 
   const currentState = activeDevices.get(deviceKey);
@@ -523,7 +541,7 @@ async function processRuntimeLogic({
     });
 
   } else if (isActiveNow && modeChanged) {
-    // MODE SWITCH event (e.g., Heating -> Cooling)
+    // MODE SWITCH event (e.g., Heating -> Cooling or Heating -> AuxHeat)
     console.log('\nACTION: MODE SWITCH');
     await modeSwitchSession({
       deviceKey, userId, deviceName,
@@ -655,6 +673,7 @@ async function startRuntimeSession({
     startTemperature: temperatureF,
     isHeating: label.equipmentStatus === 'HEATING',
     isCooling: label.equipmentStatus === 'COOLING',
+    isAuxHeat: label.equipmentStatus === 'AUX_HEATING',
     isFanOnly: label.equipmentStatus === 'FAN',
     heatSetpoint,
     coolSetpoint,
@@ -826,6 +845,7 @@ async function modeSwitchSession({
   deviceState.currentEquipmentStatus = label.equipmentStatus;
   deviceState.isHeating = label.equipmentStatus === 'HEATING';
   deviceState.isCooling = label.equipmentStatus === 'COOLING';
+  deviceState.isAuxHeat = label.equipmentStatus === 'AUX_HEATING';
   deviceState.isFanOnly = label.equipmentStatus === 'FAN';
   deviceState.lastEventTime = nowMs;
 
@@ -891,6 +911,7 @@ async function updateRuntimeSession({
     deviceState.currentEquipmentStatus = label.equipmentStatus;
     deviceState.isHeating = label.equipmentStatus === 'HEATING';
     deviceState.isCooling = label.equipmentStatus === 'COOLING';
+    deviceState.isAuxHeat = label.equipmentStatus === 'AUX_HEATING';
     deviceState.isFanOnly = label.equipmentStatus === 'FAN';
     if (heatSetpoint != null) deviceState.heatSetpoint = heatSetpoint;
     if (coolSetpoint != null) deviceState.coolSetpoint = coolSetpoint;
@@ -911,12 +932,12 @@ async function handleTelemetryUpdate(deviceKey, tempF, tempC, humidity) {
     let paramIndex = 2;
 
     if (tempF !== null) {
-      updates.push(`last_temperature = $${paramIndex++}`);
+      updates.push(`last_temperature = ${paramIndex++}`);
       params.push(tempF);
     }
 
     if (humidity !== null) {
-      updates.push(`last_humidity = $${paramIndex++}`);
+      updates.push(`last_humidity = ${paramIndex++}`);
       params.push(humidity);
     }
 
