@@ -1,5 +1,4 @@
 'use strict';
-
 const { v4: uuidv4 } = require('uuid');
 const { getPool } = require('../database/db');
 const { postToCoreIngestAsync } = require('./ingestPoster');
@@ -9,6 +8,24 @@ const { buildCorePayload } = require('./buildCorePayload');
 // In-memory device state
 // ================================
 const deviceStateMemory = new Map();
+
+// ================================
+// Reachability check
+// ================================
+function checkDeviceReachability(prevState, nowMs) {
+  // If we've never seen an event, assume reachable
+  if (!prevState.lastEventTime) return true;
+  
+  // If event is more than 2 hours old, mark as unreachable
+  const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+  const timeSinceLastEvent = nowMs - prevState.lastEventTime;
+  
+  if (timeSinceLastEvent > TWO_HOURS_MS) {
+    return false;
+  }
+  
+  return true;
+}
 
 // =========================================
 // Handle Nest device updates
@@ -27,11 +44,34 @@ async function handleDeviceUpdate(normalized) {
     equipmentStatus,
     heatSetpoint,
     coolSetpoint,
+    outdoorTemperatureF,      // ✅ ADD
+    outdoorHumidity,          // ✅ ADD
+    pressureHpa,              // ✅ ADD
+    thermostatMode,           // ✅ ADD
+    isReachable,              // ✅ ADD (explicit from Nest API if available)
   } = normalized;
 
   const now = new Date();
   const nowMs = now.getTime();
-  const prevState = deviceStateMemory.get(deviceKey) || {};
+
+  const prevState = deviceStateMemory.get(deviceKey) || {
+    lastEventTime: null,
+    lastTempF: null,
+    lastHumidity: null,
+    lastIsActive: false,
+    lastEquipStatus: 'OFF',
+    lastPostTempAt: null,
+    isReachable: true,
+  };
+
+  // ✅ Check reachability
+  const calculatedReachable = checkDeviceReachability(prevState, nowMs);
+  const finalReachable = isReachable !== undefined ? isReachable : calculatedReachable;
+  
+  // ✅ Log reachability changes
+  if (prevState.isReachable !== finalReachable) {
+    console.log(`[Nest] Device ${deviceKey} reachability changed: ${prevState.isReachable} -> ${finalReachable}`);
+  }
 
   const MIN_TEMP_DELTA = 0.5; // °F
   const MIN_TIME_DELTA_MS = 15 * 60 * 1000; // 15 min
@@ -46,8 +86,8 @@ async function handleDeviceUpdate(normalized) {
 
   const shouldPostTempUpdate = tempChanged || timeExceeded;
 
-  // --- post temperature update while idle
-  if (shouldPostTempUpdate) {
+  // --- post temperature update while idle or if reachability changed
+  if (shouldPostTempUpdate || prevState.isReachable !== finalReachable) {
     const payload = buildCorePayload({
       deviceKey,
       userId,
@@ -58,22 +98,28 @@ async function handleDeviceUpdate(normalized) {
       connectionSource: 'nest',
       source: 'nest',
       sourceVendor: 'nest',
-      eventType: 'STATE_UPDATE',
+      eventType: prevState.isReachable !== finalReachable ? 'CONNECTIVITY_CHANGE' : 'Telemetry_Update',  // ✅ CHANGED
       equipmentStatus: equipmentStatus || 'OFF',
       previousStatus: prevState.lastEquipStatus || 'UNKNOWN',
-      isActive: false,
-      mode: 'off',
+      isActive: isActive || false,
+      isReachable: finalReachable,  // ✅ ADD
+      mode: thermostatMode || 'off',  // ✅ CHANGED
+      thermostatMode: thermostatMode || null,  // ✅ ADD
       runtimeSeconds: null,
+      runtimeType: 'UPDATE',  // ✅ ADD
       temperatureF: tempF,
       humidity,
       heatSetpoint,
       coolSetpoint,
+      outdoorTemperatureF,  // ✅ ADD
+      outdoorHumidity,      // ✅ ADD
+      pressureHpa,          // ✅ ADD
       observedAt: now,
       sourceEventId: uuidv4(),
       payloadRaw: normalized
     });
 
-    await postToCoreIngestAsync(payload, 'state-update');
+    await postToCoreIngestAsync(payload, prevState.isReachable !== finalReachable ? 'connectivity-change' : 'telemetry-update');
   }
 
   // --- persist latest state
@@ -83,6 +129,8 @@ async function handleDeviceUpdate(normalized) {
     lastIsActive: isActive,
     lastEquipStatus: equipmentStatus,
     lastPostTempAt: shouldPostTempUpdate ? nowMs : prevState.lastPostTempAt,
+    lastEventTime: nowMs,  // ✅ ADD
+    isReachable: finalReachable,  // ✅ ADD
   });
 }
 
@@ -101,6 +149,7 @@ async function recoverActiveSessions() {
   console.log('[runtimeTracker] ⚠️ Skipping active session recovery (not implemented)');
   return;
 }
+
 // =========================================
 // Unified export
 // =========================================
