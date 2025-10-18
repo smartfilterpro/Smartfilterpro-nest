@@ -878,4 +878,75 @@ async function updateRuntimeSession({
       WHERE session_id = $1
     `, [deviceState.sessionId, now, heatSetpoint, coolSetpoint]);
 
-    await pool
+    await pool.query(`
+      UPDATE device_status SET
+        current_equipment_status = $2,
+        last_heat_setpoint = COALESCE($3, last_heat_setpoint),
+        last_cool_setpoint = COALESCE($4, last_cool_setpoint),
+        updated_at = NOW()
+      WHERE device_key = $1
+    `, [deviceKey, label.equipmentStatus, heatSetpoint, coolSetpoint]);
+
+    // Update in-memory state
+    deviceState.currentEquipmentStatus = label.equipmentStatus;
+    deviceState.isHeating = label.equipmentStatus === 'HEATING';
+    deviceState.isCooling = label.equipmentStatus === 'COOLING';
+    deviceState.isFanOnly = label.equipmentStatus === 'FAN';
+    if (heatSetpoint != null) deviceState.heatSetpoint = heatSetpoint;
+    if (coolSetpoint != null) deviceState.coolSetpoint = coolSetpoint;
+
+    console.log('[runtimeTracker] Session tick persisted.');
+  } catch (error) {
+    console.error('[runtimeTracker] Error updating runtime session:', error);
+  }
+}
+
+async function handleTelemetryUpdate(deviceKey, tempF, tempC, humidity) {
+  const pool = getPool();
+  console.log('[runtimeTracker] handleTelemetryUpdate', { deviceKey, tempF, tempC, humidity });
+
+  try {
+    const updates = [];
+    const params = [deviceKey];
+    let paramIndex = 2;
+
+    if (tempF !== null) {
+      updates.push(`last_temperature = $${paramIndex++}`);
+      params.push(tempF);
+    }
+
+    if (humidity !== null) {
+      updates.push(`last_humidity = $${paramIndex++}`);
+      params.push(humidity);
+    }
+
+    if (updates.length > 0) {
+      updates.push('last_seen_at = NOW()');
+      updates.push('updated_at = NOW()');
+
+      await pool.query(`
+        UPDATE device_status SET ${updates.join(', ')}
+        WHERE device_key = $1
+      `, params);
+    }
+
+    if (tempF !== null) {
+      await pool.query(`
+        INSERT INTO temp_readings (device_key, temperature, units, event_type, session_id, recorded_at, created_at)
+        VALUES ($1, $2, 'F', 'temperature_update',
+                (SELECT session_id FROM runtime_sessions WHERE device_key = $1 AND ended_at IS NULL LIMIT 1),
+                NOW(), NOW())
+      `, [deviceKey, tempF]);
+    }
+
+    console.log('[runtimeTracker] Telemetry update persisted.');
+  } catch (error) {
+    console.error('[runtimeTracker] Error handling telemetry update:', error);
+  }
+}
+
+module.exports = {
+  handleDeviceEvent,
+  recoverActiveSessions,
+  activeDevices
+};
