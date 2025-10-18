@@ -3,7 +3,6 @@
 const { v4: uuidv4 } = require('uuid');
 const { getPool } = require('../database/db');
 const { postToCoreIngestAsync } = require('./ingestPoster');
-const { postToBubbleAsync } = require('./bubblePoster');
 const { buildCorePayload } = require('./buildCorePayload');
 
 // ================================
