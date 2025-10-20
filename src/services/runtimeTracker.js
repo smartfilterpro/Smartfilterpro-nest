@@ -32,7 +32,7 @@ function checkDeviceReachability(deviceState, nowMs) {
 // State Classification (8-State System)
 // ===========================
 function classifyEquipmentState(equipmentStatus, isFanTimerOn, hvacMode) {
-  const status = (equipmentStatus || 'IDLE').toUpperCase();
+  const status = (equipmentStatus || 'OFF').toUpperCase();
   
   let eventType;
   let finalEquipmentStatus;
@@ -78,8 +78,8 @@ function classifyEquipmentState(equipmentStatus, isFanTimerOn, hvacMode) {
     finalEquipmentStatus = 'FAN';
     isActive = true;
   } else {
-    eventType = 'Idle';              // ✅ Changed from 'Fan_off'
-    finalEquipmentStatus = 'IDLE';    // ✅ Changed from 'OFF'
+    eventType = 'Fan_off';
+    finalEquipmentStatus = 'OFF';
     isActive = false;
   }
 
@@ -415,7 +415,7 @@ async function handleDeviceEvent(eventData) {
     if (effectiveEquip === null) {
       console.log('DEBUG - Backfilling equipment status from DB...');
       const s = await getBackfillState(deviceKey);
-      effectiveEquip = s?.current_equipment_status || 'IDLE';
+      effectiveEquip = s?.current_equipment_status || 'OFF';
       console.log(`DEBUG - DB equipment_status: ${effectiveEquip}`);
       
       if (heatSetpoint == null) heatSetpoint = s?.last_heat_setpoint ?? null;
@@ -480,8 +480,8 @@ async function processRuntimeLogic({
 
   const currentState = activeDevices.get(deviceKey);
   const wasActive = !!currentState;
-  const prevEventType = currentState?.currentEventType || 'Idle';  // ✅ Changed from 'Fan_off'
-  const equipmentModeChanged = wasActive && (label.eventType !== currentState.currentEventType);
+  const prevEventType = currentState?.currentEquipmentStatus || 'OFF';
+  const modeChanged = wasActive && (label.eventType !== currentState.currentEventType);
 
   console.log('Equipment Status:', equipmentStatus);
   console.log('  - Event Type:', label.eventType);
@@ -492,18 +492,18 @@ async function processRuntimeLogic({
   console.log('\nACTIVITY DETERMINATION:');
   console.log('Should be active:', isActiveNow);
   console.log('Was active:', wasActive);
-  console.log('Equipment mode changed:', equipmentModeChanged);
+  console.log('Mode changed:', modeChanged);
   console.log('Previous event type:', currentState?.currentEventType || 'none');
 
   // Calculate runtime if transitioning
   let runtimeSeconds = null;
-  if ((equipmentModeChanged || (!isActiveNow && wasActive)) && currentState?.sessionStartedAt) {
+  if ((modeChanged || (!isActiveNow && wasActive)) && currentState?.sessionStartedAt) {
     runtimeSeconds = Math.max(0, Math.round((nowMs - currentState.sessionStartedAt.getTime()) / 1000));
     console.log(`[RUNTIME] Calculated: ${runtimeSeconds}s`);
   }
 
-  // Session START (inactive → active)
   if (isActiveNow && !wasActive) {
+    // START event
     console.log('\nACTION: START NEW RUNTIME SESSION');
     await startRuntimeSession({
       deviceKey, userId, deviceName,
@@ -517,17 +517,16 @@ async function processRuntimeLogic({
       serialNumber,
       isReachable,
       eventData,
-      now,
-      prevEventType
+      now
     });
 
-  // Session END (active → inactive)
   } else if (!isActiveNow && wasActive) {
+    // END event
     console.log('\nACTION: END RUNTIME SESSION');
     await endRuntimeSession({
       deviceKey, userId, deviceName,
       label,
-      previousStatus: prevEventType,
+      previousStatus: currentState.currentEventType,
       runtimeSeconds,
       temperatureF,
       humidity,
@@ -541,13 +540,13 @@ async function processRuntimeLogic({
       now
     });
 
-  // MODE SWITCH (equipment changes while active: Heating → Cooling, etc.)
-  } else if (isActiveNow && equipmentModeChanged) {
+  } else if (isActiveNow && modeChanged) {
+    // MODE SWITCH event (e.g., Heating -> Cooling or Heating -> AuxHeat)
     console.log('\nACTION: MODE SWITCH');
     await modeSwitchSession({
       deviceKey, userId, deviceName,
       label,
-      previousStatus: prevEventType,
+      previousStatus: currentState.currentEventType,
       runtimeSeconds,
       thermostatMode,
       heatSetpoint,
@@ -562,8 +561,8 @@ async function processRuntimeLogic({
       nowMs
     });
 
-  // UPDATE existing session (no state change)
   } else if (isActiveNow && wasActive) {
+    // UPDATE existing session
     console.log('\nACTION: UPDATE EXISTING SESSION (still active)');
     const elapsed = Math.floor((nowMs - currentState.sessionStartedAt.getTime()) / 1000);
     console.log(`  Session has been running for ${elapsed} seconds`);
@@ -575,8 +574,8 @@ async function processRuntimeLogic({
       now
     });
 
-  // TELEMETRY UPDATE (idle, no state change)
   } else {
+    // TELEMETRY UPDATE (idle)
     console.log('\nACTION: TELEMETRY UPDATE (system idle)');
     
     const backfill = await getBackfillState(deviceKey);
@@ -590,10 +589,7 @@ async function processRuntimeLogic({
         deviceName,
         firmwareVersion,
         serialNumber,
-        label: { 
-          eventType: 'Telemetry_Update',     // ✅ Type of event
-          equipmentStatus: 'IDLE'            // ✅ Current state
-        },
+        label: { eventType: 'Telemetry_Update', equipmentStatus: 'OFF' },
         previousStatus: prevEventType,
         isActive: false,
         isReachable,
@@ -631,8 +627,7 @@ async function startRuntimeSession({
   serialNumber,
   isReachable,
   eventData,
-  now,
-  prevEventType
+  now
 }) {
   const pool = getPool();
   const sessionId = uuidv4();
@@ -687,18 +682,15 @@ async function startRuntimeSession({
     isReachable
   });
 
-  // Post to Core with Mode_Change
+  // Post to Core
   await postCoreEvent({
     deviceKey,
     userId,
     deviceName,
     firmwareVersion,
     serialNumber,
-    label: {
-      eventType: 'Mode_Change',           // ✅ Event type
-      equipmentStatus: label.equipmentStatus  // ✅ Current state
-    },
-    previousStatus: prevEventType,
+    label,
+    previousStatus: 'OFF',
     isActive: true,
     isReachable,
     runtimeSeconds: undefined,
@@ -751,29 +743,26 @@ async function endRuntimeSession({
     WHERE session_id = $1
   `, [deviceState.sessionId, now, runtimeSeconds]);
 
-  // Update device_status → IDLE snapshot
+  // Update device_status → OFF snapshot
   await pool.query(`
     UPDATE device_status SET
       is_running = FALSE,
       session_started_at = NULL,
       last_equipment_status = current_equipment_status,
-      current_equipment_status = 'IDLE',
-      current_mode = 'idle',
+      current_equipment_status = 'OFF',
+      current_mode = 'off',
       updated_at = $2
     WHERE device_key = $1
   `, [deviceKey, now]);
 
-  // Post to Core with Mode_Change
+  // Post to Core
   await postCoreEvent({
     deviceKey,
     userId,
     deviceName,
     firmwareVersion,
     serialNumber,
-    label: { 
-      eventType: 'Mode_Change',     // ✅ Event type
-      equipmentStatus: 'IDLE'       // ✅ Current state
-    },
+    label: { eventType: 'Fan_off', equipmentStatus: 'OFF' },
     previousStatus,
     isActive: false,
     isReachable,
@@ -860,17 +849,14 @@ async function modeSwitchSession({
   deviceState.isFanOnly = label.equipmentStatus === 'FAN';
   deviceState.lastEventTime = nowMs;
 
-  // Post to Core with Mode_Change
+  // Post to Core
   await postCoreEvent({
     deviceKey,
     userId,
     deviceName,
     firmwareVersion,
     serialNumber,
-    label: {
-      eventType: 'Mode_Change',           // ✅ Event type
-      equipmentStatus: label.equipmentStatus  // ✅ New state
-    },
+    label,
     previousStatus,
     isActive: true,
     isReachable,
