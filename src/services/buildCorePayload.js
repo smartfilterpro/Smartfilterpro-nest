@@ -39,9 +39,9 @@ function buildCorePayload({
 }) {
   const temperatureC = typeof temperatureF === 'number' ? Math.round(((temperatureF - 32) * 5 / 9) * 100) / 100 : null;
   const iso = (observedAt || new Date()).toISOString();
-  const isCooling = equipmentStatus === 'COOLING' || equipmentStatus === 'COOLING_FAN';
-  const isHeating = equipmentStatus === 'HEATING' || equipmentStatus === 'HEATING_FAN' || equipmentStatus === 'AUX_HEATING' || equipmentStatus === 'AUX_HEATING_FAN';
-  const isFanOnly = equipmentStatus === 'FAN';
+  const isCooling = equipmentStatus === 'Ccooling' || equipmentStatus === 'Cooling_Fan';
+  const isHeating = equipmentStatus === 'Heating' || equipmentStatus === 'Heating_Fan' || equipmentStatus === 'Aux_Heating' || equipmentStatus === 'Auc_Heating_Fam';
+  const isFanOnly = equipmentStatus === 'Fan_only';
 
   const payload = {
     device_key: deviceKey,
@@ -62,7 +62,7 @@ function buildCorePayload({
     last_is_cooling: isCooling,
     last_is_heating: isHeating,
     last_is_fan_only: isFanOnly,
-    last_equipment_status: equipmentStatus || 'IDLE',
+    last_equipment_status: equipmentStatus || 'Idle',
     is_reachable: isReachable !== undefined ? !!isReachable : true,
     last_temperature: temperatureF ?? null,
     temperature_f: temperatureF ?? null,
@@ -79,7 +79,7 @@ function buildCorePayload({
     pressure_hpa: pressureHpa ?? null,
     event_type: eventType || 'Unknown',
     is_active: !!isActive,
-    equipment_status: equipmentStatus || 'IDLE',
+    equipment_status: equipmentStatus || 'Idle',
     previous_status: previousStatus || 'UNKNOWN',
     runtime_seconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null,
     runtime_type: runtimeType || 'UPDATE',
