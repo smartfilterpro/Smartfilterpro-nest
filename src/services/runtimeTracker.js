@@ -469,7 +469,7 @@ async function handleDeviceEvent(eventData) {
     console.log(`  Active: ${isActiveNow} (was: ${wasActive})`);
     console.log(`  Equipment: ${mem.equipmentStatus}, Fan: ${mem.isFanTimerOn}`);
     console.log(`  Mode: ${mem.thermostatMode} -> ${mem.thermostatModeMapped || mapNestModeToStandard(mem.thermostatMode)}`);
-    console.log(`  Changes: hvac=${hvacChanged}, fan=${fanChanged}, mode=${modeChanged}, telemetry=${telemetryChanged}`);
+    console.log(`  Changes: hvac=${hvacChanged}, fan=${fanChanged}, mode=${modeChanged}, telemetry=${telemetryChanged}, setpoint=${setpointChanged}`);
 
     // Calculate runtime if transitioning
     let runtimeSeconds = null;
@@ -564,7 +564,11 @@ async function handleDeviceEvent(eventData) {
       // IDLE - Telemetry updates while equipment is off
       const timeExceeded = (nowMs - mem.lastTelemetryPost) >= 15 * 60 * 1000; // 15 min
       
-      if (telemetryChanged && timeExceeded) {
+      // ✅ Post immediately for setpoint/mode changes (user actions)
+      // ✅ Rate-limit temperature/humidity updates (15 min)
+      const shouldPost = (setpointChanged || modeChanged) || (telemetryChanged && timeExceeded);
+      
+      if (shouldPost) {
         console.log('[ACTION] TELEMETRY UPDATE (idle)');
         await postCoreEvent({
           deviceKey, userId, deviceName,
