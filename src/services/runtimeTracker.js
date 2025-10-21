@@ -144,7 +144,7 @@ async function handleDeviceEvent(eventData) {
     let mem = deviceMemory.get(deviceKey);
     if (!mem) {
       console.log('[runtimeTracker] Initializing new device memory for ' + deviceKey);
-      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'Idle', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'IDLE', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
+      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'Idle', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'Idle', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
       deviceMemory.set(deviceKey, mem);
     }
 
@@ -290,7 +290,7 @@ async function handleDeviceEvent(eventData) {
       const shouldPost = (setpointChanged || modeChanged) || (telemetryChanged && timeExceeded);
       if (shouldPost) {
         console.log('[ACTION] TELEMETRY UPDATE (idle)');
-        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: 'IDLE', previousStatus: prevStateLabel, isActive: false, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
+        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: 'Idle', previousStatus: prevStateLabel, isActive: false, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
         mem.lastTelemetryPost = nowMs;
       }
     }
@@ -320,11 +320,11 @@ async function endRuntimeSession(params) {
   const pool = getPool();
   console.log('[SESSION END] ' + params.deviceKey + ' -> ' + params.state.stateLabel + ', runtime=' + params.runtimeSeconds + 's');
   await pool.query('UPDATE runtime_sessions SET ended_at = $2, duration_seconds = $3, updated_at = $2 WHERE session_id = $1', [params.mem.sessionId, params.now, params.runtimeSeconds]);
-  await pool.query('UPDATE device_status SET is_running = FALSE, session_started_at = NULL, last_equipment_status = current_equipment_status, current_equipment_status = $2, current_mode = $3, updated_at = $4 WHERE device_key = $1', [params.deviceKey, 'IDLE', 'off', params.now]);
+  await pool.query('UPDATE device_status SET is_running = FALSE, session_started_at = NULL, last_equipment_status = current_equipment_status, current_equipment_status = $2, current_mode = $3, updated_at = $4 WHERE device_key = $1', [params.deviceKey, 'Idle', 'off', params.now]);
   params.mem.running = false;
   params.mem.sessionId = null;
   params.mem.sessionStartedAt = null;
-  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: 'IDLE', previousStatus: params.previousStatus, isActive: false, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
+  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: 'Idle', previousStatus: params.previousStatus, isActive: false, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
 }
 
 async function modeSwitchSession(params) {
