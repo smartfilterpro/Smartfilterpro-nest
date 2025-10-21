@@ -9,31 +9,19 @@ const { buildCorePayload } = require('./buildCorePayload');
 // In-memory state manager (like Resideo)
 // ===========================
 const deviceMemory = new Map();
-// deviceKey -> {
-//   deviceKey, frontendId, deviceName,
-//   // Equipment state
-//   equipmentStatus: 'HEATING'|'COOLING'|'OFF'|'AUX_HEATING',
-//   isFanTimerOn: boolean,
-//   thermostatMode: 'HEAT'|'COOL'|'HEATCOOL'|'OFF',
-//   // Runtime tracking
-//   running: boolean,
-//   sessionId: string,
-//   sessionStartedAt: Date,
-//   currentEventType: string,
-//   currentEquipmentStatus: string,
-//   // Telemetry
-//   lastTemperatureF: number,
-//   lastTemperatureC: number,
-//   lastHumidity: number,
-//   lastHeatSetpoint: number,
-//   lastCoolSetpoint: number,
-//   // Metadata
-//   lastEventTime: number,
-//   isReachable: boolean,
-//   firmwareVersion: string,
-//   serialNumber: string,
-//   lastTelemetryPost: number
-// }
+
+// ===========================
+// Mode Mapping
+// ===========================
+function mapNestModeToStandard(nestMode) {
+  const modeMap = {
+    'HEAT': 'heat',
+    'COOL': 'cool',
+    'HEATCOOL': 'auto',  // ✅ FIXED: Map HEATCOOL to auto
+    'OFF': 'off'
+  };
+  return modeMap[nestMode] || (nestMode || 'off').toLowerCase();
+}
 
 // ===========================
 // Reachability Check
@@ -47,12 +35,13 @@ function checkDeviceReachability(mem, nowMs) {
 
 // ===========================
 // State Classification (8-State System)
+// Returns equipment state, NOT event type
 // ===========================
 function classifyCurrentState(mem) {
   const equipmentStatus = mem.equipmentStatus || 'OFF';
   const isFanTimerOn = mem.isFanTimerOn || false;
   
-  let eventType;
+  let stateLabel;
   let finalEquipmentStatus;
   let isActive;
 
@@ -61,45 +50,45 @@ function classifyCurrentState(mem) {
 
   if (isAuxHeat) {
     if (isFanTimerOn) {
-      eventType = 'AuxHeat_Fan';
+      stateLabel = 'AuxHeat_Fan';
       finalEquipmentStatus = 'AUX_HEATING';
       isActive = true;
     } else {
-      eventType = 'AuxHeat';
+      stateLabel = 'AuxHeat';
       finalEquipmentStatus = 'AUX_HEATING';
       isActive = true;
     }
   } else if (equipmentStatus === 'HEATING') {
     if (isFanTimerOn) {
-      eventType = 'Heating_Fan';
+      stateLabel = 'Heating_Fan';
       finalEquipmentStatus = 'HEATING';
       isActive = true;
     } else {
-      eventType = 'Heating';
+      stateLabel = 'Heating';
       finalEquipmentStatus = 'HEATING';
       isActive = true;
     }
   } else if (equipmentStatus === 'COOLING') {
     if (isFanTimerOn) {
-      eventType = 'Cooling_Fan';
+      stateLabel = 'Cooling_Fan';
       finalEquipmentStatus = 'COOLING';
       isActive = true;
     } else {
-      eventType = 'Cooling';
+      stateLabel = 'Cooling';
       finalEquipmentStatus = 'COOLING';
       isActive = true;
     }
   } else if (isFanTimerOn) {
-    eventType = 'Fan_only';
+    stateLabel = 'Fan_only';
     finalEquipmentStatus = 'FAN';
     isActive = true;
   } else {
-    eventType = 'Fan_off';
+    stateLabel = 'Fan_off';
     finalEquipmentStatus = 'OFF';
     isActive = false;
   }
 
-  return { eventType, equipmentStatus: finalEquipmentStatus, isActive };
+  return { stateLabel, equipmentStatus: finalEquipmentStatus, isActive };
 }
 
 // ===========================
@@ -164,9 +153,9 @@ async function recoverActiveSessions() {
         running: true,
         sessionId: row.session_id || uuidv4(),
         sessionStartedAt: new Date(row.session_started_at),
-        currentEventType: row.current_equipment_status === 'HEATING' ? 'Heating' : 
-                         row.current_equipment_status === 'COOLING' ? 'Cooling' :
-                         row.current_equipment_status === 'FAN' ? 'Fan_only' : 'Fan_off',
+        currentStateLabel: row.current_equipment_status === 'HEATING' ? 'Heating' : 
+                          row.current_equipment_status === 'COOLING' ? 'Cooling' :
+                          row.current_equipment_status === 'FAN' ? 'Fan_only' : 'Fan_off',
         currentEquipmentStatus: row.current_equipment_status,
         lastTemperatureF: row.last_temperature,
         lastTemperatureC: row.last_temperature ? (row.last_temperature - 32) * 5 / 9 : null,
@@ -238,7 +227,8 @@ async function postCoreEvent({
   deviceName,
   firmwareVersion,
   serialNumber,
-  label,
+  eventType,           // ✅ FIXED: This is the EVENT TYPE (Mode_Change, Telemetry_Update)
+  equipmentStatus,     // ✅ FIXED: This is the EQUIPMENT STATUS (HEATING, COOLING, OFF, FAN)
   previousStatus,
   isActive,
   isReachable,
@@ -270,13 +260,13 @@ async function postCoreEvent({
     connectionSource: 'nest',
     source: 'nest',
     sourceVendor: 'nest',
-    eventType: label.eventType,
-    equipmentStatus: label.equipmentStatus,
+    eventType,              // ✅ Mode_Change or Telemetry_Update
+    equipmentStatus,        // ✅ HEATING, COOLING, OFF, FAN
     previousStatus: previousStatus || 'UNKNOWN',
     isActive: !!isActive,
     isReachable: isReachable !== undefined ? !!isReachable : true,
-    mode: thermostatMode || label.eventType.toLowerCase(),
-    thermostatMode: thermostatMode || null,
+    mode: thermostatMode || equipmentStatus.toLowerCase(),
+    thermostatMode,         // ✅ Pass actual mode (heat, cool, auto, off)
     runtimeSeconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null,
     runtimeType,
     temperatureF,
@@ -284,7 +274,7 @@ async function postCoreEvent({
     heatSetpoint,
     coolSetpoint,
     observedAt: observedAt || new Date(),
-    sourceEventId: sourceEventId || uuidv4(),
+    sourceEventId: sourceEventId || uuidv4(),  // ✅ FIXED: Always unique
     payloadRaw: eventData
   });
 
@@ -292,7 +282,7 @@ async function postCoreEvent({
                     runtimeSeconds === null ? 'UPDATE' : 
                     `${runtimeSeconds}s`;
 
-  console.log(`[CORE POST] ${deviceKey} -> ${label.eventType} (${runtimeType}) runtime=${rtDisplay} eq=${label.equipmentStatus} prev=${previousStatus} reachable=${isReachable}`);
+  console.log(`[CORE POST] ${deviceKey} -> ${eventType} (${runtimeType}) runtime=${rtDisplay} eq=${equipmentStatus} prev=${previousStatus} reachable=${isReachable}`);
   
   await postToCoreIngestAsync(payload, runtimeType.toLowerCase());
 }
@@ -301,8 +291,6 @@ async function postCoreEvent({
 // Main Event Handler
 // ===========================
 async function handleDeviceEvent(eventData) {
-  const pool = getPool();
-
   try {
     const now = new Date();
     const nowMs = now.getTime();
@@ -333,7 +321,7 @@ async function handleDeviceEvent(eventData) {
         running: false,
         sessionId: null,
         sessionStartedAt: null,
-        currentEventType: 'Fan_off',
+        currentStateLabel: 'Fan_off',
         currentEquipmentStatus: 'OFF',
         lastTemperatureF: null,
         lastTemperatureC: null,
@@ -415,10 +403,12 @@ async function handleDeviceEvent(eventData) {
 
     // Update thermostat mode
     if (tMode && tMode.mode) {
-      const newMode = tMode.mode; // HEAT, COOL, HEATCOOL, OFF
-      if (mem.thermostatMode !== newMode) {
-        console.log(`[MODE] ${deviceKey} mode: ${mem.thermostatMode} -> ${newMode}`);
-        mem.thermostatMode = newMode;
+      const rawMode = tMode.mode; // HEAT, COOL, HEATCOOL, OFF
+      const mappedMode = mapNestModeToStandard(rawMode);
+      if (mem.thermostatMode !== rawMode) {
+        console.log(`[MODE] ${deviceKey} mode: ${mem.thermostatMode} -> ${rawMode} (mapped: ${mappedMode})`);
+        mem.thermostatMode = rawMode;
+        mem.thermostatModeMapped = mappedMode;
         modeChanged = true;
       }
     }
@@ -466,23 +456,24 @@ async function handleDeviceEvent(eventData) {
     }
 
     // Classify current state using 8-state system
-    const label = classifyCurrentState(mem);
-    const isActiveNow = label.isActive;
+    const state = classifyCurrentState(mem);
+    const isActiveNow = state.isActive;
 
     const wasActive = mem.running;
-    const prevEventType = mem.currentEventType;
-    const equipmentModeChanged = label.eventType !== prevEventType;
+    const prevStateLabel = mem.currentStateLabel;
+    const stateLabelChanged = state.stateLabel !== prevStateLabel;
 
     console.log(`\n[STATE] ${deviceKey}:`);
-    console.log(`  Current: ${label.eventType} (${label.equipmentStatus})`);
-    console.log(`  Previous: ${prevEventType} (${mem.currentEquipmentStatus})`);
+    console.log(`  Current: ${state.stateLabel} (${state.equipmentStatus})`);
+    console.log(`  Previous: ${prevStateLabel} (${mem.currentEquipmentStatus})`);
     console.log(`  Active: ${isActiveNow} (was: ${wasActive})`);
     console.log(`  Equipment: ${mem.equipmentStatus}, Fan: ${mem.isFanTimerOn}`);
+    console.log(`  Mode: ${mem.thermostatMode} -> ${mem.thermostatModeMapped || mapNestModeToStandard(mem.thermostatMode)}`);
     console.log(`  Changes: hvac=${hvacChanged}, fan=${fanChanged}, mode=${modeChanged}, telemetry=${telemetryChanged}`);
 
     // Calculate runtime if transitioning
     let runtimeSeconds = null;
-    if ((equipmentModeChanged || (!isActiveNow && wasActive)) && mem.sessionStartedAt) {
+    if ((stateLabelChanged || (!isActiveNow && wasActive)) && mem.sessionStartedAt) {
       runtimeSeconds = Math.max(0, Math.round((nowMs - mem.sessionStartedAt.getTime()) / 1000));
       console.log(`[RUNTIME] Calculated: ${runtimeSeconds}s`);
     }
@@ -490,45 +481,49 @@ async function handleDeviceEvent(eventData) {
     // Determine if this is a state-changing event
     const isStateChangingEvent = hvacChanged || fanChanged;
 
+    // Get mapped mode for posting
+    const mappedMode = mem.thermostatModeMapped || mapNestModeToStandard(mem.thermostatMode);
+
     // Process runtime logic
     if (isActiveNow && !wasActive) {
       // START event
       console.log('[ACTION] START NEW RUNTIME SESSION');
       await startRuntimeSession({
-        deviceKey, userId, deviceName, mem, label, now, nowMs, eventData
+        deviceKey, userId, deviceName, mem, state, mappedMode, now, nowMs, eventData
       });
 
     } else if (!isActiveNow && wasActive) {
       // END event
       console.log('[ACTION] END RUNTIME SESSION');
       await endRuntimeSession({
-        deviceKey, userId, deviceName, mem, label, 
-        previousStatus: prevEventType, runtimeSeconds, now, eventData
+        deviceKey, userId, deviceName, mem, state, 
+        previousStatus: prevStateLabel, runtimeSeconds, mappedMode, now, eventData
       });
 
-    } else if (isActiveNow && equipmentModeChanged) {
+    } else if (isActiveNow && stateLabelChanged) {
       // MODE SWITCH event (e.g., Heating -> Cooling or Heating -> Heating_Fan)
       console.log('[ACTION] MODE SWITCH');
       await modeSwitchSession({
-        deviceKey, userId, deviceName, mem, label, 
-        previousStatus: prevEventType, runtimeSeconds, now, nowMs, eventData
+        deviceKey, userId, deviceName, mem, state, 
+        previousStatus: prevStateLabel, runtimeSeconds, mappedMode, now, nowMs, eventData
       });
 
     } else if (isActiveNow && wasActive) {
       // UPDATE existing session
+      await updateRuntimeSession({
+        deviceKey, mem, state, now
+      });
+
       if (isStateChangingEvent) {
-        console.log('[ACTION] UPDATE SESSION (state change)');
-        await updateRuntimeSession({
-          deviceKey, mem, label, now
-        });
-        
+        console.log('[ACTION] STATE CHANGE UPDATE (active)');
         // Post Mode_Change for state changes
         await postCoreEvent({
           deviceKey, userId, deviceName,
           firmwareVersion: mem.firmwareVersion,
           serialNumber: mem.serialNumber,
-          label: { eventType: 'Mode_Change', equipmentStatus: label.equipmentStatus },
-          previousStatus: prevEventType,
+          eventType: 'Mode_Change',              // ✅ Event type
+          equipmentStatus: state.equipmentStatus, // ✅ Equipment status
+          previousStatus: prevStateLabel,
           isActive: true,
           isReachable,
           runtimeSeconds: null,
@@ -536,24 +531,21 @@ async function handleDeviceEvent(eventData) {
           humidity: mem.lastHumidity,
           heatSetpoint: mem.lastHeatSetpoint,
           coolSetpoint: mem.lastCoolSetpoint,
-          thermostatMode: mem.thermostatMode,
+          thermostatMode: mappedMode,
           observedAt: now,
-          sourceEventId: mem.sessionId,
+          sourceEventId: uuidv4(),  // ✅ Unique ID
           eventData
         });
       } else if (telemetryChanged || setpointChanged || modeChanged) {
         console.log('[ACTION] TELEMETRY UPDATE (active)');
-        await updateRuntimeSession({
-          deviceKey, mem, label, now
-        });
-        
         // Post Telemetry_Update
         await postCoreEvent({
           deviceKey, userId, deviceName,
           firmwareVersion: mem.firmwareVersion,
           serialNumber: mem.serialNumber,
-          label: { eventType: 'Telemetry_Update', equipmentStatus: label.equipmentStatus },
-          previousStatus: prevEventType,
+          eventType: 'Telemetry_Update',         // ✅ Event type
+          equipmentStatus: state.equipmentStatus, // ✅ Equipment status
+          previousStatus: prevStateLabel,
           isActive: true,
           isReachable,
           runtimeSeconds: null,
@@ -561,9 +553,9 @@ async function handleDeviceEvent(eventData) {
           humidity: mem.lastHumidity,
           heatSetpoint: mem.lastHeatSetpoint,
           coolSetpoint: mem.lastCoolSetpoint,
-          thermostatMode: mem.thermostatMode,
+          thermostatMode: mappedMode,
           observedAt: now,
-          sourceEventId: mem.sessionId,
+          sourceEventId: uuidv4(),  // ✅ Unique ID
           eventData
         });
       }
@@ -578,8 +570,9 @@ async function handleDeviceEvent(eventData) {
           deviceKey, userId, deviceName,
           firmwareVersion: mem.firmwareVersion,
           serialNumber: mem.serialNumber,
-          label: { eventType: 'Telemetry_Update', equipmentStatus: 'OFF' },
-          previousStatus: prevEventType,
+          eventType: 'Telemetry_Update',  // ✅ Event type
+          equipmentStatus: 'OFF',          // ✅ Equipment status
+          previousStatus: prevStateLabel,
           isActive: false,
           isReachable,
           runtimeSeconds: null,
@@ -587,9 +580,9 @@ async function handleDeviceEvent(eventData) {
           humidity: mem.lastHumidity,
           heatSetpoint: mem.lastHeatSetpoint,
           coolSetpoint: mem.lastCoolSetpoint,
-          thermostatMode: mem.thermostatMode,
+          thermostatMode: mappedMode,
           observedAt: now,
-          sourceEventId: uuidv4(),
+          sourceEventId: uuidv4(),  // ✅ Unique ID
           eventData
         });
         mem.lastTelemetryPost = nowMs;
@@ -597,23 +590,24 @@ async function handleDeviceEvent(eventData) {
     }
 
     // Update memory with new state
-    mem.currentEventType = label.eventType;
-    mem.currentEquipmentStatus = label.equipmentStatus;
+    mem.currentStateLabel = state.stateLabel;
+    mem.currentEquipmentStatus = state.equipmentStatus;
 
   } catch (error) {
     console.error('[runtimeTracker] Error handling device event:', error);
+    console.error(error.stack);
   }
 }
 
 // ===========================
 // Session Management Functions
 // ===========================
-async function startRuntimeSession({ deviceKey, userId, deviceName, mem, label, now, nowMs, eventData }) {
+async function startRuntimeSession({ deviceKey, userId, deviceName, mem, state, mappedMode, now, nowMs, eventData }) {
   const pool = getPool();
   const sessionId = uuidv4();
-  const mode = label.eventType.toLowerCase();
+  const mode = state.stateLabel.toLowerCase();
 
-  console.log(`[SESSION START] ${deviceKey} -> ${label.eventType}`);
+  console.log(`[SESSION START] ${deviceKey} -> ${state.stateLabel}`);
 
   // Create runtime session
   await pool.query(`
@@ -622,7 +616,7 @@ async function startRuntimeSession({ deviceKey, userId, deviceName, mem, label, 
       started_at, start_temperature, heat_setpoint, cool_setpoint,
       tick_count, last_tick_at, created_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$5,NOW())
-  `, [deviceKey, sessionId, mode, label.equipmentStatus, now, 
+  `, [deviceKey, sessionId, mode, state.equipmentStatus, now, 
       mem.lastTemperatureF, mem.lastHeatSetpoint, mem.lastCoolSetpoint]);
 
   // Update device_status
@@ -636,7 +630,7 @@ async function startRuntimeSession({ deviceKey, userId, deviceName, mem, label, 
       last_cool_setpoint = COALESCE($6, last_cool_setpoint),
       updated_at = $2
     WHERE device_key = $1
-  `, [deviceKey, now, mode, label.equipmentStatus, mem.lastHeatSetpoint, mem.lastCoolSetpoint]);
+  `, [deviceKey, now, mode, state.equipmentStatus, mem.lastHeatSetpoint, mem.lastCoolSetpoint]);
 
   // Update memory
   mem.running = true;
@@ -648,7 +642,8 @@ async function startRuntimeSession({ deviceKey, userId, deviceName, mem, label, 
     deviceKey, userId, deviceName,
     firmwareVersion: mem.firmwareVersion,
     serialNumber: mem.serialNumber,
-    label,
+    eventType: 'Mode_Change',              // ✅ Event type
+    equipmentStatus: state.equipmentStatus, // ✅ Equipment status
     previousStatus: 'OFF',
     isActive: true,
     isReachable: mem.isReachable,
@@ -657,17 +652,17 @@ async function startRuntimeSession({ deviceKey, userId, deviceName, mem, label, 
     humidity: mem.lastHumidity,
     heatSetpoint: mem.lastHeatSetpoint,
     coolSetpoint: mem.lastCoolSetpoint,
-    thermostatMode: mem.thermostatMode,
+    thermostatMode: mappedMode,
     observedAt: now,
-    sourceEventId: sessionId,
+    sourceEventId: uuidv4(),  // ✅ Unique ID
     eventData
   });
 }
 
-async function endRuntimeSession({ deviceKey, userId, deviceName, mem, label, previousStatus, runtimeSeconds, now, eventData }) {
+async function endRuntimeSession({ deviceKey, userId, deviceName, mem, state, previousStatus, runtimeSeconds, mappedMode, now, eventData }) {
   const pool = getPool();
 
-  console.log(`[SESSION END] ${deviceKey} -> ${label.eventType}, runtime=${runtimeSeconds}s`);
+  console.log(`[SESSION END] ${deviceKey} -> ${state.stateLabel}, runtime=${runtimeSeconds}s`);
 
   // Update runtime session
   await pool.query(`
@@ -692,36 +687,38 @@ async function endRuntimeSession({ deviceKey, userId, deviceName, mem, label, pr
 
   // Update memory
   mem.running = false;
+  const oldSessionId = mem.sessionId;
   mem.sessionId = null;
   mem.sessionStartedAt = null;
 
-  // Post to Core
+  // Post to Core with runtime
   await postCoreEvent({
     deviceKey, userId, deviceName,
     firmwareVersion: mem.firmwareVersion,
     serialNumber: mem.serialNumber,
-    label: { eventType: 'Fan_off', equipmentStatus: 'OFF' },
+    eventType: 'Mode_Change',       // ✅ Event type
+    equipmentStatus: 'OFF',         // ✅ Equipment status (now OFF)
     previousStatus,
     isActive: false,
     isReachable: mem.isReachable,
-    runtimeSeconds,
+    runtimeSeconds,                 // ✅ Include runtime
     temperatureF: mem.lastTemperatureF,
     humidity: mem.lastHumidity,
     heatSetpoint: mem.lastHeatSetpoint,
     coolSetpoint: mem.lastCoolSetpoint,
-    thermostatMode: mem.thermostatMode,
+    thermostatMode: mappedMode,
     observedAt: now,
-    sourceEventId: mem.sessionId || uuidv4(),
+    sourceEventId: uuidv4(),        // ✅ Unique ID (not oldSessionId)
     eventData
   });
 }
 
-async function modeSwitchSession({ deviceKey, userId, deviceName, mem, label, previousStatus, runtimeSeconds, now, nowMs, eventData }) {
+async function modeSwitchSession({ deviceKey, userId, deviceName, mem, state, previousStatus, runtimeSeconds, mappedMode, now, nowMs, eventData }) {
   const pool = getPool();
   const oldSessionId = mem.sessionId;
   const newSessionId = uuidv4();
 
-  console.log(`[MODE SWITCH] ${deviceKey} ${previousStatus} -> ${label.eventType}, runtime=${runtimeSeconds}s`);
+  console.log(`[MODE SWITCH] ${deviceKey} ${previousStatus} -> ${state.stateLabel}, runtime=${runtimeSeconds}s`);
 
   // End old session
   await pool.query(`
@@ -733,14 +730,14 @@ async function modeSwitchSession({ deviceKey, userId, deviceName, mem, label, pr
   `, [oldSessionId, now, runtimeSeconds]);
 
   // Start new session
-  const mode = label.eventType.toLowerCase();
+  const mode = state.stateLabel.toLowerCase();
   await pool.query(`
     INSERT INTO runtime_sessions (
       device_key, session_id, mode, equipment_status,
       started_at, start_temperature, heat_setpoint, cool_setpoint,
       tick_count, last_tick_at, created_at
     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$5,NOW())
-  `, [deviceKey, newSessionId, mode, label.equipmentStatus, now, 
+  `, [deviceKey, newSessionId, mode, state.equipmentStatus, now, 
       mem.lastTemperatureF, mem.lastHeatSetpoint, mem.lastCoolSetpoint]);
 
   // Update device_status
@@ -751,34 +748,35 @@ async function modeSwitchSession({ deviceKey, userId, deviceName, mem, label, pr
       session_started_at = $4,
       updated_at = $4
     WHERE device_key = $1
-  `, [deviceKey, mode, label.equipmentStatus, now]);
+  `, [deviceKey, mode, state.equipmentStatus, now]);
 
   // Update memory
   mem.sessionId = newSessionId;
   mem.sessionStartedAt = now;
 
-  // Post to Core
+  // Post to Core with runtime from old session
   await postCoreEvent({
     deviceKey, userId, deviceName,
     firmwareVersion: mem.firmwareVersion,
     serialNumber: mem.serialNumber,
-    label,
+    eventType: 'Mode_Change',              // ✅ Event type
+    equipmentStatus: state.equipmentStatus, // ✅ New equipment status
     previousStatus,
     isActive: true,
     isReachable: mem.isReachable,
-    runtimeSeconds,
+    runtimeSeconds,                        // ✅ Runtime from old session
     temperatureF: mem.lastTemperatureF,
     humidity: mem.lastHumidity,
     heatSetpoint: mem.lastHeatSetpoint,
     coolSetpoint: mem.lastCoolSetpoint,
-    thermostatMode: mem.thermostatMode,
+    thermostatMode: mappedMode,
     observedAt: now,
-    sourceEventId: newSessionId,
+    sourceEventId: uuidv4(),  // ✅ Unique ID
     eventData
   });
 }
 
-async function updateRuntimeSession({ deviceKey, mem, label, now }) {
+async function updateRuntimeSession({ deviceKey, mem, state, now }) {
   const pool = getPool();
 
   try {
@@ -799,7 +797,7 @@ async function updateRuntimeSession({ deviceKey, mem, label, now }) {
         last_cool_setpoint = COALESCE($4, last_cool_setpoint),
         updated_at = NOW()
       WHERE device_key = $1
-    `, [deviceKey, label.equipmentStatus, mem.lastHeatSetpoint, mem.lastCoolSetpoint]);
+    `, [deviceKey, state.equipmentStatus, mem.lastHeatSetpoint, mem.lastCoolSetpoint]);
 
   } catch (error) {
     console.error('[runtimeTracker] Error updating runtime session:', error);
