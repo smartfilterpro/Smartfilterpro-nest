@@ -19,30 +19,31 @@ function checkDeviceReachability(mem, nowMs) {
 }
 
 function classifyCurrentState(mem) {
-  const equipmentStatus = mem.equipmentStatus || 'Idle';
+  // ✅ CRITICAL FIX: Normalize to uppercase since Nest API sends 'COOLING', 'HEATING', 'OFF'
+  const equipmentStatus = (mem.equipmentStatus || 'IDLE').toUpperCase();
   const isFanTimerOn = mem.isFanTimerOn || false;
   let stateLabel, finalEquipmentStatus, isActive;
-  const isAuxHeat = equipmentStatus === 'Aux_Heating' || equipmentStatus === 'EMERGENCY_HEAT';
+  const isAuxHeat = equipmentStatus === 'AUX_HEATING' || equipmentStatus === 'EMERGENCY_HEAT';
 
   if (isAuxHeat) {
     stateLabel = isFanTimerOn ? 'AuxHeat_Fan' : 'AuxHeat';
-    finalEquipmentStatus = isFanTimerOn ? 'Aux_heating_Fan' : 'Aux_Heating';
+    finalEquipmentStatus = isFanTimerOn ? 'AUX_HEATING_FAN' : 'AUX_HEATING';
     isActive = true;
-  } else if (equipmentStatus === 'Heating') {
+  } else if (equipmentStatus === 'HEATING') {
     stateLabel = isFanTimerOn ? 'Heating_Fan' : 'Heating';
-    finalEquipmentStatus = isFanTimerOn ? 'Heating_Fan' : 'Heating';
+    finalEquipmentStatus = isFanTimerOn ? 'HEATING_FAN' : 'HEATING';
     isActive = true;
-  } else if (equipmentStatus === 'Cooling') {
+  } else if (equipmentStatus === 'COOLING') {
     stateLabel = isFanTimerOn ? 'Cooling_Fan' : 'Cooling';
-    finalEquipmentStatus = isFanTimerOn ? 'Cooling_Fan' : 'Cooling';
+    finalEquipmentStatus = isFanTimerOn ? 'COOLING_FAN' : 'COOLING';
     isActive = true;
   } else if (isFanTimerOn) {
     stateLabel = 'Fan_only';
-    finalEquipmentStatus = 'Fan_only';
+    finalEquipmentStatus = 'FAN';
     isActive = true;
   } else {
     stateLabel = 'Fan_off';
-    finalEquipmentStatus = 'Idle';
+    finalEquipmentStatus = 'IDLE';
     isActive = false;
   }
 
@@ -69,10 +70,10 @@ async function recoverActiveSessions() {
       deviceMemory.set(row.device_key, {
         deviceKey: row.device_key, frontendId: row.frontend_id, deviceName: row.device_name,
         equipmentStatus: row.current_equipment_status,
-        isFanTimerOn: row.current_equipment_status === 'Fan_only' || row.current_equipment_status?.includes('_Fan'),
+        isFanTimerOn: row.current_equipment_status === 'FAN' || row.current_equipment_status?.includes('_FAN'),
         thermostatMode: row.current_mode?.toUpperCase() || 'OFF', running: true,
         sessionId: row.session_id || uuidv4(), sessionStartedAt: new Date(row.session_started_at),
-        currentStateLabel: row.current_equipment_status === 'HEATING' ? 'Heating' : row.current_equipment_status === 'COOLING' ? 'Cooling' : row.current_equipment_status === 'Fan_only' ? 'Fan_only' : 'Fan_off',
+        currentStateLabel: row.current_equipment_status === 'HEATING' ? 'Heating' : row.current_equipment_status === 'COOLING' ? 'Cooling' : row.current_equipment_status === 'FAN' ? 'Fan_only' : 'Fan_off',
         currentEquipmentStatus: row.current_equipment_status,
         lastTemperatureF: row.last_temperature, lastTemperatureC: row.last_temperature ? (row.last_temperature - 32) * 5 / 9 : null,
         lastHumidity: row.last_humidity, lastHeatSetpoint: row.last_heat_setpoint, lastCoolSetpoint: row.last_cool_setpoint,
@@ -144,7 +145,7 @@ async function handleDeviceEvent(eventData) {
     let mem = deviceMemory.get(deviceKey);
     if (!mem) {
       console.log('[runtimeTracker] Initializing new device memory for ' + deviceKey);
-      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'Idle', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'Idle', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
+      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'IDLE', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'IDLE', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
       deviceMemory.set(deviceKey, mem);
     }
 
@@ -191,7 +192,7 @@ async function handleDeviceEvent(eventData) {
     if (tFan && tFan.timerMode !== undefined) {
       const newFanState = tFan.timerMode === 'ON';
       if (mem.isFanTimerOn !== newFanState) {
-        console.log('[Fan_only] ' + deviceKey + ' fan timer: ' + mem.isFanTimerOn + ' -> ' + newFanState);
+        console.log('[FAN] ' + deviceKey + ' fan timer: ' + mem.isFanTimerOn + ' -> ' + newFanState);
         mem.isFanTimerOn = newFanState;
         fanChanged = true;
       }
@@ -290,7 +291,7 @@ async function handleDeviceEvent(eventData) {
       const shouldPost = (setpointChanged || modeChanged) || (telemetryChanged && timeExceeded);
       if (shouldPost) {
         console.log('[ACTION] TELEMETRY UPDATE (idle)');
-        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: 'Idle', previousStatus: prevStateLabel, isActive: false, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
+        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: 'IDLE', previousStatus: prevStateLabel, isActive: false, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
         mem.lastTelemetryPost = nowMs;
       }
     }
@@ -320,11 +321,11 @@ async function endRuntimeSession(params) {
   const pool = getPool();
   console.log('[SESSION END] ' + params.deviceKey + ' -> ' + params.state.stateLabel + ', runtime=' + params.runtimeSeconds + 's');
   await pool.query('UPDATE runtime_sessions SET ended_at = $2, duration_seconds = $3, updated_at = $2 WHERE session_id = $1', [params.mem.sessionId, params.now, params.runtimeSeconds]);
-  await pool.query('UPDATE device_status SET is_running = FALSE, session_started_at = NULL, last_equipment_status = current_equipment_status, current_equipment_status = $2, current_mode = $3, updated_at = $4 WHERE device_key = $1', [params.deviceKey, 'Idle', 'off', params.now]);
+  await pool.query('UPDATE device_status SET is_running = FALSE, session_started_at = NULL, last_equipment_status = current_equipment_status, current_equipment_status = $2, current_mode = $3, updated_at = $4 WHERE device_key = $1', [params.deviceKey, 'IDLE', 'off', params.now]);
   params.mem.running = false;
   params.mem.sessionId = null;
   params.mem.sessionStartedAt = null;
-  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: 'Idle', previousStatus: params.previousStatus, isActive: false, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
+  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: 'IDLE', previousStatus: params.previousStatus, isActive: false, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
 }
 
 async function modeSwitchSession(params) {
