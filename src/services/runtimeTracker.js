@@ -19,22 +19,22 @@ function checkDeviceReachability(mem, nowMs) {
 }
 
 function classifyCurrentState(mem) {
-  const equipmentStatus = mem.equipmentStatus || 'IDLE';
+  const equipmentStatus = mem.equipmentStatus || 'Idle';
   const isFanTimerOn = mem.isFanTimerOn || false;
   let stateLabel, finalEquipmentStatus, isActive;
-  const isAuxHeat = equipmentStatus === 'AUX_HEATING' || equipmentStatus === 'EMERGENCY_HEAT';
+  const isAuxHeat = equipmentStatus === 'Aux_Heating' || equipmentStatus === 'EMERGENCY_HEAT';
 
   if (isAuxHeat) {
     stateLabel = isFanTimerOn ? 'AuxHeat_Fan' : 'AuxHeat';
-    finalEquipmentStatus = isFanTimerOn ? 'AUX_HEATING_FAN' : 'AUX_HEATING';
+    finalEquipmentStatus = isFanTimerOn ? 'Aux_heating_Fan' : 'Aux_Heating';
     isActive = true;
-  } else if (equipmentStatus === 'HEATING') {
+  } else if (equipmentStatus === 'Heating') {
     stateLabel = isFanTimerOn ? 'Heating_Fan' : 'Heating';
-    finalEquipmentStatus = isFanTimerOn ? 'HEATING_FAN' : 'HEATING';
+    finalEquipmentStatus = isFanTimerOn ? 'Heating_Fan' : 'Heating';
     isActive = true;
-  } else if (equipmentStatus === 'COOLING') {
+  } else if (equipmentStatus === 'Cooling') {
     stateLabel = isFanTimerOn ? 'Cooling_Fan' : 'Cooling';
-    finalEquipmentStatus = isFanTimerOn ? 'COOLING_FAN' : 'COOLING';
+    finalEquipmentStatus = isFanTimerOn ? 'Cooling_Fan' : 'Cooling';
     isActive = true;
   } else if (isFanTimerOn) {
     stateLabel = 'Fan_only';
@@ -42,7 +42,7 @@ function classifyCurrentState(mem) {
     isActive = true;
   } else {
     stateLabel = 'Fan_off';
-    finalEquipmentStatus = 'IDLE';
+    finalEquipmentStatus = 'Idle';
     isActive = false;
   }
 
@@ -144,7 +144,7 @@ async function handleDeviceEvent(eventData) {
     let mem = deviceMemory.get(deviceKey);
     if (!mem) {
       console.log('[runtimeTracker] Initializing new device memory for ' + deviceKey);
-      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'IDLE', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'IDLE', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
+      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'Idle', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'IDLE', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
       deviceMemory.set(deviceKey, mem);
     }
 
