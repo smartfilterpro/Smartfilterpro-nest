@@ -8,7 +8,7 @@ const { v4: uuidv4 } = require(‘uuid’);
 - 
 - CRITICAL: event_type and equipment_status are DIFFERENT:
 - - event_type: Type of event (Mode_Change, Telemetry_Update, etc.)
-- - equipment_status: Current equipment state (HEATING, COOLING, FAN, IDLE)
+- - equipment_status: Current equipment state (HEATING, COOLING, HEATING_FAN, COOLING_FAN, AUX_HEATING, AUX_HEATING_FAN, FAN, IDLE)
     */
     function buildCorePayload({
     deviceKey,
@@ -55,9 +55,13 @@ typeof temperatureF === ‘number’
 
 const iso = (observedAt || new Date()).toISOString();
 
-// ✅ CRITICAL: Map equipment_status (not event_type) to boolean flags
-const isCooling = equipmentStatus === ‘COOLING’;
-const isHeating = equipmentStatus === ‘HEATING’ || equipmentStatus === ‘AUX_HEATING’;
+// ✅ CRITICAL: Map equipment_status (with _FAN suffix) to boolean flags
+const isCooling = equipmentStatus === ‘COOLING’ || equipmentStatus === ‘COOLING_FAN’;
+const isHeating = equipmentStatus === ‘HEATING’ ||
+equipmentStatus === ‘HEATING_FAN’ ||
+equipmentStatus === ‘AUX_HEATING’ ||
+equipmentStatus === ‘AUX_HEATING_FAN’;
+const isFanOnly = equipmentStatus === ‘FAN’;_HEATING’;
 const isFanOnly = equipmentStatus === ‘FAN’;
 
 const payload = {
