@@ -38,7 +38,7 @@ function classifyCurrentState(mem) {
     isActive = true;
   } else if (isFanTimerOn) {
     stateLabel = 'Fan_only';
-    finalEquipmentStatus = 'FAN';
+    finalEquipmentStatus = 'Fan_only';
     isActive = true;
   } else {
     stateLabel = 'Fan_off';
@@ -69,10 +69,10 @@ async function recoverActiveSessions() {
       deviceMemory.set(row.device_key, {
         deviceKey: row.device_key, frontendId: row.frontend_id, deviceName: row.device_name,
         equipmentStatus: row.current_equipment_status,
-        isFanTimerOn: row.current_equipment_status === 'FAN' || row.current_equipment_status?.includes('_FAN'),
+        isFanTimerOn: row.current_equipment_status === 'Fan_only' || row.current_equipment_status?.includes('_Fan'),
         thermostatMode: row.current_mode?.toUpperCase() || 'OFF', running: true,
         sessionId: row.session_id || uuidv4(), sessionStartedAt: new Date(row.session_started_at),
-        currentStateLabel: row.current_equipment_status === 'HEATING' ? 'Heating' : row.current_equipment_status === 'COOLING' ? 'Cooling' : row.current_equipment_status === 'FAN' ? 'Fan_only' : 'Fan_off',
+        currentStateLabel: row.current_equipment_status === 'HEATING' ? 'Heating' : row.current_equipment_status === 'COOLING' ? 'Cooling' : row.current_equipment_status === 'Fan_only' ? 'Fan_only' : 'Fan_off',
         currentEquipmentStatus: row.current_equipment_status,
         lastTemperatureF: row.last_temperature, lastTemperatureC: row.last_temperature ? (row.last_temperature - 32) * 5 / 9 : null,
         lastHumidity: row.last_humidity, lastHeatSetpoint: row.last_heat_setpoint, lastCoolSetpoint: row.last_cool_setpoint,
@@ -191,7 +191,7 @@ async function handleDeviceEvent(eventData) {
     if (tFan && tFan.timerMode !== undefined) {
       const newFanState = tFan.timerMode === 'ON';
       if (mem.isFanTimerOn !== newFanState) {
-        console.log('[FAN] ' + deviceKey + ' fan timer: ' + mem.isFanTimerOn + ' -> ' + newFanState);
+        console.log('[Fan_only] ' + deviceKey + ' fan timer: ' + mem.isFanTimerOn + ' -> ' + newFanState);
         mem.isFanTimerOn = newFanState;
         fanChanged = true;
       }
