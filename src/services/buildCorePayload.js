@@ -39,8 +39,8 @@ function buildCorePayload({
 }) {
   const temperatureC = typeof temperatureF === 'number' ? Math.round(((temperatureF - 32) * 5 / 9) * 100) / 100 : null;
   const iso = (observedAt || new Date()).toISOString();
-  const isCooling = equipmentStatus === 'Ccooling' || equipmentStatus === 'Cooling_Fan';
-  const isHeating = equipmentStatus === 'Heating' || equipmentStatus === 'Heating_Fan' || equipmentStatus === 'Aux_Heating' || equipmentStatus === 'Auc_Heating_Fam';
+  const isCooling = equipmentStatus === 'COOLING' || equipmentStatus === 'COOLING_FAN' || equipmentStatus === 'Cooling' || equipmentStatus === 'Cooling_Fan';
+  const isHeating = equipmentStatus === 'HEATING' || equipmentStatus === 'HEATING_FAN' || equipmentStatus === 'AUX_HEATING' || equipmentStatus === 'AUX_HEATING_FAN' || equipmentStatus === 'Heating' || equipmentStatus === 'Heating_Fan' || equipmentStatus === 'AuxHeat' || equipmentStatus === 'AuxHeat_Fan';
   const isFanOnly = equipmentStatus === 'Fan_only';
 
   const payload = {

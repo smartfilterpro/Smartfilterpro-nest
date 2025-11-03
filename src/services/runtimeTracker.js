@@ -77,7 +77,10 @@ async function recoverActiveSessions() {
         currentEquipmentStatus: row.current_equipment_status,
         lastTemperatureF: row.last_temperature, lastTemperatureC: row.last_temperature ? (row.last_temperature - 32) * 5 / 9 : null,
         lastHumidity: row.last_humidity, lastHeatSetpoint: row.last_heat_setpoint, lastCoolSetpoint: row.last_cool_setpoint,
-        lastEventTime: nowMs, isReachable: row.is_reachable !== false, lastTelemetryPost: nowMs
+        lastEventTime: nowMs, isReachable: row.is_reachable !== false, lastTelemetryPost: nowMs,
+        firmwareVersion: null, serialNumber: null,
+        customName: null, parentResource: null, roomName: null, temperatureScale: null,
+        ecoMode: 'OFF', ecoHeatCelsius: null, ecoCoolCelsius: null, previousEcoMode: null
       });
       console.log('[runtimeTracker] Recovered active session for ' + row.device_key);
     }
@@ -145,7 +148,7 @@ async function handleDeviceEvent(eventData) {
     let mem = deviceMemory.get(deviceKey);
     if (!mem) {
       console.log('[runtimeTracker] Initializing new device memory for ' + deviceKey);
-      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'IDLE', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'IDLE', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0 };
+      mem = { deviceKey, frontendId: userId, deviceName, equipmentStatus: 'IDLE', isFanTimerOn: false, thermostatMode: 'OFF', running: false, sessionId: null, sessionStartedAt: null, currentStateLabel: 'Fan_off', currentEquipmentStatus: 'IDLE', lastTemperatureF: null, lastTemperatureC: null, lastHumidity: null, lastHeatSetpoint: null, lastCoolSetpoint: null, lastEventTime: nowMs, isReachable: true, firmwareVersion: null, serialNumber: null, lastTelemetryPost: 0, customName: null, parentResource: null, roomName: null, temperatureScale: null, ecoMode: 'OFF', ecoHeatCelsius: null, ecoCoolCelsius: null, previousEcoMode: null };
       deviceMemory.set(deviceKey, mem);
     }
 
@@ -157,11 +160,87 @@ async function handleDeviceEvent(eventData) {
     const tFan = traits['sdm.devices.traits.Fan'];
     const tSetpoint = traits['sdm.devices.traits.ThermostatTemperatureSetpoint'];
     const tMode = traits['sdm.devices.traits.ThermostatMode'];
-    const tInfo = traits['sdm.devices.traits.Info'] || traits['sdm.devices.traits.DeviceInfo'] || {};
-    const tSwUpdate = traits['sdm.devices.traits.SoftwareUpdate'] || {};
+    const tEco = traits['sdm.devices.traits.ThermostatEco'];
+    const tSettings = traits['sdm.devices.traits.Settings'];
+    const tInfo = traits['sdm.devices.traits.Info'] || {};
+    const parentRelations = eventData.resourceUpdate?.parentRelations || [];
 
-    if (tSwUpdate.currentVersion || tInfo.currentVersion) mem.firmwareVersion = tSwUpdate.currentVersion || tInfo.currentVersion;
-    if (tInfo.serialNumber || tInfo.serial) mem.serialNumber = tInfo.serialNumber || tInfo.serial;
+    // Track metadata changes for database persistence
+    let metadataChanged = false;
+    const metadataUpdates = {};
+
+    // Extract device metadata from Info trait
+    if (tInfo.customName && mem.customName !== tInfo.customName) {
+      mem.customName = tInfo.customName;
+      metadataUpdates.customName = tInfo.customName;
+      metadataChanged = true;
+    }
+
+    // Note: Firmware version and serial number may not be available in the standard SDM API
+    // but we'll try to extract them if present
+    const firmwareVersion = tInfo.currentVersion || tInfo.softwareVersion || null;
+    const serialNumber = tInfo.serialNumber || tInfo.serial || null;
+
+    if (firmwareVersion && mem.firmwareVersion !== firmwareVersion) {
+      mem.firmwareVersion = firmwareVersion;
+      metadataUpdates.firmwareVersion = firmwareVersion;
+      metadataChanged = true;
+    }
+
+    if (serialNumber && mem.serialNumber !== serialNumber) {
+      mem.serialNumber = serialNumber;
+      metadataUpdates.serialNumber = serialNumber;
+      metadataChanged = true;
+    }
+
+    // Extract parent room/structure info
+    if (parentRelations.length > 0) {
+      const parent = parentRelations[0];
+      if (parent.parent && mem.parentResource !== parent.parent) {
+        mem.parentResource = parent.parent;
+        metadataUpdates.parentResource = parent.parent;
+        metadataChanged = true;
+      }
+      if (parent.displayName && mem.roomName !== parent.displayName) {
+        mem.roomName = parent.displayName;
+        metadataUpdates.roomName = parent.displayName;
+        metadataChanged = true;
+      }
+    }
+
+    // Extract temperature display preference
+    if (tSettings && tSettings.temperatureScale && mem.temperatureScale !== tSettings.temperatureScale) {
+      mem.temperatureScale = tSettings.temperatureScale; // CELSIUS or FAHRENHEIT
+      metadataUpdates.temperatureScale = tSettings.temperatureScale;
+      metadataChanged = true;
+    }
+
+    if (tEco) {
+      const ecoMode = tEco.mode || 'OFF';
+      const ecoModeChanged = mem.ecoMode !== ecoMode;
+      if (ecoModeChanged) {
+        mem.ecoMode = ecoMode;
+        metadataUpdates.ecoMode = ecoMode;
+        metadataChanged = true;
+        console.log('[ECO MODE] ' + deviceKey + ' eco mode: ' + (mem.previousEcoMode || 'UNKNOWN') + ' -> ' + ecoMode);
+        mem.previousEcoMode = ecoMode;
+      }
+      if (tEco.heatCelsius !== undefined && mem.ecoHeatCelsius !== tEco.heatCelsius) {
+        mem.ecoHeatCelsius = tEco.heatCelsius;
+        metadataUpdates.ecoHeatCelsius = tEco.heatCelsius;
+        metadataChanged = true;
+      }
+      if (tEco.coolCelsius !== undefined && mem.ecoCoolCelsius !== tEco.coolCelsius) {
+        mem.ecoCoolCelsius = tEco.coolCelsius;
+        metadataUpdates.ecoCoolCelsius = tEco.coolCelsius;
+        metadataChanged = true;
+      }
+    }
+
+    // Persist metadata to database if anything changed
+    if (metadataChanged) {
+      await updateDeviceMetadata(deviceKey, metadataUpdates);
+    }
 
     let isReachable = mem.isReachable;
     if (tConnectivity) {
@@ -257,6 +336,10 @@ async function handleDeviceEvent(eventData) {
     console.log('  Active: ' + isActiveNow + ' (was: ' + wasActive + ')');
     console.log('  Equipment: ' + mem.equipmentStatus + ', Fan: ' + mem.isFanTimerOn);
     console.log('  Mode: ' + mem.thermostatMode + ' -> ' + (mem.thermostatModeMapped || mapNestModeToStandard(mem.thermostatMode)));
+    console.log('  Eco Mode: ' + (mem.ecoMode || 'OFF'));
+    if (mem.customName) console.log('  Custom Name: ' + mem.customName);
+    if (mem.roomName) console.log('  Room: ' + mem.roomName);
+    if (mem.temperatureScale) console.log('  Display Units: ' + mem.temperatureScale);
     console.log('  Changes: hvac=' + hvacChanged + ', fan=' + fanChanged + ', mode=' + modeChanged + ', telemetry=' + telemetryChanged + ', setpoint=' + setpointChanged);
 
     let runtimeSeconds = null;
@@ -369,6 +452,68 @@ async function handleTelemetryUpdate(deviceKey, tempF, tempC, humidity) {
     }
   } catch (error) {
     console.error('[runtimeTracker] Error handling telemetry update:', error);
+  }
+}
+
+async function updateDeviceMetadata(deviceKey, metadata) {
+  const pool = getPool();
+  try {
+    const updates = [];
+    const params = [deviceKey];
+    let paramIndex = 2;
+
+    if (metadata.customName !== undefined) {
+      updates.push('custom_name = $' + paramIndex);
+      params.push(metadata.customName);
+      paramIndex++;
+    }
+    if (metadata.parentResource !== undefined) {
+      updates.push('parent_resource = $' + paramIndex);
+      params.push(metadata.parentResource);
+      paramIndex++;
+    }
+    if (metadata.roomName !== undefined) {
+      updates.push('room_display_name = $' + paramIndex);
+      params.push(metadata.roomName);
+      paramIndex++;
+    }
+    if (metadata.temperatureScale !== undefined) {
+      updates.push('temperature_scale = $' + paramIndex);
+      params.push(metadata.temperatureScale);
+      paramIndex++;
+    }
+    if (metadata.ecoMode !== undefined) {
+      updates.push('eco_mode = $' + paramIndex);
+      params.push(metadata.ecoMode);
+      paramIndex++;
+    }
+    if (metadata.ecoHeatCelsius !== undefined) {
+      updates.push('eco_heat_celsius = $' + paramIndex);
+      params.push(metadata.ecoHeatCelsius);
+      paramIndex++;
+    }
+    if (metadata.ecoCoolCelsius !== undefined) {
+      updates.push('eco_cool_celsius = $' + paramIndex);
+      params.push(metadata.ecoCoolCelsius);
+      paramIndex++;
+    }
+    if (metadata.firmwareVersion !== undefined) {
+      updates.push('firmware_version = $' + paramIndex);
+      params.push(metadata.firmwareVersion);
+      paramIndex++;
+    }
+    if (metadata.serialNumber !== undefined) {
+      updates.push('serial_number = $' + paramIndex);
+      params.push(metadata.serialNumber);
+      paramIndex++;
+    }
+
+    if (updates.length > 0) {
+      updates.push('updated_at = NOW()');
+      await pool.query('UPDATE device_status SET ' + updates.join(', ') + ' WHERE device_key = $1', params);
+    }
+  } catch (error) {
+    console.error('[runtimeTracker] Error updating device metadata:', error);
   }
 }
 
