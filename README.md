@@ -36,6 +36,7 @@ GOOGLE_CLIENT_ID=your-client-id
 GOOGLE_CLIENT_SECRET=your-client-secret
 GOOGLE_REDIRECT_URI=https://your-app.railway.app/auth/callback
 BUBBLE_WEBHOOK_URL=https://smartfilterpro-scaling.bubbleapps.io/version-test/api/1.1/wf/nest_callback
+RAILWAY_API_KEY=your-secure-api-key
 LAST_FAN_TAIL_SECONDS=30
 MAX_RETRY_ATTEMPTS=3
 RETRY_DELAY_MS=2000
@@ -57,9 +58,14 @@ npm start
 
 ## API Endpoints
 
-### OAuth
-- `GET /auth/google` - Initiate Google OAuth flow
-- `GET /auth/callback` - OAuth callback handler
+### OAuth & Token Management
+- `POST /auth/store-tokens` - Receive OAuth tokens from Bubble and store in database
+  - **Body:** `{ userId, accessToken, refreshToken, expiresIn, apiKey }`
+  - **Auth:** Requires `RAILWAY_API_KEY` in request body
+  - **Response:** `{ success: true, message: "Tokens stored successfully", userId }`
+- `GET /auth/check-tokens/:userId` - Check if tokens exist and their expiration status
+  - **Query:** `?apiKey=your-api-key`
+  - **Response:** `{ exists: boolean, expired: boolean, expiresAt: string }`
 
 ### Deletion
 - `DELETE /api/user/:userId` - Delete user and all devices
