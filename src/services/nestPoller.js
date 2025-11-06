@@ -27,6 +27,11 @@ async function getOAuthClientForUser(userId) {
 
   const { access_token, refresh_token, expires_at } = result.rows[0];
 
+  // Validate that we have a refresh token for automatic token refresh
+  if (!refresh_token) {
+    console.warn(`⚠️  User ${userId} has no refresh_token - cannot auto-refresh when expired`);
+  }
+
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
@@ -36,25 +41,37 @@ async function getOAuthClientForUser(userId) {
   oauth2Client.setCredentials({
     access_token,
     refresh_token,
-    expiry_date: new Date(expires_at).getTime()
+    expiry_date: expires_at ? new Date(expires_at).getTime() : null
   });
 
+  // Listen for automatic token refresh events
   oauth2Client.on('tokens', async (tokens) => {
-    console.log(`Refreshing tokens for user: ${userId}`);
+    try {
+      console.log(`🔄 Token refresh triggered for user: ${userId}`);
 
-    if (tokens.access_token) {
-      const expiresAt = new Date(Date.now() + (tokens.expiry_date || 3600000));
-      await pool.query(
-        'UPDATE oauth_tokens SET access_token = $1, expires_at = $2, updated_at = NOW() WHERE user_id = $3',
-        [tokens.access_token, expiresAt, userId]
-      );
-    }
+      if (tokens.access_token) {
+        // FIX: tokens.expiry_date is ALREADY an absolute timestamp, not a duration
+        const expiresAt = tokens.expiry_date
+          ? new Date(tokens.expiry_date)
+          : new Date(Date.now() + 3600 * 1000); // Default to 1 hour
 
-    if (tokens.refresh_token) {
-      await pool.query(
-        'UPDATE oauth_tokens SET refresh_token = $1, updated_at = NOW() WHERE user_id = $2',
-        [tokens.refresh_token, userId]
-      );
+        console.log(`✅ Updating access_token for user ${userId}, expires at ${expiresAt.toISOString()}`);
+
+        await pool.query(
+          'UPDATE oauth_tokens SET access_token = $1, expires_at = $2, updated_at = NOW() WHERE user_id = $3',
+          [tokens.access_token, expiresAt, userId]
+        );
+      }
+
+      if (tokens.refresh_token) {
+        console.log(`✅ Updating refresh_token for user ${userId}`);
+        await pool.query(
+          'UPDATE oauth_tokens SET refresh_token = $1, updated_at = NOW() WHERE user_id = $2',
+          [tokens.refresh_token, userId]
+        );
+      }
+    } catch (error) {
+      console.error(`❌ Error updating tokens for user ${userId}:`, error.message);
     }
   });
 
@@ -195,7 +212,20 @@ async function pollUserDevices(userId, staleDeviceIds = null) {
       await handleDeviceEvent(syntheticEvent);
     }
   } catch (error) {
-    console.error(`Error polling devices for user ${userId}:`, error.message);
+    console.error(`❌ Error polling devices for user ${userId}:`, error.message);
+
+    // Provide specific guidance for common errors
+    if (error.message.includes('Invalid Credentials') || error.message.includes('invalid_grant')) {
+      console.error(`   ⚠️  Token issue detected for user ${userId}:`);
+      console.error(`   - Access token may be expired`);
+      console.error(`   - Refresh token may be missing or invalid`);
+      console.error(`   - User may need to re-authenticate via Bubble`);
+      console.error(`   → Check oauth_tokens table: SELECT user_id, refresh_token IS NOT NULL as has_refresh, expires_at FROM oauth_tokens WHERE user_id = '${userId}';`);
+    } else if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
+      console.error(`   ⚠️  Network error - Google API may be unreachable`);
+    } else {
+      console.error(`   Error details:`, error);
+    }
   }
 }
 

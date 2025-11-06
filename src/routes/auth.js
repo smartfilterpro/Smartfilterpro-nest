@@ -23,7 +23,7 @@ router.post('/store-tokens', async (req, res) => {
   
   try {
     const expiresAt = new Date(Date.now() + (expiresIn || 3600) * 1000);
-    
+
     const pool = getPool();
     await pool.query(`
       INSERT INTO oauth_tokens (user_id, access_token, refresh_token, expires_at, updated_at)
@@ -34,16 +34,20 @@ router.post('/store-tokens', async (req, res) => {
         expires_at = EXCLUDED.expires_at,
         updated_at = NOW()
     `, [userId, accessToken, refreshToken, expiresAt]);
-    
-    console.log(`Tokens stored successfully for user: ${userId}`);
-    
-    res.json({ 
-      success: true, 
+
+    console.log(`✅ Tokens stored successfully for user: ${userId}`);
+    console.log(`   - Access token: ${accessToken.substring(0, 20)}...`);
+    console.log(`   - Has refresh token: ${!!refreshToken}`);
+    console.log(`   - Expires at: ${expiresAt.toISOString()} (in ${expiresIn || 3600} seconds)`);
+
+    res.json({
+      success: true,
       message: 'Tokens stored successfully',
-      userId: userId
+      userId: userId,
+      expiresAt: expiresAt.toISOString()
     });
   } catch (error) {
-    console.error('Error storing tokens:', error);
+    console.error('❌ Error storing tokens:', error);
     res.status(500).json({ error: 'Failed to store tokens' });
   }
 });
