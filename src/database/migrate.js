@@ -43,6 +43,34 @@ async function runMigrations() {
         last_fan_tail_until TIMESTAMPTZ
       )
     `);
+
+    // Add missing columns for device metadata (safe if columns already exist)
+    console.log('Adding missing device metadata columns...');
+
+    // Helper to add column if it doesn't exist
+    const addColumnIfNotExists = async (tableName, columnName, columnType) => {
+      try {
+        await client.query(`
+          ALTER TABLE ${tableName}
+          ADD COLUMN IF NOT EXISTS ${columnName} ${columnType}
+        `);
+      } catch (err) {
+        // Ignore if column already exists
+        if (!err.message.includes('already exists')) {
+          console.error(`Error adding column ${columnName}:`, err.message);
+        }
+      }
+    };
+
+    await addColumnIfNotExists('device_status', 'custom_name', 'TEXT');
+    await addColumnIfNotExists('device_status', 'parent_resource', 'TEXT');
+    await addColumnIfNotExists('device_status', 'temperature_scale', 'TEXT');
+    await addColumnIfNotExists('device_status', 'eco_mode', 'TEXT DEFAULT \'OFF\'');
+    await addColumnIfNotExists('device_status', 'eco_heat_celsius', 'DECIMAL(5,2)');
+    await addColumnIfNotExists('device_status', 'eco_cool_celsius', 'DECIMAL(5,2)');
+    await addColumnIfNotExists('device_status', 'firmware_version', 'TEXT');
+    await addColumnIfNotExists('device_status', 'serial_number', 'TEXT');
+    await addColumnIfNotExists('device_status', 'last_humidity', 'DECIMAL(5,2)');
     
     // OAuth Tokens Table
     await client.query(`

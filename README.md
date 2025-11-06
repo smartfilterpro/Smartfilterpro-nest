@@ -77,7 +77,7 @@ npm start
 ## Database Schema
 
 ### Tables
-- `device_status` - Current device state
+- `device_status` - Current device state (includes custom_name, room_display_name, firmware_version, serial_number, humidity, eco mode settings)
 - `equipment_events` - Equipment status changes
 - `runtime_sessions` - HVAC runtime sessions
 - `temp_readings` - Temperature history
