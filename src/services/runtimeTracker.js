@@ -118,12 +118,15 @@ async function updateDeviceReachability(deviceKey, isReachable) {
   }
 }
 
-async function postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion, serialNumber, eventType, equipmentStatus, previousStatus, isActive, isReachable, runtimeSeconds, temperatureF, humidity, heatSetpoint, coolSetpoint, thermostatMode, observedAt, sourceEventId, eventData }) {
+async function postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion, serialNumber, eventType, equipmentStatus, previousStatus, isActive, isReachable, runtimeSeconds, temperatureF, humidity, heatSetpoint, coolSetpoint, thermostatMode, observedAt, sourceEventId, eventData, customName, roomName }) {
   let runtimeType = 'UPDATE';
   if (runtimeSeconds === undefined) runtimeType = 'START';
   else if (typeof runtimeSeconds === 'number' && runtimeSeconds > 0) runtimeType = 'END';
 
-  const payload = buildCorePayload({ deviceKey, userId, deviceName: deviceName || 'Nest Thermostat', manufacturer: 'Google Nest', model: 'Nest Thermostat', serialNumber, firmwareVersion, connectionSource: 'nest', source: 'nest', sourceVendor: 'nest', eventType, equipmentStatus, previousStatus: previousStatus || 'UNKNOWN', isActive: !!isActive, isReachable: isReachable !== undefined ? !!isReachable : true, mode: thermostatMode || equipmentStatus.toLowerCase(), thermostatMode, runtimeSeconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null, runtimeType, temperatureF, humidity, heatSetpoint, coolSetpoint, observedAt: observedAt || new Date(), sourceEventId: sourceEventId || uuidv4(), payloadRaw: eventData });
+  // Prefer custom name, then room name, then full device path
+  const displayName = customName || roomName || deviceName || 'Nest Thermostat';
+
+  const payload = buildCorePayload({ deviceKey, userId, deviceName: displayName, manufacturer: 'Google Nest', model: 'Nest Thermostat', serialNumber, firmwareVersion, connectionSource: 'nest', source: 'nest', sourceVendor: 'nest', eventType, equipmentStatus, previousStatus: previousStatus || 'UNKNOWN', isActive: !!isActive, isReachable: isReachable !== undefined ? !!isReachable : true, mode: thermostatMode || equipmentStatus.toLowerCase(), thermostatMode, runtimeSeconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null, runtimeType, temperatureF, humidity, heatSetpoint, coolSetpoint, observedAt: observedAt || new Date(), sourceEventId: sourceEventId || uuidv4(), payloadRaw: eventData });
 
   const rtDisplay = runtimeSeconds === undefined ? 'START' : runtimeSeconds === null ? 'UPDATE' : runtimeSeconds + 's';
   console.log('[CORE POST] ' + deviceKey + ' -> ' + eventType + ' (' + runtimeType + ') runtime=' + rtDisplay + ' eq=' + equipmentStatus + ' prev=' + previousStatus + ' reachable=' + isReachable);
@@ -364,17 +367,17 @@ async function handleDeviceEvent(eventData) {
       await updateRuntimeSession({ deviceKey, mem, state, now });
       if (isStateChangingEvent) {
         console.log('[ACTION] STATE CHANGE UPDATE (active)');
-        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: state.equipmentStatus, previousStatus: prevStateLabel, isActive: true, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
+        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: state.equipmentStatus, previousStatus: prevStateLabel, isActive: true, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData, customName: mem.customName, roomName: mem.roomName });
       } else if (telemetryChanged || setpointChanged || modeChanged) {
         console.log('[ACTION] TELEMETRY UPDATE (active)');
-        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: state.equipmentStatus, previousStatus: prevStateLabel, isActive: true, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
+        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: state.equipmentStatus, previousStatus: prevStateLabel, isActive: true, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData, customName: mem.customName, roomName: mem.roomName });
       }
     } else {
       const timeExceeded = (nowMs - mem.lastTelemetryPost) >= 900000;
       const shouldPost = (setpointChanged || modeChanged) || (telemetryChanged && timeExceeded);
       if (shouldPost) {
         console.log('[ACTION] TELEMETRY UPDATE (idle)');
-        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: 'IDLE', previousStatus: prevStateLabel, isActive: false, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData });
+        await postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion: mem.firmwareVersion, serialNumber: mem.serialNumber, eventType: 'Telemetry_Update', equipmentStatus: 'IDLE', previousStatus: prevStateLabel, isActive: false, isReachable, runtimeSeconds: null, temperatureF: mem.lastTemperatureF, humidity: mem.lastHumidity, heatSetpoint: mem.lastHeatSetpoint, coolSetpoint: mem.lastCoolSetpoint, thermostatMode: mappedMode, observedAt: now, sourceEventId: uuidv4(), eventData, customName: mem.customName, roomName: mem.roomName });
         mem.lastTelemetryPost = nowMs;
       }
     }
@@ -397,7 +400,7 @@ async function startRuntimeSession(params) {
   params.mem.running = true;
   params.mem.sessionId = sessionId;
   params.mem.sessionStartedAt = params.now;
-  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: params.state.equipmentStatus, previousStatus: params.previousStatus, isActive: true, isReachable: params.mem.isReachable, runtimeSeconds: undefined, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
+  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: params.state.equipmentStatus, previousStatus: params.previousStatus, isActive: true, isReachable: params.mem.isReachable, runtimeSeconds: undefined, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData, customName: params.mem.customName, roomName: params.mem.roomName });
 }
 
 async function endRuntimeSession(params) {
@@ -408,7 +411,7 @@ async function endRuntimeSession(params) {
   params.mem.running = false;
   params.mem.sessionId = null;
   params.mem.sessionStartedAt = null;
-  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: 'IDLE', previousStatus: params.previousStatus, isActive: false, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
+  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: 'IDLE', previousStatus: params.previousStatus, isActive: false, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData, customName: params.mem.customName, roomName: params.mem.roomName });
 }
 
 async function modeSwitchSession(params) {
@@ -422,7 +425,7 @@ async function modeSwitchSession(params) {
   await pool.query('UPDATE device_status SET current_mode = $2, current_equipment_status = $3, session_started_at = $4, updated_at = $4 WHERE device_key = $1', [params.deviceKey, mode, params.state.equipmentStatus, params.now]);
   params.mem.sessionId = newSessionId;
   params.mem.sessionStartedAt = params.now;
-  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: params.state.equipmentStatus, previousStatus: params.previousStatus, isActive: true, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData });
+  await postCoreEvent({ deviceKey: params.deviceKey, userId: params.userId, deviceName: params.deviceName, firmwareVersion: params.mem.firmwareVersion, serialNumber: params.mem.serialNumber, eventType: 'Mode_Change', equipmentStatus: params.state.equipmentStatus, previousStatus: params.previousStatus, isActive: true, isReachable: params.mem.isReachable, runtimeSeconds: params.runtimeSeconds, temperatureF: params.mem.lastTemperatureF, humidity: params.mem.lastHumidity, heatSetpoint: params.mem.lastHeatSetpoint, coolSetpoint: params.mem.lastCoolSetpoint, thermostatMode: params.mappedMode, observedAt: params.now, sourceEventId: uuidv4(), eventData: params.eventData, customName: params.mem.customName, roomName: params.mem.roomName });
 }
 
 async function updateRuntimeSession(params) {
