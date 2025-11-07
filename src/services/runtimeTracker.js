@@ -219,7 +219,12 @@ async function handleDeviceEvent(eventData) {
         mem.roomName = parent.displayName;
         metadataUpdates.roomName = parent.displayName;
         metadataChanged = true;
+      } else if (parent.displayName) {
+        // Room name exists but hasn't changed - log for debugging
+        console.log(`[METADATA] ${deviceKey} room name unchanged: "${parent.displayName}" (already in memory)`);
       }
+    } else {
+      console.log(`[METADATA] ${deviceKey} no parentRelations found in event data`);
     }
 
     // Extract temperature display preference
@@ -525,7 +530,16 @@ async function updateDeviceMetadata(deviceKey, metadata) {
 
     if (updates.length > 0) {
       updates.push('updated_at = NOW()');
-      await pool.query('UPDATE device_status SET ' + updates.join(', ') + ' WHERE device_key = $1', params);
+      try {
+        await pool.query('UPDATE device_status SET ' + updates.join(', ') + ' WHERE device_key = $1', params);
+        console.log(`[METADATA] ✅ Successfully saved metadata to database for ${deviceKey}`);
+      } catch (dbError) {
+        console.error(`[METADATA] ❌ Failed to save metadata to database for ${deviceKey}:`, dbError.message);
+        if (dbError.message.includes('column') && dbError.message.includes('does not exist')) {
+          console.error(`[METADATA] ⚠️  Database column missing! Run migration: npm run migrate`);
+        }
+        throw dbError;
+      }
     }
   } catch (error) {
     console.error('[runtimeTracker] Error updating device metadata:', error);
