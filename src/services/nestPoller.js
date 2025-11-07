@@ -196,14 +196,21 @@ async function pollUserDevices(userId, staleDeviceIds = null) {
 
     for (const device of devicesToProcess) {
       const deviceId = device.name.split('/').pop();
-      console.log(`Polling stale device: ${deviceId}`);
+      console.log(`📡 Polling stale device: ${deviceId}`);
+
+      // Log device metadata if available
+      const customName = device.traits?.['sdm.devices.traits.Info']?.customName;
+      const roomName = device.parentRelations?.[0]?.displayName;
+      if (customName) console.log(`   Custom name: "${customName}"`);
+      if (roomName) console.log(`   Room: "${roomName}"`);
 
       const syntheticEvent = {
         eventId: `poll-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         timestamp: new Date().toISOString(),
         resourceUpdate: {
           name: device.name,
-          traits: device.traits || {}
+          traits: device.traits || {},
+          parentRelations: device.parentRelations || [] // FIX: Include parent relations for room name
         },
         userId: userId,
         resourceGroup: [device.name]

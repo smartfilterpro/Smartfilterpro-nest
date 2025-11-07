@@ -126,6 +126,12 @@ async function postCoreEvent({ deviceKey, userId, deviceName, firmwareVersion, s
   // Prefer custom name, then room name, then full device path
   const displayName = customName || roomName || deviceName || 'Nest Thermostat';
 
+  // Log which name is being used (verbose logging)
+  if (displayName !== deviceName) {
+    const source = customName ? 'custom' : 'room';
+    console.log(`[CORE POST] Using ${source} name: "${displayName}" (instead of device path)`);
+  }
+
   const payload = buildCorePayload({ deviceKey, userId, deviceName: displayName, manufacturer: 'Google Nest', model: 'Nest Thermostat', serialNumber, firmwareVersion, connectionSource: 'nest', source: 'nest', sourceVendor: 'nest', eventType, equipmentStatus, previousStatus: previousStatus || 'UNKNOWN', isActive: !!isActive, isReachable: isReachable !== undefined ? !!isReachable : true, mode: thermostatMode || equipmentStatus.toLowerCase(), thermostatMode, runtimeSeconds: typeof runtimeSeconds === 'number' ? runtimeSeconds : null, runtimeType, temperatureF, humidity, heatSetpoint, coolSetpoint, observedAt: observedAt || new Date(), sourceEventId: sourceEventId || uuidv4(), payloadRaw: eventData });
 
   const rtDisplay = runtimeSeconds === undefined ? 'START' : runtimeSeconds === null ? 'UPDATE' : runtimeSeconds + 's';
@@ -174,6 +180,7 @@ async function handleDeviceEvent(eventData) {
 
     // Extract device metadata from Info trait
     if (tInfo.customName && mem.customName !== tInfo.customName) {
+      console.log(`[METADATA] ${deviceKey} custom name updated: "${mem.customName || 'none'}" -> "${tInfo.customName}"`);
       mem.customName = tInfo.customName;
       metadataUpdates.customName = tInfo.customName;
       metadataChanged = true;
@@ -185,12 +192,14 @@ async function handleDeviceEvent(eventData) {
     const serialNumber = tInfo.serialNumber || tInfo.serial || null;
 
     if (firmwareVersion && mem.firmwareVersion !== firmwareVersion) {
+      console.log(`[METADATA] ${deviceKey} firmware version: ${firmwareVersion}`);
       mem.firmwareVersion = firmwareVersion;
       metadataUpdates.firmwareVersion = firmwareVersion;
       metadataChanged = true;
     }
 
     if (serialNumber && mem.serialNumber !== serialNumber) {
+      console.log(`[METADATA] ${deviceKey} serial number: ${serialNumber}`);
       mem.serialNumber = serialNumber;
       metadataUpdates.serialNumber = serialNumber;
       metadataChanged = true;
@@ -200,11 +209,13 @@ async function handleDeviceEvent(eventData) {
     if (parentRelations.length > 0) {
       const parent = parentRelations[0];
       if (parent.parent && mem.parentResource !== parent.parent) {
+        console.log(`[METADATA] ${deviceKey} parent resource: ${parent.parent}`);
         mem.parentResource = parent.parent;
         metadataUpdates.parentResource = parent.parent;
         metadataChanged = true;
       }
       if (parent.displayName && mem.roomName !== parent.displayName) {
+        console.log(`[METADATA] ${deviceKey} room name updated: "${mem.roomName || 'none'}" -> "${parent.displayName}"`);
         mem.roomName = parent.displayName;
         metadataUpdates.roomName = parent.displayName;
         metadataChanged = true;
@@ -242,6 +253,7 @@ async function handleDeviceEvent(eventData) {
 
     // Persist metadata to database if anything changed
     if (metadataChanged) {
+      console.log(`[METADATA] ${deviceKey} saving ${Object.keys(metadataUpdates).length} metadata field(s) to database`);
       await updateDeviceMetadata(deviceKey, metadataUpdates);
     }
 
