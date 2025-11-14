@@ -6,6 +6,7 @@ const { startPoller, stopPoller } = require('./services/nestPoller');
 const authRoutes = require('./routes/auth');
 const webhookRoutes = require('./routes/webhook');
 const deleteRoutes = require('./routes/delete');
+const deviceRoutes = require('./routes/devices');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,6 +35,7 @@ app.get('/health', (req, res) => {
 app.use('/auth', authRoutes);
 app.use('/webhook', webhookRoutes);
 app.use('/api', deleteRoutes);
+app.use('/devices', deviceRoutes);
 
 // 404 handler
 app.use((req, res) => {

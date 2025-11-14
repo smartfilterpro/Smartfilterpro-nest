@@ -93,17 +93,18 @@ async function pollStaleDevices() {
     // Find devices that haven't reported in 20+ minutes
     const staleDevicesResult = await pool.query(
       `
-      SELECT 
+      SELECT
         ds.device_key,
         ds.device_name,
-        ds.frontend_id AS user_id,
+        ds.bubble_user_id AS user_id,
         ds.last_seen_at,
         ds.last_activity_at,
         GREATEST(ds.last_seen_at, ds.last_activity_at) AS last_update,
         EXTRACT(EPOCH FROM (NOW() - GREATEST(ds.last_seen_at, ds.last_activity_at))) / 60 AS minutes_since_update
       FROM device_status ds
-      WHERE GREATEST(ds.last_seen_at, ds.last_activity_at) < $1
-         OR (ds.last_seen_at IS NULL AND ds.last_activity_at IS NULL)
+      WHERE ds.bubble_user_id IS NOT NULL
+        AND (GREATEST(ds.last_seen_at, ds.last_activity_at) < $1
+         OR (ds.last_seen_at IS NULL AND ds.last_activity_at IS NULL))
       ORDER BY GREATEST(ds.last_seen_at, ds.last_activity_at) ASC NULLS FIRST
       `,
       [staleThreshold]
@@ -163,7 +164,7 @@ async function pollUserDevices(userId, staleDeviceIds = null) {
     if (!projectId) {
       const pool = getPool();
       const deviceResult = await pool.query(
-        'SELECT device_name FROM device_status WHERE frontend_id = $1 LIMIT 1',
+        'SELECT device_name FROM device_status WHERE bubble_user_id = $1 LIMIT 1',
         [userId]
       );
 
