@@ -71,6 +71,7 @@ async function runMigrations() {
     await addColumnIfNotExists('device_status', 'firmware_version', 'TEXT');
     await addColumnIfNotExists('device_status', 'serial_number', 'TEXT');
     await addColumnIfNotExists('device_status', 'last_humidity', 'DECIMAL(5,2)');
+    await addColumnIfNotExists('device_status', 'bubble_user_id', 'TEXT');
     
     // OAuth Tokens Table
     await client.query(`
@@ -160,10 +161,16 @@ async function runMigrations() {
     `);
     
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_temp_readings_session_id 
+      CREATE INDEX IF NOT EXISTS idx_temp_readings_session_id
       ON temp_readings(session_id)
     `);
-    
+
+    // Index for bubble_user_id lookup (for polling queries)
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_device_status_bubble_user_id
+      ON device_status(bubble_user_id)
+    `);
+
     await client.query('COMMIT');
     console.log('✓ All migrations completed successfully');
   } catch (error) {

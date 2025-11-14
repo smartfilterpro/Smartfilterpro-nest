@@ -103,7 +103,17 @@ function celsiusToFahrenheit(celsius) {
 async function ensureDeviceExists(deviceKey, userId, deviceName) {
   const pool = getPool();
   try {
-    await pool.query('INSERT INTO device_status (device_key, frontend_id, device_name, created_at, updated_at) VALUES ($1,$2,$3,NOW(),NOW()) ON CONFLICT (device_key) DO UPDATE SET frontend_id = EXCLUDED.frontend_id, device_name = EXCLUDED.device_name, updated_at = NOW()', [deviceKey, userId, deviceName]);
+    // Note: userId here is the Google/Nest user ID (frontend_id), NOT bubble_user_id
+    // bubble_user_id is set separately via /devices/register endpoint
+    await pool.query(
+      `INSERT INTO device_status (device_key, frontend_id, device_name, created_at, updated_at)
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (device_key) DO UPDATE SET
+         frontend_id = EXCLUDED.frontend_id,
+         device_name = EXCLUDED.device_name,
+         updated_at = NOW()`,
+      [deviceKey, userId, deviceName]
+    );
   } catch (error) {
     console.error('[runtimeTracker] Error ensuring device exists:', error);
   }
